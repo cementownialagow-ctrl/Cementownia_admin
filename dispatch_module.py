@@ -3,33 +3,35 @@
 Moduł celowo nie steruje stanem magazynowym ani nie odczytuje wagi. Zachowuje
 etapy zakładowe, aby później można było bezpiecznie dołączyć urządzenie wagi.
 """
+import secrets
+import time
+
 from flask import Blueprint, abort, redirect, render_template_string, request, session, url_for
 
 bp = Blueprint("dispatch", __name__, url_prefix="/dispatch")
 D = {}
 
 STAGES = [
-    ("planned", "Zaplanowana"), ("waiting", "Oczekuje"),
-    ("gate_entered", "Wjazd na zakład"), ("first_weighing", "Pierwsza waga"),
-    ("waiting_for_loading", "Kolejka do załadunku"), ("loading", "Załadunek"),
-    ("second_weighing", "Waga końcowa"), ("ready_to_leave", "Gotowy do wyjazdu"),
-    ("departed", "Wyjechał"), ("cancelled", "Anulowana"), ("problem", "Problem"),
+    ("planned", "Zaplanowana"), ("loading", "Załadunek"),
+    ("ready_to_leave", "Gotowy do wyjazdu"), ("departed", "Wyjechał"),
+    ("cancelled", "Anulowana"), ("problem", "Problem"),
 ]
 STAGE_LABEL = dict(STAGES)
 NEXT = {
-    "planned": {"waiting", "cancelled", "problem"},
-    "waiting": {"gate_entered", "cancelled", "problem"},
-    "gate_entered": {"first_weighing", "problem"},
-    "first_weighing": {"waiting_for_loading", "problem"},
+    "planned": {"loading", "cancelled", "problem"},
+    "waiting": {"loading", "cancelled", "problem"},
+    "gate_entered": {"loading", "problem"},
+    "first_weighing": {"loading", "problem"},
     "waiting_for_loading": {"loading", "problem"},
-    "loading": {"second_weighing", "problem"},
     "second_weighing": {"ready_to_leave", "problem"},
+    "loading": {"ready_to_leave", "problem"},
     "ready_to_leave": {"departed", "problem"},
-    "problem": {"waiting", "gate_entered", "first_weighing", "waiting_for_loading", "loading", "second_weighing", "ready_to_leave", "cancelled"},
+    "problem": {"planned", "loading", "ready_to_leave", "cancelled"},
 }
 
 def _now(): return D["now_iso"]()
 def _actor(): return session.get("display_name") or session.get("username") or "pracownik"
+def _cloud_id(): return int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
 def _number(c):
     year = _now()[:4]
     n = c.execute("SELECT COUNT(*) FROM dispatch_appointments WHERE appointment_no LIKE ?", (f"AW/{year}/%",)).fetchone()[0] + 1
@@ -69,9 +71,33 @@ def appointments():
         if not order_id: abort(400)
         with D["conn"]() as c:
             now = _now()
+            wz_id = int(request.form.get("wz_id") or 0)
+            driver_id = int(request.form.get("driver_id") or 0)
+            vehicle_id = int(request.form.get("vehicle_id") or 0)
+            transport_id = int(request.form.get("transport_id") or 0)
+            # Jedna awizacja z wybranym WZ, kierowcą i autem od razu tworzy kurs.
+            # Dzięki temu kierowca widzi go natychmiast w swoim panelu.
+            if not transport_id and wz_id and driver_id and vehicle_id:
+                existing = c.execute("SELECT id FROM transports WHERE wz_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", (wz_id,)).fetchone()
+                if existing:
+                    transport_id = int(existing["id"])
+                else:
+                    year = now[:4]
+                    number = c.execute("SELECT COUNT(*) FROM transports WHERE transport_no LIKE ?", (f"TR/{year}/%",)).fetchone()[0] + 1
+                    transport_no = f"TR/{year}/{number:05d}"
+                    transport_id = _cloud_id()
+                    c.execute("""INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)""", (transport_id, transport_no, wz_id, driver_id, vehicle_id, request.form.get("destination", "").strip(), _actor(), _actor(), now, now))
+                    for item in c.execute("SELECT id,qty_issued,qty_planned FROM wz_items WHERE wz_id=?", (wz_id,)).fetchall():
+                        c.execute("INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)", (_cloud_id(), transport_id, item["id"], item["qty_issued"] or item["qty_planned"], now))
             position = c.execute("SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?", (request.form.get("planned_date") or day,)).fetchone()[0]
             c.execute("""INSERT INTO dispatch_appointments(appointment_no,order_id,wz_id,transport_id,driver_id,vehicle_id,loading_bay_id,planned_date,time_from,time_to,shift,queue_position,status,notes,created_by,updated_by,created_at,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'planned',?,?,?,?,?)""", (_number(c), order_id, request.form.get("wz_id") or None, request.form.get("transport_id") or None, request.form.get("driver_id") or None, request.form.get("vehicle_id") or None, request.form.get("loading_bay_id") or None, request.form.get("planned_date") or day, request.form.get("time_from") or None, request.form.get("time_to") or None, request.form.get("shift") or None, position, request.form.get("notes", "").strip(), _actor(), _actor(), now, now))
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'planned',?,?,?,?,?)""", (_number(c), order_id, wz_id or None, transport_id or None, driver_id or None, vehicle_id or None, request.form.get("loading_bay_id") or None, request.form.get("planned_date") or day, request.form.get("time_from") or None, request.form.get("time_to") or None, request.form.get("shift") or None, position, request.form.get("notes", "").strip(), _actor(), _actor(), now, now))
+            c.commit()
+            if transport_id:
+                D['sync_local_rows_to_supabase']('transports','id',[transport_id])
+                item_ids=[x['id'] for x in c.execute('SELECT id FROM transport_items WHERE transport_id=?',(transport_id,)).fetchall()]
+                D['sync_local_rows_to_supabase']('transport_items','id',item_ids)
         return redirect(url_for("dispatch.appointments", day=day))
     with D["conn"]() as c:
         rows = c.execute("""SELECT a.*,o.order_no,o.customer_name,v.registration_no,d.name driver_name,b.code bay_code,
