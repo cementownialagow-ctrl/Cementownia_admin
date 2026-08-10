@@ -938,12 +938,18 @@ if not CLIENT_ALLOWED_ORIGINS:
     app.logger.warning("CLIENT_ALLOWED_ORIGINS jest puste; przeglądarkowe żądania tworzenia zamówień będą odrzucane.")
 SUPABASE_STORAGE_BUCKET = (os.environ.get("SUPABASE_STORAGE_BUCKET") or "invoice-pdfs").strip()
 SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "1").strip().lower() in ("1", "true", "yes", "on")
+# Na darmowym Renderze plik SQLite jest tymczasowy. Domyślnie każda zmiana
+# czeka na potwierdzenie zapisu w Supabase zanim odpowiedź opuści serwer.
+SUPABASE_SYNC_BEFORE_RESPONSE = (os.environ.get("SUPABASE_SYNC_BEFORE_RESPONSE") or "1").strip().lower() in ("1", "true", "yes", "on")
 INVENTORY_AUTOMATION_ENABLED = (os.environ.get("INVENTORY_AUTOMATION_ENABLED") or "0").strip().lower() in ("1", "true", "yes", "on")
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
 SUPABASE_MIN_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_PULL_INTERVAL_SEC") or "2").strip())
 
 SUPABASE_SYNC_TABLES = [
     ("products", "id"),
+    # Nie sterujemy automatycznie stanem magazynowym, ale jeżeli zostanie
+    # wpisany ręcznie, jego kopia również musi trafić do chmury.
+    ("stock", "product_id"),
     ("customers", "id"),
     ("orders", "id"),
     ("order_items", "id"),
@@ -951,6 +957,8 @@ SUPABASE_SYNC_TABLES = [
     ("material_order_items", "id"),
     ("pricing", "model"),
     ("company_profile", "id"),
+    ("app_users", "id"),
+    ("cash_flow_settings", "key"),
     ("invoices", "id"),
     ("invoice_meta", "invoice_id"),
     ("invoice_allocations", "id"),
@@ -968,6 +976,7 @@ SUPABASE_SYNC_TABLES = [
     ("appointment_status_history", "id"),
     ("audit_log", "id"),
     ("audit_events", "id"),
+    ("email_events", "id"),
     ("departments", "id"),
     ("material_usage", "id"),
     ("fuel_entries", "id"),
@@ -979,8 +988,11 @@ SUPABASE_SYNC_TABLES = [
 SUPABASE_PULL_TABLES = [
     ("company_profile", "id"),
     ("pricing", "model"),
+    ("app_users", "id"),
+    ("cash_flow_settings", "key"),
     ("customers", "id"),
     ("products", "id"),
+    ("stock", "product_id"),
     ("drivers", "id"),
     ("driver_accounts", "driver_id"),
     ("orders", "id"),
@@ -1002,6 +1014,7 @@ SUPABASE_PULL_TABLES = [
     ("appointment_status_history", "id"),
     ("audit_log", "id"),
     ("audit_events", "id"),
+    ("email_events", "id"),
     ("departments", "id"),
     ("expense_categories", "id"),
     ("material_usage", "id"),
@@ -2818,6 +2831,8 @@ def login():
             c.execute("UPDATE app_users SET last_login_at=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), user["id"]))
             c.commit()
             c.close()
+            # Konto i ostatnie logowanie są wspólne dla wszystkich lokalizacji.
+            sync_local_rows_to_supabase("app_users", "id", [user["id"]])
             target = norm(request.args.get("next"))
             return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("home"))
         else:
@@ -2975,8 +2990,10 @@ def admin_users():
             c = conn()
             try:
                 stamp = now_iso()
-                c.execute("INSERT INTO app_users(username,display_name,password_hash,role,created_at,updated_at) VALUES(?,?,?,?,?,?)", (username, display_name, generate_password_hash(password), role, stamp, stamp))
+                cur = c.execute("INSERT INTO app_users(username,display_name,password_hash,role,created_at,updated_at) VALUES(?,?,?,?,?,?)", (username, display_name, generate_password_hash(password), role, stamp, stamp))
+                user_id = cur.lastrowid
                 c.commit()
+                sync_local_rows_to_supabase("app_users", "id", [user_id])
                 return redirect(url_for("admin_users"))
             except sqlite3.IntegrityError:
                 error = "Taki login już istnieje."
@@ -3031,6 +3048,7 @@ def admin_user_toggle(user_id):
     if user["active"] and user["role"] == "admin" and c.execute("SELECT COUNT(*) FROM app_users WHERE role='admin' AND active=1 AND deleted_at IS NULL").fetchone()[0] <= 1:
         c.close(); return "Nie można wyłączyć ostatniego administratora.", 400
     c.execute("UPDATE app_users SET active=?,updated_at=? WHERE id=?", (0 if user["active"] else 1, now_iso(), user_id)); c.commit(); c.close()
+    sync_local_rows_to_supabase("app_users", "id", [user_id])
     return redirect(url_for("admin_users"))
 
 
@@ -3052,6 +3070,7 @@ def admin_user_role(user_id):
     c.execute("UPDATE app_users SET role=?,updated_at=? WHERE id=?", (role, now_iso(), user_id))
     c.commit()
     c.close()
+    sync_local_rows_to_supabase("app_users", "id", [user_id])
     return redirect(url_for("admin_users"))
 
 
@@ -3730,6 +3749,7 @@ register_cash_flow(app, {
     "app_now": app_now,
     "to_float": to_float,
     "maybe_pull_shared_from_supabase": maybe_pull_shared_from_supabase,
+    "sync_local_rows_to_supabase": sync_local_rows_to_supabase,
     "BASE_URL": BASE_URL,
     "DB_PATH": DB_PATH,
 })
@@ -3771,7 +3791,13 @@ def auto_sync_after_write(response):
 
         no_auto_sync_paths = {"/api/client_search_log", "/api/client_order_email"}
         if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path not in no_auto_sync_paths:
-            trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
+            if SUPABASE_SYNC_BEFORE_RESPONSE and supabase_enabled():
+                result = sync_all_to_supabase()
+                response.headers["X-Supabase-Sync"] = "ok" if result.get("ok") else "failed"
+                if not result.get("ok"):
+                    app.logger.error("Niepełna synchronizacja Supabase po %s %s: %s", request.method, request.path, result.get("tables"))
+            else:
+                trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
     except Exception:
         pass
     return response
@@ -5053,7 +5079,7 @@ def order_new():
             <div class="items-row card" style="margin:10px 0;">
               <div>
                 <label class="muted small">Produkt (SKU)</label>
-                <select name="product_id[]" onchange="refreshStock(this.value, this.dataset.stockTarget)" data-stock-target="">
+                <select name="product_id[]">
                   <option value="">-- wybierz --</option>
                   {% for p in products %}
                     <option value="{{ p['id'] }}">{{ p['sku'] }}{% if p['model'] %} â€˘ {{ p['model'] }}{% endif %}{% if p['name'] %} â€˘ {{ p['name'] }}{% endif %}</option>
@@ -5065,8 +5091,8 @@ def order_new():
                 <input name="qty[]" value="1">
               </div>
               <div>
-                <label class="muted small">Stan</label>
-                <div class="badge" id="">-</div>
+                <label class="muted small">Produkt ręczny</label>
+                <input name="manual_product[]" placeholder="np. Beton C25/30">
               </div>
               <div class="flex" style="align-items:flex-end;">
                 <button class="btn danger" onclick="removeRow(this); return false;">UsuĹ„</button>
@@ -5090,7 +5116,7 @@ function addItemRow(){
   // znajdĹş select i badge w nowo wstawionym wierszu
   const wrap = node.querySelector(".items-row");
   const select = wrap.querySelector("select");
-  const badge = wrap.querySelector(".badge");
+  const badge = {};
 
   const id = "stock_" + Math.random().toString(36).slice(2);
   badge.id = id;
@@ -5146,13 +5172,35 @@ def order_create():
     note = norm(request.form.get("note"))
 
     product_ids = request.form.getlist("product_id[]")
+    manual_products = request.form.getlist("manual_product[]")
     qtys = request.form.getlist("qty[]")
 
     items = []
-    for pid, q in zip(product_ids, qtys):
+    for index, (pid, q) in enumerate(zip(product_ids, qtys)):
         pid = to_int(pid, 0)
         qty = to_int(q, 0)
         if pid > 0 and qty > 0:
+            items.append((pid, qty))
+            continue
+        manual_name = norm(manual_products[index] if index < len(manual_products) else "")
+        if manual_name and qty > 0:
+            sku = f"RECZNY-{uuid.uuid4().hex[:10].upper()}"
+            created_at = now_iso()
+            c = conn()
+            try:
+                cur = c.cursor()
+                if supabase_enabled():
+                    created = supabase_insert_row("products", {"sku": sku, "model": manual_name, "name": manual_name, "created_at": created_at})
+                    if not created or "id" not in created:
+                        raise RuntimeError("Nie udało się dodać ręcznego produktu do Supabase")
+                    pid = int(created["id"])
+                    cur.execute("INSERT INTO products(id,sku,model,ean,name,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET sku=excluded.sku,model=excluded.model,name=excluded.name", (pid, sku, manual_name, "", manual_name, created_at))
+                else:
+                    cur.execute("INSERT INTO products(sku,model,ean,name,created_at) VALUES(?,?,?,?,?)", (sku, manual_name, "", manual_name, created_at))
+                    pid = cur.lastrowid
+                c.commit()
+            finally:
+                c.close()
             items.append((pid, qty))
 
     if not items:
