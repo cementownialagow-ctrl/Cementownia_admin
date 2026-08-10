@@ -113,6 +113,12 @@ def driver_auth_email(username):
         raise ValueError('Login kierowcy może zawierać litery, cyfry, kropkę, myślnik i podkreślenie.')
     return f'{value}@kierowca.betonlagow.local'
 
+def save_row_to_supabase(table, row, conflict='id'):
+    """Critical operational records are saved centrally before the response."""
+    if not D['supabase_enabled']():
+        raise RuntimeError('Brak połączenia z Supabase. Nie można zapisać danych bezpiecznie w chmurze.')
+    D['supabase_request'](f'/rest/v1/{table}', method='POST', params={'on_conflict': conflict}, payload=[dict(row)], prefer='resolution=merge-duplicates,return=minimal')
+
 def provision_driver_account(driver_id, username, password, update=False):
     if not D['supabase_enabled']():
         raise RuntimeError('Nie można nadać hasła: brakuje SUPABASE_URL lub SUPABASE_SERVICE_ROLE_KEY na Render.')
@@ -232,7 +238,12 @@ def driver_add():
         with D['conn']() as c:
             cur=c.execute('INSERT INTO drivers(name,phone,email,created_at,updated_at) VALUES(?,?,?,?,?)',(request.form['name'].strip(),request.form.get('phone','').strip(),driver_auth_email(username),s,s))
             driver_id=cur.lastrowid
+            driver=c.execute('SELECT * FROM drivers WHERE id=?',(driver_id,)).fetchone()
+        save_row_to_supabase('drivers', driver)
         provision_driver_account(driver_id,username,password)
+        with D['conn']() as c:
+            account=c.execute('SELECT * FROM driver_accounts WHERE driver_id=?',(driver_id,)).fetchone()
+        save_row_to_supabase('driver_accounts', account, 'driver_id')
         return redirect(url_for('beton.drivers',ok=f'Konto kierowcy {username} zostało utworzone.'))
     except Exception as exc:
         return redirect(url_for('beton.drivers',error=str(exc)))
@@ -249,8 +260,14 @@ def driver_password(driver_id):
 @bp.post('/vehicles/add')
 def vehicle_add():
     s=stamp()
-    with D['conn']() as c:c.execute('INSERT INTO vehicles(name,brand,model,registration_no,trailer_no,year,vin,current_mileage,driver_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(request.form.get('name',''),request.form.get('brand',''),request.form.get('model',''),request.form['registration_no'].strip().upper(),request.form.get('trailer_no','').strip().upper(),request.form.get('year') or None,request.form.get('vin',''),request.form.get('current_mileage') or 0,request.form.get('driver_id') or None,s,s))
-    return redirect(url_for('beton.drivers'))
+    try:
+        with D['conn']() as c:
+            cur=c.execute('INSERT INTO vehicles(name,brand,model,registration_no,trailer_no,year,vin,current_mileage,driver_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(request.form.get('name',''),request.form.get('brand',''),request.form.get('model',''),request.form['registration_no'].strip().upper(),request.form.get('trailer_no','').strip().upper(),request.form.get('year') or None,request.form.get('vin',''),request.form.get('current_mileage') or 0,request.form.get('driver_id') or None,s,s))
+            vehicle=c.execute('SELECT * FROM vehicles WHERE id=?',(cur.lastrowid,)).fetchone()
+        save_row_to_supabase('vehicles', vehicle)
+        return redirect(url_for('beton.drivers',ok='Pojazd został zapisany w Supabase.'))
+    except Exception as exc:
+        return redirect(url_for('beton.drivers',error=str(exc)))
 
 @bp.get('/transports')
 def transports():
