@@ -223,14 +223,18 @@ def wz_new():
         items=c.execute('''SELECT oi.*,COALESCE(p.name,p.sku) product_name,COALESCE((SELECT SUM(wi.qty_planned) FROM wz_items wi JOIN wz_documents wd ON wd.id=wi.wz_id WHERE wi.order_item_id=oi.id AND wd.deleted_at IS NULL),0) wz_reserved FROM order_items oi JOIN products p ON p.id=oi.product_id WHERE oi.order_id=? ORDER BY oi.id''',(order_id,)).fetchall() if order else []
         if request.method=='POST':
             if not order:abort(400)
-            s=stamp(); cur=c.execute('''INSERT INTO wz_documents(wz_no,order_id,issue_location,warehouse_location,destination,status,created_by,created_at,notes)
-              VALUES(?,?,?,?,?,'created',?,?,?)''',(next_wz_no(c),order_id,request.form.get('issue_location','Miejscowość X').strip(),request.form.get('warehouse_location','Miejscowość Y').strip(),request.form.get('destination','').strip(),actor(),s,request.form.get('notes','').strip()))
-            wz_id=cur.lastrowid; count=0
+            s=stamp(); wz_id=cloud_id(); cur=c.execute('''INSERT INTO wz_documents(id,wz_no,order_id,issue_location,warehouse_location,destination,status,created_by,created_at,notes)
+              VALUES(?,?,?,?,?,?,'created',?,?,?)''',(wz_id,next_wz_no(c),order_id,request.form.get('issue_location','Miejscowość X').strip(),request.form.get('warehouse_location','Miejscowość Y').strip(),request.form.get('destination','').strip(),actor(),s,request.form.get('notes','').strip()))
+            count=0
             for item in items:
                 qty=float(request.form.get(f'qty_{item["id"]}') or 0)
                 if qty>0 and qty<=float(item['qty'])-float(item['wz_reserved']):
-                    c.execute('INSERT INTO wz_items(wz_id,order_item_id,product_id,sku,qty_planned,created_at) VALUES(?,?,?,?,?,?)',(wz_id,item['id'],item['product_id'],item['sku'],qty,s)); count+=1
+                    c.execute('INSERT INTO wz_items(id,wz_id,order_item_id,product_id,sku,qty_planned,created_at) VALUES(?,?,?,?,?,?,?)',(cloud_id(),wz_id,item['id'],item['product_id'],item['sku'],qty,s)); count+=1
             if not count:raise ValueError('WZ musi zawierać co najmniej jedną pozycję')
+            c.commit()
+            D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
+            wz_item_ids=[x['id'] for x in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
+            D['sync_local_rows_to_supabase']('wz_items','id',wz_item_ids)
             return redirect(url_for('beton.wz_view',wz_id=wz_id))
     return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Nowy dokument WZ</h1><div class="card"><form method="get"><label>Zamówienie klienta</label><select name="order_id" onchange="this.form.submit()"><option value="">Wybierz zamówienie</option>{% for x in orders %}<option value="{{x.id}}" {{'selected' if x.id==order_id}}>{{x.order_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>{% if order %}<form method="post" class="card"><input type="hidden" name="order_id" value="{{order.id}}"><h2>{{order.order_no}} · {{order.customer_name}}</h2><div class="grid3"><div><label>Wystawiono w</label><input name="issue_location" value="Miejscowość X" required></div><div><label>Magazyn wydający</label><input name="warehouse_location" value="Miejscowość Y" required></div><div><label>Miejsce dostawy</label><input name="destination"></div></div><table><thead><tr><th>Materiał</th><th>Zamówiono</th><th>Już na WZ</th><th>Na nowym WZ</th></tr></thead><tbody>{% for x in items %}{% set available=x.qty-x.wz_reserved %}<tr><td>{{x.product_name}}<br><span class="muted">{{x.sku}}</span></td><td>{{x.qty}}</td><td>{{x.wz_reserved}}</td><td><input type="number" min="0" max="{{available}}" step="0.01" name="qty_{{x.id}}" value="{{available}}"></td></tr>{% endfor %}</tbody></table><label>Uwagi</label><textarea name="notes"></textarea><button class="btn primary">Wystaw WZ</button></form>{% endif %}{% endblock %}''',orders=orders,order=order,order_id=order_id,items=items,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
@@ -286,7 +290,7 @@ def drivers():
       {% if request.args.get('error') %}<div class="notice">{{request.args.get('error')}}</div>{% endif %}
       {% if request.args.get('ok') %}<div class="notice">{{request.args.get('ok')}}</div>{% endif %}
       <div class="row"><div class="card"><h2>Dodaj kierowcę i konto</h2><form method="post" action="{{url_for('beton.driver_add')}}"><label>Imię i nazwisko</label><input name="name" required><label>Telefon</label><input name="phone"><label>Login do panelu kierowcy</label><input name="username" placeholder="np. Kicia" required><label>Hasło kierowcy (min. 12 znaków)</label><input type="password" name="password" required><button class="btn primary" style="margin-top:12px">Dodaj kierowcę i ustaw hasło</button></form></div><div class="card"><h2>Dodaj pojazd</h2><form method="post" action="{{url_for('beton.vehicle_add')}}"><label>Numer rejestracyjny</label><input name="registration_no" required><label>Naczepa</label><input name="trailer_no"><label>Marka / model</label><input name="brand"><input name="model"><label>Domyślny kierowca</label><select name="driver_id"><option value="">—</option>{% for d in ds %}<option value="{{d.id}}">{{d.name}}</option>{% endfor %}</select><button class="btn primary" style="margin-top:12px">Dodaj pojazd</button></form></div></div>
-      <div class="card"><h2>Kierowcy</h2><table><thead><tr><th>Kierowca</th><th>Login</th><th>Telefon</th><th>Status</th><th>Hasło</th></tr></thead><tbody>{% for x in ds %}<tr><td><b>{{x.name}}</b></td><td>{{x.username or 'Brak konta'}}</td><td>{{x.phone or '-'}}</td><td><span class="badge">{{'Aktywny' if x.active else 'Nieaktywny'}}</span></td><td><form method="post" action="{{url_for('beton.driver_password',driver_id=x.id)}}"><input name="username" value="{{x.username or ''}}" placeholder="login" required><input name="password" type="password" placeholder="nowe hasło (min. 12)" required><button class="btn">Zmień hasło</button></form></td></tr>{% else %}<tr><td colspan="5">Brak kierowców.</td></tr>{% endfor %}</tbody></table></div>
+      <div class="card"><h2>Kierowcy</h2><table><thead><tr><th>Kierowca</th><th>Login</th><th>Telefon</th><th>Status</th><th>Hasło i konto</th></tr></thead><tbody>{% for x in ds %}<tr><td><b>{{x.name}}</b></td><td>{{x.username or 'Brak konta'}}</td><td>{{x.phone or '-'}}</td><td><span class="badge">{{'Aktywny' if x.active else 'Nieaktywny'}}</span></td><td>{% if x.auth_user_id %}<form method="post" action="{{url_for('beton.driver_password',driver_id=x.id)}}"><input name="username" value="{{x.username or ''}}" placeholder="login" required><input name="password" type="password" placeholder="nowe hasło (min. 12)" required><button class="btn">Zmień hasło</button></form><form method="post" action="{{url_for('beton.driver_account_delete',driver_id=x.id)}}" style="margin-top:8px"><button class="btn" style="color:#b42318">Usuń konto</button></form>{% else %}<span class="muted">Brak konta — możesz utworzyć je przy dodawaniu kierowcy.</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5">Brak kierowców.</td></tr>{% endfor %}</tbody></table></div>
       <div class="card"><h2>Pojazdy</h2><table><thead><tr><th>Rejestracja</th><th>Marka / model</th><th>Naczepa</th><th>Kierowca</th></tr></thead><tbody>{% for x in vs %}<tr><td><b>{{x.registration_no}}</b></td><td>{{x.brand or ''}} {{x.model or ''}}</td><td>{{x.trailer_no or '-'}}</td><td>{{x.driver_name or '-'}}</td></tr>{% else %}<tr><td colspan="4">Brak pojazdów.</td></tr>{% endfor %}</tbody></table></div>
     {% endblock %}''',ds=ds,vs=vs,title='Kierowcy i pojazdy',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
     with D['conn']() as c:
@@ -325,6 +329,35 @@ def driver_password(driver_id):
     except Exception as exc:
         return redirect(url_for('beton.drivers',error=str(exc)))
 
+@bp.post('/drivers/<int:driver_id>/account/delete')
+def driver_account_delete(driver_id):
+    """Remove only the driver's login; the driver and operational history stay."""
+    try:
+        with D['conn']() as c:
+            account=c.execute('SELECT * FROM driver_accounts WHERE driver_id=?',(driver_id,)).fetchone()
+            driver=c.execute('SELECT name FROM drivers WHERE id=?',(driver_id,)).fetchone()
+        if not account:
+            raise ValueError('Ten kierowca nie ma konta do usunięcia.')
+        auth_user_id=str(account['auth_user_id'] or '')
+        if not auth_user_id:
+            raise ValueError('Brakuje identyfikatora konta kierowcy.')
+        # First remove the central account. Local SQLite may disappear after a
+        # deploy, so it must never be treated as the authority for deletion.
+        try:
+            D['supabase_request']('/rest/v1/driver_profiles',method='DELETE',params={'driver_id':f'eq.{driver_id}'})
+            D['supabase_request']('/rest/v1/driver_accounts',method='DELETE',params={'driver_id':f'eq.{driver_id}'})
+            D['supabase_request'](f'/auth/v1/admin/users/{auth_user_id}',method='DELETE')
+        except RuntimeError as exc:
+            if 'HTTP 404' not in str(exc):
+                raise
+        with D['conn']() as c:
+            c.execute('DELETE FROM driver_accounts WHERE driver_id=?',(driver_id,))
+            c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'delete_account','driver',driver_id,'{}',stamp()))
+        name=(driver['name'] if driver else 'kierowcy')
+        return redirect(url_for('beton.drivers',ok=f'Konto kierowcy {name} zostało usunięte. Kierowca pozostaje na liście.'))
+    except Exception as exc:
+        return redirect(url_for('beton.drivers',error=f'Nie usunięto konta: {exc}'))
+
 @bp.post('/vehicles/add')
 def vehicle_add():
     s=stamp()
@@ -359,9 +392,13 @@ def transport_new():
         if request.method=='POST':
             if not wz:abort(400)
             if not ds or not vs:raise ValueError('Najpierw dodaj kierowcę i pojazd')
-            s=stamp(); cur=c.execute("INSERT INTO transports(transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,'assigned',?,?,?,?)",(next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],request.form.get('destination','') or wz['destination'],actor(),actor(),s,s)); tid=cur.lastrowid
-            for item in wz_items:c.execute('INSERT INTO transport_items(transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?)',(tid,item['id'],item['qty_issued'] or item['qty_planned'],s))
+            s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],request.form.get('destination','') or wz['destination'],actor(),actor(),s,s));
+            for item in wz_items:c.execute('INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)',(cloud_id(),tid,item['id'],item['qty_issued'] or item['qty_planned'],s))
             c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'create','transport',tid,'{}',s))
+            c.commit()
+            D['sync_local_rows_to_supabase']('transports','id',[tid])
+            transport_item_ids=[x['id'] for x in c.execute('SELECT id FROM transport_items WHERE transport_id=?',(tid,)).fetchall()]
+            D['sync_local_rows_to_supabase']('transport_items','id',transport_item_ids)
             return redirect(url_for('beton.transport_view',transport_id=tid))
     return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Transport z dokumentu WZ</h1><div class="card"><form method="get"><label>Wydane WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div></div><label>Miejsce dostawy</label><input name="destination" value="{{wz.destination or ''}}"><table><thead><tr><th>Materiał</th><th>Ilość wydana</th></tr></thead><tbody>{% for x in wz_items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued or x.qty_planned}}</td></tr>{% endfor %}</tbody></table><button class="btn primary">Utwórz i przypisz transport</button></form>{% endif %}{% endblock %}''',wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
@@ -373,14 +410,32 @@ def transport_view(transport_id):
         items=c.execute('SELECT ti.qty,w.sku FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id WHERE ti.transport_id=?',(transport_id,)).fetchall()
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a>{% if x.invoice_id %}<a class="btn" href="{{url_for('invoice_download_admin',invoice_id=x.invoice_id)}}">Pobierz fakturę</a>{% endif %}</div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><div class="line"></div><table><thead><tr><th>Materiał / SKU</th><th>Ilość</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}}</b></td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',x=x,items=items,title=x['transport_no'],base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
+def current_driver_id():
+    """Resolve the logged-in Supabase account to the internal driver record."""
+    auth_user_id=str((getattr(g,'client_user',{}) or {}).get('id') or '').strip()
+    if not auth_user_id:
+        return None
+    with D['conn']() as c:
+        row=c.execute('''SELECT d.id FROM driver_accounts a
+            JOIN drivers d ON d.id=a.driver_id
+            WHERE a.auth_user_id=? AND d.active=1 AND d.deleted_at IS NULL''',(auth_user_id,)).fetchone()
+    return int(row['id']) if row else None
+
+
 @driver_api.get('/transports')
 def driver_transports_api():
-    email=(g.client_user.get('email') or '').strip().lower()
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        pass
+    driver_id=current_driver_id()
+    if not driver_id:
+        return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
     with D['conn']() as c:
         rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no,
           (SELECT a.status FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) plant_status,
           (SELECT b.code FROM dispatch_appointments a LEFT JOIN loading_bays b ON b.id=a.loading_bay_id WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) loading_bay
-          FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE lower(d.email)=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(email,)).fetchall()
+          FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE t.driver_id=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(driver_id,)).fetchall()
         result=[]
         for r in rows:
             x=dict(r); x['items']=[dict(z) for z in c.execute('SELECT w.sku,ti.qty FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id WHERE ti.transport_id=?',(r['id'],))]; result.append(x)
@@ -388,12 +443,13 @@ def driver_transports_api():
 
 @driver_api.post('/transports/<int:transport_id>/status')
 def driver_transport_status_api(transport_id):
-    email=(g.client_user.get('email') or '').strip().lower(); data=request.get_json(silent=True) or {}; status=str(data.get('status',''))
+    driver_id=current_driver_id(); email=(g.client_user.get('email') or '').strip().lower(); data=request.get_json(silent=True) or {}; status=str(data.get('status',''))
+    if not driver_id:return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
     allowed={'issued','in_transit','delivered','returned','problem'}
     if status not in allowed:return jsonify(ok=False,error='Niedozwolony status'),400
     field={'issued':'issued_at','in_transit':'departed_at','delivered':'delivered_at','returned':'returned_at'}.get(status)
     with D['conn']() as c:
-        row=c.execute('SELECT t.id,t.status,t.wz_id FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND lower(d.email)=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,email)).fetchone()
+        row=c.execute('SELECT t.id,t.status,t.wz_id FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,driver_id)).fetchone()
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
         transitions={'assigned':{'issued','problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'issued','in_transit','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
@@ -413,14 +469,16 @@ def driver_transport_status_api(transport_id):
 
 @driver_api.get('/transports/<int:transport_id>/invoice')
 def driver_invoice_api(transport_id):
-    email=(g.client_user.get('email') or '').strip().lower()
-    with D['conn']() as c: row=c.execute('SELECT w.invoice_id FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND lower(d.email)=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,email)).fetchone()
+    driver_id=current_driver_id()
+    if not driver_id:abort(403)
+    with D['conn']() as c: row=c.execute('SELECT w.invoice_id FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,driver_id)).fetchone()
     if not row or not row['invoice_id']:abort(404)
     return current_app.view_functions['invoice_download_admin'](row['invoice_id'])
 
 @driver_api.post('/transports/<int:transport_id>/photos')
 def driver_delivery_photo_api(transport_id):
-    email=(g.client_user.get('email') or '').strip().lower()
+    driver_id=current_driver_id()
+    if not driver_id:return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
     photo=request.files.get('photo')
     if not photo or not photo.filename:
         return jsonify(ok=False,error='Wybierz zdjęcie.'),400
@@ -430,7 +488,7 @@ def driver_delivery_photo_api(transport_id):
     if not raw or len(raw)>10*1024*1024:
         return jsonify(ok=False,error='Zdjęcie jest puste lub większe niż 10 MB.'),400
     with D['conn']() as c:
-        row=c.execute('SELECT t.id FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND lower(d.email)=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,email)).fetchone()
+        row=c.execute('SELECT t.id FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,driver_id)).fetchone()
     if not row:
         return jsonify(ok=False,error='Brak dostępu do transportu.'),403
     ext={'image/jpeg':'jpg','image/png':'png','image/webp':'webp'}[photo.mimetype]
