@@ -3797,6 +3797,7 @@ register_beton_logistics(app, {
     "supabase_enabled": supabase_enabled,
     "supabase_request": supabase_request,
     "supabase_storage_upload_bytes": supabase_storage_upload_bytes,
+    "pull_shared_tables_from_supabase": pull_shared_tables_from_supabase,
     "BASE_URL": BASE_URL,
     "DB_PATH": DB_PATH,
 })
