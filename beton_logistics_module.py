@@ -1,349 +1,455 @@
-import re
-import unicodedata
+# -*- coding: utf-8 -*-
+import json
+from datetime import datetime, timedelta
 
-from flask import Blueprint, abort, current_app, g, jsonify, redirect, render_template_string, request, session, url_for
+from flask import request, redirect, url_for
+from flask import render_template_string
 
-bp=Blueprint('beton',__name__,url_prefix='/beton')
-driver_api=Blueprint('driver_api',__name__,url_prefix='/api/driver')
-D={}
 
-def register_beton_logistics(app,deps):
-    global D; D=deps
-    with D['conn']() as c:
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS drivers(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT,email TEXT,
-          active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
-        CREATE TABLE IF NOT EXISTS driver_accounts(
-          driver_id INTEGER PRIMARY KEY REFERENCES drivers(id) ON DELETE CASCADE,
-          username TEXT NOT NULL UNIQUE,auth_user_id TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS vehicles(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,brand TEXT,model TEXT,registration_no TEXT NOT NULL UNIQUE,
-          trailer_no TEXT,year INTEGER,vin TEXT,current_mileage REAL NOT NULL DEFAULT 0,driver_id INTEGER REFERENCES drivers(id),
-          active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
-        CREATE TABLE IF NOT EXISTS wz_documents(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,wz_no TEXT NOT NULL UNIQUE,order_id INTEGER NOT NULL REFERENCES orders(id),
-          invoice_id INTEGER REFERENCES invoices(id),issue_location TEXT NOT NULL,warehouse_location TEXT NOT NULL,
-          destination TEXT,status TEXT NOT NULL DEFAULT 'created',created_by TEXT NOT NULL,issued_by TEXT,
-          ready_by TEXT,invoiced_by TEXT,created_at TEXT NOT NULL,issued_at TEXT,ready_at TEXT,invoiced_at TEXT,
-          notes TEXT DEFAULT '',deleted_at TEXT);
-        CREATE TABLE IF NOT EXISTS wz_items(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,wz_id INTEGER NOT NULL REFERENCES wz_documents(id) ON DELETE CASCADE,
-          order_item_id INTEGER NOT NULL REFERENCES order_items(id),product_id INTEGER NOT NULL REFERENCES products(id),
-          sku TEXT NOT NULL,qty_planned REAL NOT NULL CHECK(qty_planned>0),qty_issued REAL,
-          created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS transports(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,transport_no TEXT NOT NULL UNIQUE,invoice_id INTEGER REFERENCES invoices(id),wz_id INTEGER REFERENCES wz_documents(id),
-          driver_id INTEGER NOT NULL REFERENCES drivers(id),vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),destination TEXT,
-          status TEXT NOT NULL DEFAULT 'assigned',issued_at TEXT,departed_at TEXT,delivered_at TEXT,returned_at TEXT,
-          receiver_name TEXT,driver_notes TEXT,created_by TEXT NOT NULL,updated_by TEXT NOT NULL,
-          created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
-        CREATE TABLE IF NOT EXISTS transport_items(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,transport_id INTEGER NOT NULL REFERENCES transports(id) ON DELETE CASCADE,
-          invoice_allocation_id INTEGER REFERENCES invoice_allocations(id),wz_item_id INTEGER REFERENCES wz_items(id),qty REAL NOT NULL CHECK(qty>0),created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS delivery_photos(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,transport_id INTEGER NOT NULL REFERENCES transports(id) ON DELETE CASCADE,
-          storage_ref TEXT NOT NULL,photo_type TEXT NOT NULL DEFAULT 'delivery',caption TEXT,created_by TEXT NOT NULL,created_at TEXT NOT NULL,deleted_at TEXT);
-        CREATE TABLE IF NOT EXISTS audit_log(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,actor TEXT NOT NULL,action TEXT NOT NULL,entity_type TEXT NOT NULL,
-          entity_id INTEGER,details_json TEXT,created_at TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS idx_transports_invoice ON transports(invoice_id);
-        CREATE INDEX IF NOT EXISTS idx_wz_status ON wz_documents(status,created_at);
-        CREATE INDEX IF NOT EXISTS idx_transports_driver_status ON transports(driver_id,status);
-        CREATE INDEX IF NOT EXISTS idx_transport_items_transport ON transport_items(transport_id);
-        ''')
-        transport_cols={r[1]:r for r in c.execute('PRAGMA table_info(transports)')}
-        if 'wz_id' not in transport_cols:c.execute('ALTER TABLE transports ADD COLUMN wz_id INTEGER REFERENCES wz_documents(id)')
-        item_cols={r[1]:r for r in c.execute('PRAGMA table_info(transport_items)')}
-        if 'wz_item_id' not in item_cols:c.execute('ALTER TABLE transport_items ADD COLUMN wz_item_id INTEGER REFERENCES wz_items(id)')
-        # Starsza wersja wymagała faktury przed transportem. Migracja odwraca obieg na WZ -> transport -> FV.
-        transport_cols={r[1]:r for r in c.execute('PRAGMA table_info(transports)')}
-        if transport_cols.get('invoice_id') and int(transport_cols['invoice_id'][3] or 0)==1:
-            c.execute('PRAGMA foreign_keys=OFF')
-            c.executescript('''
-            ALTER TABLE transport_items RENAME TO transport_items_invoice_first_backup;
-            ALTER TABLE delivery_photos RENAME TO delivery_photos_invoice_first_backup;
-            ALTER TABLE transports RENAME TO transports_invoice_first_backup;
-            CREATE TABLE transports(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,transport_no TEXT NOT NULL UNIQUE,invoice_id INTEGER REFERENCES invoices(id),
-              wz_id INTEGER REFERENCES wz_documents(id),driver_id INTEGER NOT NULL REFERENCES drivers(id),
-              vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),destination TEXT,status TEXT NOT NULL DEFAULT 'assigned',
-              issued_at TEXT,departed_at TEXT,delivered_at TEXT,returned_at TEXT,receiver_name TEXT,driver_notes TEXT,
-              created_by TEXT NOT NULL,updated_by TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
-            INSERT INTO transports(id,transport_no,invoice_id,wz_id,driver_id,vehicle_id,destination,status,issued_at,departed_at,delivered_at,returned_at,receiver_name,driver_notes,created_by,updated_by,created_at,updated_at,deleted_at)
-              SELECT id,transport_no,invoice_id,wz_id,driver_id,vehicle_id,destination,status,issued_at,departed_at,delivered_at,returned_at,receiver_name,driver_notes,created_by,updated_by,created_at,updated_at,deleted_at FROM transports_invoice_first_backup;
-            CREATE TABLE transport_items(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,transport_id INTEGER NOT NULL REFERENCES transports(id) ON DELETE CASCADE,
-              invoice_allocation_id INTEGER REFERENCES invoice_allocations(id),wz_item_id INTEGER REFERENCES wz_items(id),
-              qty REAL NOT NULL CHECK(qty>0),created_at TEXT NOT NULL);
-            INSERT INTO transport_items(id,transport_id,invoice_allocation_id,wz_item_id,qty,created_at)
-              SELECT id,transport_id,invoice_allocation_id,wz_item_id,qty,created_at FROM transport_items_invoice_first_backup;
-            CREATE TABLE delivery_photos(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,transport_id INTEGER NOT NULL REFERENCES transports(id) ON DELETE CASCADE,
-              storage_ref TEXT NOT NULL,photo_type TEXT NOT NULL DEFAULT 'delivery',caption TEXT,created_by TEXT NOT NULL,
-              created_at TEXT NOT NULL,deleted_at TEXT);
-            INSERT INTO delivery_photos SELECT * FROM delivery_photos_invoice_first_backup;
-            DROP TABLE transport_items_invoice_first_backup;
-            DROP TABLE delivery_photos_invoice_first_backup;
-            DROP TABLE transports_invoice_first_backup;
-            CREATE INDEX IF NOT EXISTS idx_transports_invoice ON transports(invoice_id);
-            CREATE INDEX IF NOT EXISTS idx_transports_wz ON transports(wz_id);
-            CREATE INDEX IF NOT EXISTS idx_transports_driver_status ON transports(driver_id,status);
-            CREATE INDEX IF NOT EXISTS idx_transport_items_transport ON transport_items(transport_id);
-            ''')
-            c.execute('PRAGMA foreign_keys=ON')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_transports_wz ON transports(wz_id)')
-    app.register_blueprint(bp)
-    app.register_blueprint(driver_api)
+CASH_FLOW_SETTING_KEYS = {
+    "account_balance": "0",
+    "monthly_zus": "0",
+    "cash_buffer": "0",
+    "planned_material_order_budget": "0",
+    "growth_percent": "0",
+}
 
-def stamp(): return D['now_iso']()
-def actor(): return session.get('display_name') or session.get('username') or 'kierowca'
-def next_no(c):
-    year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM transports WHERE transport_no LIKE ?",(f'TR/{year}/%',)).fetchone()[0]+1
-    return f'TR/{year}/{n:05d}'
-def next_wz_no(c):
-    year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM wz_documents WHERE wz_no LIKE ?",(f'WZ/{year}/%',)).fetchone()[0]+1
-    return f'WZ/{year}/{n:05d}'
 
-def driver_auth_email(username):
-    value=unicodedata.normalize('NFD',(username or '').strip().lower())
-    value=''.join(ch for ch in value if unicodedata.category(ch)!='Mn')
-    value=re.sub(r'[^a-z0-9._-]+','',value)
+def parse_date_safe(value):
+    value = (value or "").strip()
     if not value:
-        raise ValueError('Login kierowcy może zawierać litery, cyfry, kropkę, myślnik i podkreślenie.')
-    return f'{value}@kierowca.betonlagow.local'
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(value[:19] if "%H" in fmt else value[:10], fmt).date()
+        except Exception:
+            pass
+    return None
 
-def save_row_to_supabase(table, row, conflict='id'):
-    """Critical operational records are saved centrally before the response."""
-    if not D['supabase_enabled']():
-        raise RuntimeError('Brak połączenia z Supabase. Nie można zapisać danych bezpiecznie w chmurze.')
-    D['supabase_request'](f'/rest/v1/{table}', method='POST', params={'on_conflict': conflict}, payload=[dict(row)], prefer='resolution=merge-duplicates,return=minimal')
 
-def provision_driver_account(driver_id, username, password, update=False):
-    if not D['supabase_enabled']():
-        raise RuntimeError('Nie można nadać hasła: brakuje SUPABASE_URL lub SUPABASE_SERVICE_ROLE_KEY na Render.')
-    username=(username or '').strip()
-    if len(username)<3 or len(password or '')<12:
-        raise ValueError('Login musi mieć min. 3 znaki, a hasło min. 12 znaków.')
-    with D['conn']() as c:
-        driver=c.execute('SELECT * FROM drivers WHERE id=? AND deleted_at IS NULL',(driver_id,)).fetchone()
-        account=c.execute('SELECT * FROM driver_accounts WHERE driver_id=?',(driver_id,)).fetchone()
-    if not driver:
-        raise ValueError('Nie znaleziono kierowcy.')
-    email=driver_auth_email(username)
-    if account:
-        D['supabase_request'](f"/auth/v1/admin/users/{account['auth_user_id']}",method='PUT',payload={'password':password,'email_confirm':True,'user_metadata':{'driver_id':driver_id,'username':username}})
-        auth_user_id=account['auth_user_id']
-    else:
-        # Save the driver in Supabase before creating the protected profile relation.
-        D['supabase_request']('/rest/v1/drivers',method='POST',payload=[dict(driver)],prefer='resolution=merge-duplicates,return=minimal')
-        auth=D['supabase_request']('/auth/v1/admin/users',method='POST',payload={'email':email,'password':password,'email_confirm':True,'user_metadata':{'driver_id':driver_id,'username':username}})
-        auth_user_id=(auth or {}).get('id')
-        if not auth_user_id:
-            raise RuntimeError('Supabase nie zwrócił identyfikatora konta kierowcy.')
-        D['supabase_request']('/rest/v1/driver_profiles',method='POST',payload=[{'user_id':auth_user_id,'driver_id':driver_id,'active':True}],prefer='resolution=merge-duplicates,return=minimal')
-    with D['conn']() as c:
-        c.execute('INSERT INTO driver_accounts(driver_id,username,auth_user_id,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(driver_id) DO UPDATE SET username=excluded.username,updated_at=excluded.updated_at',(driver_id,username,auth_user_id,stamp(),stamp()))
-    return username
+def ensure_cash_flow_tables(conn, now_iso):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cash_flow_settings(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+    )
+    """)
+    ts = now_iso()
+    for key, value in CASH_FLOW_SETTING_KEYS.items():
+        cur.execute("""
+          INSERT OR IGNORE INTO cash_flow_settings(key, value, updated_at)
+          VALUES(?,?,?)
+        """, (key, value, ts))
+    c.commit()
+    c.close()
 
-@bp.get('/wz')
-def wz_list():
-    with D['conn']() as c:
-        rows=c.execute('''SELECT w.*,o.customer_name,i.invoice_no,
-          (SELECT t.transport_no FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL ORDER BY t.id DESC LIMIT 1) transport_no
-          FROM wz_documents w JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id
-          WHERE w.deleted_at IS NULL ORDER BY w.id DESC''').fetchall()
-    return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Dokumenty WZ</h1><a class="btn primary right" href="{{url_for('beton.wz_new')}}">+ Wystaw WZ</a></div><div class="card"><table><thead><tr><th>WZ</th><th>Klient</th><th>Miejsca</th><th>Status</th><th>Transport</th><th>Faktura</th></tr></thead><tbody>{% for x in rows %}<tr><td><a href="{{url_for('beton.wz_view',wz_id=x.id)}}"><b>{{x.wz_no}}</b></a><br><span class="muted">{{x.created_at}}</span></td><td>{{x.customer_name}}</td><td>{{x.issue_location}} → {{x.warehouse_location}}</td><td><span class="badge">{{x.status}}</span></td><td>{{x.transport_no or '—'}}</td><td>{{x.invoice_no or '—'}}</td></tr>{% else %}<tr><td colspan="6">Brak dokumentów WZ.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',rows=rows,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
-@bp.route('/wz/new',methods=['GET','POST'])
-def wz_new():
-    order_id=int(request.values.get('order_id') or 0)
-    with D['conn']() as c:
-        orders=c.execute("SELECT id,order_no,customer_name,created_at FROM orders WHERE lower(status) NOT IN ('cancelled') ORDER BY id DESC LIMIT 300").fetchall()
-        order=c.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone() if order_id else None
-        items=c.execute('''SELECT oi.*,COALESCE(p.name,p.sku) product_name,COALESCE((SELECT SUM(wi.qty_planned) FROM wz_items wi JOIN wz_documents wd ON wd.id=wi.wz_id WHERE wi.order_item_id=oi.id AND wd.deleted_at IS NULL),0) wz_reserved FROM order_items oi JOIN products p ON p.id=oi.product_id WHERE oi.order_id=? ORDER BY oi.id''',(order_id,)).fetchall() if order else []
-        if request.method=='POST':
-            if not order:abort(400)
-            s=stamp(); cur=c.execute('''INSERT INTO wz_documents(wz_no,order_id,issue_location,warehouse_location,destination,status,created_by,created_at,notes)
-              VALUES(?,?,?,?,?,'created',?,?,?)''',(next_wz_no(c),order_id,request.form.get('issue_location','Miejscowość X').strip(),request.form.get('warehouse_location','Miejscowość Y').strip(),request.form.get('destination','').strip(),actor(),s,request.form.get('notes','').strip()))
-            wz_id=cur.lastrowid; count=0
-            for item in items:
-                qty=float(request.form.get(f'qty_{item["id"]}') or 0)
-                if qty>0 and qty<=float(item['qty'])-float(item['wz_reserved']):
-                    c.execute('INSERT INTO wz_items(wz_id,order_item_id,product_id,sku,qty_planned,created_at) VALUES(?,?,?,?,?,?)',(wz_id,item['id'],item['product_id'],item['sku'],qty,s)); count+=1
-            if not count:raise ValueError('WZ musi zawierać co najmniej jedną pozycję')
-            return redirect(url_for('beton.wz_view',wz_id=wz_id))
-    return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Nowy dokument WZ</h1><div class="card"><form method="get"><label>Zamówienie klienta</label><select name="order_id" onchange="this.form.submit()"><option value="">Wybierz zamówienie</option>{% for x in orders %}<option value="{{x.id}}" {{'selected' if x.id==order_id}}>{{x.order_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>{% if order %}<form method="post" class="card"><input type="hidden" name="order_id" value="{{order.id}}"><h2>{{order.order_no}} · {{order.customer_name}}</h2><div class="grid3"><div><label>Wystawiono w</label><input name="issue_location" value="Miejscowość X" required></div><div><label>Magazyn wydający</label><input name="warehouse_location" value="Miejscowość Y" required></div><div><label>Miejsce dostawy</label><input name="destination"></div></div><table><thead><tr><th>Materiał</th><th>Zamówiono</th><th>Już na WZ</th><th>Na nowym WZ</th></tr></thead><tbody>{% for x in items %}{% set available=x.qty-x.wz_reserved %}<tr><td>{{x.product_name}}<br><span class="muted">{{x.sku}}</span></td><td>{{x.qty}}</td><td>{{x.wz_reserved}}</td><td><input type="number" min="0" max="{{available}}" step="0.01" name="qty_{{x.id}}" value="{{available}}"></td></tr>{% endfor %}</tbody></table><label>Uwagi</label><textarea name="notes"></textarea><button class="btn primary">Wystaw WZ</button></form>{% endif %}{% endblock %}''',orders=orders,order=order,order_id=order_id,items=items,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+def register_cash_flow(app, deps):
+    conn = deps["conn"]
+    now_iso = deps["now_iso"]
+    app_now = deps["app_now"]
+    to_float = deps["to_float"]
+    maybe_pull_shared_from_supabase = deps["maybe_pull_shared_from_supabase"]
+    sync_local_rows_to_supabase = deps.get("sync_local_rows_to_supabase")
+    base_url = deps["BASE_URL"]
+    db_path = deps["DB_PATH"]
 
-@bp.get('/wz/<int:wz_id>')
-def wz_view(wz_id):
-    with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.customer_name,o.order_no,i.invoice_no FROM wz_documents w JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
-        if not w:abort(404)
-        items=c.execute('SELECT * FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall()
-        transport=c.execute('SELECT * FROM transports WHERE wz_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1',(wz_id,)).fetchone()
-    return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{w.wz_no}}</h1><span class="badge">{{w.status}}</span><a class="btn right" target="_blank" href="{{url_for('beton.wz_print',wz_id=w.id)}}">Drukuj WZ</a></div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{w.customer_name}}</b></div><div><span class="muted">Wystawiono / magazyn</span><br>{{w.issue_location}} → {{w.warehouse_location}}</div><div><span class="muted">Dostawa</span><br>{{w.destination or '—'}}</div></div><div class="line"></div><table><thead><tr><th>Materiał</th><th>Plan</th><th>Wydano</th></tr></thead><tbody>{% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_planned}}</td><td>{{x.qty_issued if x.qty_issued is not none else '—'}}</td></tr>{% endfor %}</tbody></table><div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status=='issued' and not transport %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przypisz kierowcę i auto</a>{% elif w.status=='returned' %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ — gotowe do faktury VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Transport {{transport.transport_no}}</a>{% endif %}</div></div><div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>{% endblock %}''',w=w,items=items,transport=transport,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+    ensure_cash_flow_tables(conn, now_iso)
 
-@bp.get('/wz/<int:wz_id>/print')
-def wz_print(wz_id):
-    with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.customer_name,o.customer_address FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
-        if not w:abort(404)
-        items=c.execute('SELECT sku,qty_planned,qty_issued FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall()
-    return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{w.wz_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}h1{margin-bottom:4px}table{border-collapse:collapse;width:100%;margin:22px 0}th,td{border:1px solid #333;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.sign{display:grid;grid-template-columns:1fr 1fr;gap:70px;margin-top:70px}.line{border-top:1px solid #111;padding-top:7px;text-align:center}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Wydanie zewnętrzne {{w.wz_no}}</h1><p>Data: {{w.created_at[:10]}} · Status: {{w.status}}</p><div class="grid"><div><b>Nabywca / odbiorca</b><br>{{w.customer_name}}<br>{{w.customer_address or ''}}</div><div><b>Wydanie</b><br>{{w.issue_location}} → {{w.warehouse_location}}<br>Dostawa: {{w.destination or '—'}}</div></div><table><thead><tr><th>Materiał</th><th>Ilość</th></tr></thead><tbody>{% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td></tr>{% endfor %}</tbody></table><p>Uwagi: {{w.notes or '—'}}</p><div class="sign"><div class="line">Wydał: {{w.issued_by or ''}}</div><div class="line">Odebrał / podpis i pieczęć</div></div></html>''',w=w,items=items)
+    def cash_flow_settings_load():
+        data = dict(CASH_FLOW_SETTING_KEYS)
+        c = conn()
+        cur = c.cursor()
+        try:
+            cur.execute("SELECT key, value FROM cash_flow_settings")
+            for row in cur.fetchall():
+                if row["key"] in data:
+                    data[row["key"]] = row["value"]
+        except Exception:
+            pass
+        c.close()
+        return data
 
-@bp.post('/wz/<int:wz_id>/issue')
-def wz_issue(wz_id):
-    s=stamp()
-    with D['conn']() as c:
-        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status='created'",(wz_id,)).fetchone()
-        if not w:abort(409)
-        c.execute('UPDATE wz_items SET qty_issued=qty_planned WHERE wz_id=?',(wz_id,))
-        c.execute("UPDATE wz_documents SET status='issued',issued_by=?,issued_at=? WHERE id=?",(actor(),s,wz_id))
-    return redirect(url_for('beton.wz_view',wz_id=wz_id))
+    def cash_flow_settings_save(form):
+        c = conn()
+        cur = c.cursor()
+        ts = now_iso()
+        for key in CASH_FLOW_SETTING_KEYS:
+            val = str(to_float(form.get(key), 0.0))
+            cur.execute("""
+              INSERT INTO cash_flow_settings(key, value, updated_at)
+              VALUES(?,?,?)
+              ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """, (key, val, ts))
+        c.commit()
+        c.close()
+        if sync_local_rows_to_supabase:
+            # Ustawienia płynności są wspólne dla całej firmy, a nie dla jednej
+            # chwilowej instancji Rendera.
+            sync_local_rows_to_supabase("cash_flow_settings", "key", list(CASH_FLOW_SETTING_KEYS))
 
-@bp.post('/wz/<int:wz_id>/ready')
-def wz_ready(wz_id):
-    s=stamp()
-    with D['conn']() as c:
-        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status='returned'",(wz_id,)).fetchone()
-        if not w:abort(409)
-        c.execute("UPDATE wz_documents SET status='ready_invoice',ready_by=?,ready_at=? WHERE id=?",(actor(),s,wz_id))
-    return redirect(url_for('beton.wz_view',wz_id=wz_id))
+    @app.route("/cash-flow", methods=["GET", "POST"])
+    def cash_flow():
+        maybe_pull_shared_from_supabase()
+        if request.method == "POST":
+            cash_flow_settings_save(request.form)
+            return redirect(url_for("cash_flow", saved=1))
 
-@bp.get('/drivers')
-def drivers():
-    with D['conn']() as c:
-        ds=c.execute('''SELECT d.*,a.username,a.auth_user_id FROM drivers d LEFT JOIN driver_accounts a ON a.driver_id=d.id WHERE d.deleted_at IS NULL ORDER BY d.active DESC,d.name''').fetchall()
-        vs=c.execute('SELECT v.*,d.name driver_name FROM vehicles v LEFT JOIN drivers d ON d.id=v.driver_id WHERE v.deleted_at IS NULL ORDER BY v.active DESC,v.registration_no').fetchall()
-    return render_template_string('''{% extends "base.html" %}{% block content %}
-      <h1>Kierowcy i pojazdy</h1>
-      {% if request.args.get('error') %}<div class="notice">{{request.args.get('error')}}</div>{% endif %}
-      {% if request.args.get('ok') %}<div class="notice">{{request.args.get('ok')}}</div>{% endif %}
-      <div class="row"><div class="card"><h2>Dodaj kierowcę i konto</h2><form method="post" action="{{url_for('beton.driver_add')}}"><label>Imię i nazwisko</label><input name="name" required><label>Telefon</label><input name="phone"><label>Login do panelu kierowcy</label><input name="username" placeholder="np. Kicia" required><label>Hasło kierowcy (min. 12 znaków)</label><input type="password" name="password" required><button class="btn primary" style="margin-top:12px">Dodaj kierowcę i ustaw hasło</button></form></div><div class="card"><h2>Dodaj pojazd</h2><form method="post" action="{{url_for('beton.vehicle_add')}}"><label>Numer rejestracyjny</label><input name="registration_no" required><label>Naczepa</label><input name="trailer_no"><label>Marka / model</label><input name="brand"><input name="model"><label>Domyślny kierowca</label><select name="driver_id"><option value="">—</option>{% for d in ds %}<option value="{{d.id}}">{{d.name}}</option>{% endfor %}</select><button class="btn primary" style="margin-top:12px">Dodaj pojazd</button></form></div></div>
-      <div class="card"><h2>Kierowcy</h2><table><thead><tr><th>Kierowca</th><th>Login</th><th>Telefon</th><th>Status</th><th>Hasło</th></tr></thead><tbody>{% for x in ds %}<tr><td><b>{{x.name}}</b></td><td>{{x.username or 'Brak konta'}}</td><td>{{x.phone or '-'}}</td><td><span class="badge">{{'Aktywny' if x.active else 'Nieaktywny'}}</span></td><td><form method="post" action="{{url_for('beton.driver_password',driver_id=x.id)}}"><input name="username" value="{{x.username or ''}}" placeholder="login" required><input name="password" type="password" placeholder="nowe hasło (min. 12)" required><button class="btn">Zmień hasło</button></form></td></tr>{% else %}<tr><td colspan="5">Brak kierowców.</td></tr>{% endfor %}</tbody></table></div>
-      <div class="card"><h2>Pojazdy</h2><table><thead><tr><th>Rejestracja</th><th>Marka / model</th><th>Naczepa</th><th>Kierowca</th></tr></thead><tbody>{% for x in vs %}<tr><td><b>{{x.registration_no}}</b></td><td>{{x.brand or ''}} {{x.model or ''}}</td><td>{{x.trailer_no or '-'}}</td><td>{{x.driver_name or '-'}}</td></tr>{% else %}<tr><td colspan="4">Brak pojazdów.</td></tr>{% endfor %}</tbody></table></div>
-    {% endblock %}''',ds=ds,vs=vs,title='Kierowcy i pojazdy',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
-    with D['conn']() as c:
-        ds=c.execute('SELECT * FROM drivers WHERE deleted_at IS NULL ORDER BY active DESC,name').fetchall()
-        vs=c.execute('SELECT v.*,d.name driver_name FROM vehicles v LEFT JOIN drivers d ON d.id=v.driver_id WHERE v.deleted_at IS NULL ORDER BY v.active DESC,v.registration_no').fetchall()
-    return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Kierowcy i pojazdy</h1></div><div class="row"><div class="card"><h2>Dodaj kierowcę</h2><form method="post" action="{{url_for('beton.driver_add')}}"><label>Imię i nazwisko</label><input name="name" required><label>Telefon</label><input name="phone"><label>E-mail / login</label><input name="email" type="email"><button class="btn primary" style="margin-top:12px">Dodaj kierowcę</button></form></div><div class="card"><h2>Dodaj pojazd</h2><form method="post" action="{{url_for('beton.vehicle_add')}}"><div class="row"><div><label>Numer rejestracyjny</label><input name="registration_no" required></div><div><label>Naczepa</label><input name="trailer_no"></div><div><label>Marka</label><input name="brand"></div><div><label>Model</label><input name="model"></div><div><label>Rok</label><input name="year" type="number"></div><div><label>VIN</label><input name="vin"></div><div><label>Przebieg</label><input name="current_mileage" type="number" value="0"></div><div><label>Domyślny kierowca</label><select name="driver_id"><option value="">—</option>{% for d in ds %}<option value="{{d.id}}">{{d.name}}</option>{% endfor %}</select></div></div><button class="btn primary" style="margin-top:12px">Dodaj pojazd</button></form></div></div><div class="card"><h2>Kierowcy</h2><table><thead><tr><th>Kierowca</th><th>Telefon</th><th>E-mail</th><th>Status</th></tr></thead><tbody>{% for x in ds %}<tr><td><b>{{x.name}}</b></td><td>{{x.phone or '-'}}</td><td>{{x.email or '-'}}</td><td><span class="badge">{{'Aktywny' if x.active else 'Nieaktywny'}}</span></td></tr>{% endfor %}</tbody></table></div><div class="card"><h2>Pojazdy</h2><table><thead><tr><th>Rejestracja</th><th>Marka / model</th><th>Naczepa</th><th>Kierowca</th><th>Przebieg</th></tr></thead><tbody>{% for x in vs %}<tr><td><b>{{x.registration_no}}</b></td><td>{{x.brand or ''}} {{x.model or ''}}</td><td>{{x.trailer_no or '-'}}</td><td>{{x.driver_name or '-'}}</td><td>{{x.current_mileage}}</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',ds=ds,vs=vs,title='Kierowcy i pojazdy',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+        today = app_now().date()
+        settings = cash_flow_settings_load()
+        account_balance = to_float(settings.get("account_balance"), 0)
+        monthly_zus = to_float(settings.get("monthly_zus"), 0)
+        cash_buffer = to_float(settings.get("cash_buffer"), 0)
+        planned_material_order_budget = to_float(settings.get("planned_material_order_budget"), 0)
+        growth_percent = to_float(settings.get("growth_percent"), 0)
+        growth_factor = max(0, 1 + (growth_percent / 100.0))
 
-@bp.post('/drivers/add')
-def driver_add():
-    s=stamp()
-    try:
-        username=request.form.get('username','').strip()
-        password=request.form.get('password','')
-        with D['conn']() as c:
-            cur=c.execute('INSERT INTO drivers(name,phone,email,created_at,updated_at) VALUES(?,?,?,?,?)',(request.form['name'].strip(),request.form.get('phone','').strip(),driver_auth_email(username),s,s))
-            driver_id=cur.lastrowid
-            driver=c.execute('SELECT * FROM drivers WHERE id=?',(driver_id,)).fetchone()
-        save_row_to_supabase('drivers', driver)
-        provision_driver_account(driver_id,username,password)
-        with D['conn']() as c:
-            account=c.execute('SELECT * FROM driver_accounts WHERE driver_id=?',(driver_id,)).fetchone()
-        save_row_to_supabase('driver_accounts', account, 'driver_id')
-        return redirect(url_for('beton.drivers',ok=f'Konto kierowcy {username} zostało utworzone.'))
-    except Exception as exc:
-        return redirect(url_for('beton.drivers',error=str(exc)))
+        c = conn()
+        cur = c.cursor()
 
-@bp.post('/drivers/<int:driver_id>/password')
-def driver_password(driver_id):
-    try:
-        username=request.form.get('username','').strip()
-        provision_driver_account(driver_id,username,request.form.get('password',''),update=True)
-        return redirect(url_for('beton.drivers',ok=f'Hasło dla {username} zostało zmienione.'))
-    except Exception as exc:
-        return redirect(url_for('beton.drivers',error=str(exc)))
+        cur.execute("""
+          SELECT i.*,
+                 COALESCE(m.paid,0) AS paid,
+                 m.paid_at,
+                 COALESCE(m.payment_reminder,0) AS payment_reminder,
+                 m.invoice_items_json
+          FROM invoices i
+          LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+          ORDER BY COALESCE(i.payment_to, i.issue_date) ASC, i.id DESC
+        """)
+        invoices_rows = cur.fetchall()
 
-@bp.post('/vehicles/add')
-def vehicle_add():
-    s=stamp()
-    try:
-        with D['conn']() as c:
-            cur=c.execute('INSERT INTO vehicles(name,brand,model,registration_no,trailer_no,year,vin,current_mileage,driver_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(request.form.get('name',''),request.form.get('brand',''),request.form.get('model',''),request.form['registration_no'].strip().upper(),request.form.get('trailer_no','').strip().upper(),request.form.get('year') or None,request.form.get('vin',''),request.form.get('current_mileage') or 0,request.form.get('driver_id') or None,s,s))
-            vehicle=c.execute('SELECT * FROM vehicles WHERE id=?',(cur.lastrowid,)).fetchone()
-        save_row_to_supabase('vehicles', vehicle)
-        return redirect(url_for('beton.drivers',ok='Pojazd został zapisany w Supabase.'))
-    except Exception as exc:
-        return redirect(url_for('beton.drivers',error=str(exc)))
+        unpaid_total = overdue_total = due_7_total = due_30_total = 0.0
+        month_vat = month_net = month_profit = 0.0
+        last_30_net = last_30_profit = 0.0
+        sold_30_qty = 0
+        overdue_clients_map = {}
+        paid_clients_map = {}
+        inflow_rows = []
 
-@bp.get('/transports')
-def transports():
-    with D['conn']() as c:
-        rows=c.execute('''SELECT t.*,w.wz_no,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name
-          FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id
-          JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id
-          WHERE t.deleted_at IS NULL ORDER BY t.id DESC''').fetchall()
-    return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Transporty</h1><a class="btn primary right" href="{{url_for('beton.wz_list')}}">Wybierz wydane WZ</a></div><div class="card"><table><thead><tr><th>Transport</th><th>WZ</th><th>Klient</th><th>Kierowca / auto</th><th>Status</th><th>Faktura</th></tr></thead><tbody>{% for x in rows %}<tr><td><a href="{{url_for('beton.transport_view',transport_id=x.id)}}"><b>{{x.transport_no}}</b></a></td><td><a href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a></td><td>{{x.customer_name}}</td><td>{{x.driver_name}}<br>{{x.registration_no}}</td><td><span class="badge">{{x.status}}</span></td><td>{{x.invoice_no or '—'}}</td></tr>{% else %}<tr><td colspan="6">Brak transportów.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',rows=rows,title='Transporty',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+        def invoice_profit(invoice_id, invoice_net):
+            """Profit based on actual unit production costs, never a guessed margin."""
+            cur.execute("""
+              SELECT COUNT(*) AS n,
+                     COALESCE(SUM(ia.qty * (
+                       COALESCE(p.unit_material_cost,0) + COALESCE(p.unit_production_cost,0) +
+                       COALESCE(p.unit_transport_cost,0) + COALESCE(p.unit_other_cost,0)
+                     )),0) AS cost
+              FROM invoice_allocations ia
+              LEFT JOIN products p ON p.id=ia.product_id
+              WHERE ia.invoice_id=?
+            """, (inv["id"],))
+            row = cur.fetchone()
+            if not row or int(row["n"] or 0) == 0:
+                return 0.0
+            return invoice_net - to_float(row["cost"], 0)
 
-@bp.route('/transports/new',methods=['GET','POST'])
-def transport_new():
-    wz_id=int(request.values.get('wz_id') or 0)
-    with D['conn']() as c:
-        wz_rows=c.execute("""SELECT w.id,w.wz_no,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.status='issued' AND w.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL) ORDER BY w.id DESC""").fetchall()
-        ds=c.execute('SELECT * FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name').fetchall(); vs=c.execute('SELECT * FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no').fetchall()
-        wz=c.execute("SELECT w.*,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status='issued'",(wz_id,)).fetchone() if wz_id else None
-        wz_items=c.execute('SELECT * FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall() if wz else []
-        if request.method=='POST':
-            if not wz:abort(400)
-            if not ds or not vs:raise ValueError('Najpierw dodaj kierowcę i pojazd')
-            s=stamp(); cur=c.execute("INSERT INTO transports(transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,'assigned',?,?,?,?)",(next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],request.form.get('destination','') or wz['destination'],actor(),actor(),s,s)); tid=cur.lastrowid
-            for item in wz_items:c.execute('INSERT INTO transport_items(transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?)',(tid,item['id'],item['qty_issued'] or item['qty_planned'],s))
-            c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'create','transport',tid,'{}',s))
-            return redirect(url_for('beton.transport_view',transport_id=tid))
-    return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Transport z dokumentu WZ</h1><div class="card"><form method="get"><label>Wydane WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div></div><label>Miejsce dostawy</label><input name="destination" value="{{wz.destination or ''}}"><table><thead><tr><th>Materiał</th><th>Ilość wydana</th></tr></thead><tbody>{% for x in wz_items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued or x.qty_planned}}</td></tr>{% endfor %}</tbody></table><button class="btn primary">Utwórz i przypisz transport</button></form>{% endif %}{% endblock %}''',wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+        for inv in invoices_rows:
+            gross = to_float(inv["total_gross"], 0)
+            net = to_float(inv["total_net"], 0)
+            vat = max(0.0, gross - net)
+            paid = int(inv["paid"] or 0) == 1
+            issue_d = parse_date_safe(inv["issue_date"])
+            due_d = parse_date_safe(inv["payment_to"]) or issue_d or today
+            buyer = inv["buyer_name"] or "-"
+            invoice_no = inv["invoice_no"] or "-"
+            profit = invoice_profit(inv["id"], net)
 
-@bp.get('/transports/<int:transport_id>')
-def transport_view(transport_id):
-    with D['conn']() as c:
-        x=c.execute('''SELECT t.*,w.wz_no,w.invoice_id,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name FROM transports t JOIN wz_documents w ON w.id=t.wz_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN orders o ON o.id=w.order_id JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id WHERE t.id=?''',(transport_id,)).fetchone()
-        if not x:abort(404)
-        items=c.execute('SELECT ti.qty,w.sku FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id WHERE ti.transport_id=?',(transport_id,)).fetchall()
-    return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a>{% if x.invoice_id %}<a class="btn" href="{{url_for('invoice_download_admin',invoice_id=x.invoice_id)}}">Pobierz fakturę</a>{% endif %}</div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><div class="line"></div><table><thead><tr><th>Materiał / SKU</th><th>Ilość</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}}</b></td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',x=x,items=items,title=x['transport_no'],base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+            if issue_d and issue_d.year == today.year and issue_d.month == today.month:
+                month_net += net
+                month_vat += vat
+                month_profit += profit
 
-@driver_api.get('/transports')
-def driver_transports_api():
-    email=(g.client_user.get('email') or '').strip().lower()
-    with D['conn']() as c:
-        rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no,
-          (SELECT a.status FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) plant_status,
-          (SELECT b.code FROM dispatch_appointments a LEFT JOIN loading_bays b ON b.id=a.loading_bay_id WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) loading_bay
-          FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE lower(d.email)=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(email,)).fetchall()
-        result=[]
-        for r in rows:
-            x=dict(r); x['items']=[dict(z) for z in c.execute('SELECT w.sku,ti.qty FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id WHERE ti.transport_id=?',(r['id'],))]; result.append(x)
-    return jsonify(ok=True,transports=result)
+            if issue_d and issue_d >= today - timedelta(days=30):
+                last_30_net += net
+                last_30_profit += profit
+                try:
+                    for item in json.loads(inv["invoice_items_json"] or "[]"):
+                        sold_30_qty += int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
+                except Exception:
+                    pass
 
-@driver_api.post('/transports/<int:transport_id>/status')
-def driver_transport_status_api(transport_id):
-    email=(g.client_user.get('email') or '').strip().lower(); data=request.get_json(silent=True) or {}; status=str(data.get('status',''))
-    allowed={'issued','in_transit','delivered','returned','problem'}
-    if status not in allowed:return jsonify(ok=False,error='Niedozwolony status'),400
-    field={'issued':'issued_at','in_transit':'departed_at','delivered':'delivered_at','returned':'returned_at'}.get(status)
-    with D['conn']() as c:
-        row=c.execute('SELECT t.id,t.status,t.wz_id FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND lower(d.email)=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,email)).fetchone()
-        if not row:return jsonify(ok=False,error='Brak dostępu'),403
-        transitions={'assigned':{'issued','problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'issued','in_transit','delivered','returned'}}
-        if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
-        appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
-        if status in {'issued','in_transit'} and appointment and appointment['status']!='ready_to_leave':
-            return jsonify(ok=False,error='Dyspozytor musi najpierw oznaczyć transport jako gotowy do wyjazdu.'),409
-        sql='UPDATE transports SET status=?,driver_notes=?,receiver_name=?,updated_by=?,updated_at=?'+(f',{field}=?' if field else '')+' WHERE id=?'; values=[status,str(data.get('notes',''))[:2000],str(data.get('receiver_name',''))[:200],email,stamp()]
-        if field:values.append(stamp())
-        values.append(transport_id); c.execute(sql,values)
-        if status=='returned':c.execute("UPDATE wz_documents SET status='returned' WHERE id=? AND status IN ('issued','in_transport')",(row['wz_id'],))
-        elif status in {'issued','in_transit','delivered'}:c.execute("UPDATE wz_documents SET status='in_transport' WHERE id=? AND status='issued'",(row['wz_id'],))
-        if status=='in_transit' and appointment:
-            c.execute("UPDATE dispatch_appointments SET status='departed',updated_by=?,updated_at=? WHERE id=?",(email,stamp(),appointment['id']))
-            c.execute("INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)",(appointment['id'],'ready_to_leave','departed','Potwierdzenie wyjazdu przez kierowcę',email,stamp()))
-        c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(email,'status:'+status,'transport',transport_id,'{}',stamp()))
-    return jsonify(ok=True,status=status)
+            if paid:
+                paid_d = parse_date_safe(inv["paid_at"]) or issue_d
+                if paid_d and paid_d >= today - timedelta(days=30):
+                    rec = paid_clients_map.setdefault(buyer, {"buyer": buyer, "gross": 0.0, "count": 0, "last": ""})
+                    rec["gross"] += gross
+                    rec["count"] += 1
+                    rec["last"] = max(rec["last"], str(paid_d))
+                continue
 
-@driver_api.get('/transports/<int:transport_id>/invoice')
-def driver_invoice_api(transport_id):
-    email=(g.client_user.get('email') or '').strip().lower()
-    with D['conn']() as c: row=c.execute('SELECT w.invoice_id FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND lower(d.email)=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,email)).fetchone()
-    if not row or not row['invoice_id']:abort(404)
-    return current_app.view_functions['invoice_download_admin'](row['invoice_id'])
+            unpaid_total += gross
+            if due_d <= today + timedelta(days=7):
+                due_7_total += gross
+            if due_d <= today + timedelta(days=30):
+                due_30_total += gross
+            if due_d < today:
+                overdue_total += gross
+                days_late = (today - due_d).days
+                rec = overdue_clients_map.setdefault(buyer, {"buyer": buyer, "gross": 0.0, "count": 0, "days_late": 0})
+                rec["gross"] += gross
+                rec["count"] += 1
+                rec["days_late"] = max(rec["days_late"], days_late)
+
+            inflow_rows.append({
+                "invoice_no": invoice_no,
+                "buyer": buyer,
+                "due": due_d.isoformat() if due_d else "-",
+                "gross": gross,
+                "days": (due_d - today).days if due_d else 0,
+                "overdue": due_d < today if due_d else False,
+                "reminder": int(inv["payment_reminder"] or 0) == 1,
+            })
+
+        cur.execute("""
+          SELECT COALESCE(SUM(s.qty),0) AS units,
+                 COALESCE(SUM(s.qty * COALESCE(p.unit_net_price,pr.net_price,0)),0) AS sale_net,
+                 COALESCE(SUM(s.qty * (COALESCE(p.unit_material_cost,0) + COALESCE(p.unit_production_cost,0) + COALESCE(p.unit_transport_cost,0) + COALESCE(p.unit_other_cost,0))),0) AS cost_est
+          FROM stock s
+          LEFT JOIN products p ON p.id=s.product_id
+          LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku,p.model))
+        """)
+        stock_row = cur.fetchone()
+        stock_units = int(stock_row["units"] or 0)
+        stock_sale_net = to_float(stock_row["sale_net"], 0)
+        stock_cost_est = to_float(stock_row["cost_est"], 0)
+
+        cur.execute("""
+          SELECT COALESCE(SUM(ci.qty),0) AS qty,
+                 COALESCE(SUM(ci.qty * COALESCE(p.unit_material_cost,0)),0) AS cost_est
+          FROM material_order_items ci
+          JOIN material_orders cp ON cp.id=ci.package_id
+          LEFT JOIN products p ON p.id=ci.product_id
+          LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku, ci.sku))
+          WHERE lower(COALESCE(cp.status,'')) IN ('planned','ordered','shipped')
+        """)
+        material_order_row = cur.fetchone()
+        material_order_qty = int(material_order_row["qty"] or 0)
+        material_order_cost_est = to_float(material_order_row["cost_est"], 0)
+
+        cutoff_30 = (today - timedelta(days=30)).isoformat()
+        cutoff_90 = (today - timedelta(days=90)).isoformat()
+        cur.execute("""
+          WITH demand AS (
+            SELECT
+              oi.product_id,
+              SUM(CASE WHEN date(o.created_at) >= date(?) THEN oi.qty ELSE 0 END) AS ordered_30,
+              SUM(CASE WHEN date(o.created_at) >= date(?) THEN oi.qty ELSE 0 END) AS ordered_90
+            FROM order_items oi
+            JOIN orders o ON o.id=oi.order_id
+            WHERE lower(COALESCE(o.status,'')) NOT IN ('cancelled','canceled','deleted','usuniete','anulowane')
+            GROUP BY oi.product_id
+          ),
+          material_order_incoming AS (
+            SELECT
+              ci.product_id,
+              SUM(ci.qty) AS incoming_qty
+            FROM material_order_items ci
+            JOIN material_orders cp ON cp.id=ci.package_id
+            WHERE 1=0 -- raw materials are not finished products available for sale
+            GROUP BY ci.product_id
+          )
+          SELECT
+            p.sku,
+            p.model,
+            p.name,
+            COALESCE(d.ordered_30,0) AS ordered_30,
+            COALESCE(d.ordered_90,0) AS ordered_90,
+            COALESCE(s.qty,0) AS stock_qty,
+            COALESCE(ci.incoming_qty,0) AS incoming_qty,
+            MAX(0, COALESCE(d.ordered_90,0) - COALESCE(s.qty,0) - COALESCE(ci.incoming_qty,0)) AS suggested_qty,
+            CASE
+              WHEN COALESCE(d.ordered_90,0) <= 0 THEN 0
+              ELSE ROUND((COALESCE(s.qty,0) + COALESCE(ci.incoming_qty,0)) * 100.0 / COALESCE(d.ordered_90,0), 0)
+            END AS coverage_pct
+          FROM demand d
+          JOIN products p ON p.id=d.product_id
+          LEFT JOIN stock s ON s.product_id=p.id
+          LEFT JOIN material_order_incoming ci ON ci.product_id=p.id
+          WHERE COALESCE(d.ordered_90,0) > 0
+            AND (
+              COALESCE(s.qty,0) + COALESCE(ci.incoming_qty,0) < COALESCE(d.ordered_90,0)
+              OR COALESCE(s.qty,0) <= COALESCE(d.ordered_30,0)
+            )
+          ORDER BY
+            COALESCE(d.ordered_90,0) DESC,
+            suggested_qty DESC,
+            coverage_pct ASC
+          LIMIT 10
+        """, (cutoff_30, cutoff_90))
+        reorder_rows = cur.fetchall()
+        c.close()
+
+        avg_daily_gross = (last_30_net * 1.23) / 30.0 if last_30_net else 0.0
+        forecast_7_sales = avg_daily_gross * 7 * growth_factor
+        forecast_30_sales = avg_daily_gross * 30 * growth_factor
+        forecast_7_total = due_7_total + forecast_7_sales
+        forecast_30_total = due_30_total + forecast_30_sales
+        # Realna kwota do wydania na Zamówienia materiałów liczona jest tylko z gotówki na koncie.
+        # Prognozy oraz niezapłacone faktury to informacja pomocnicza, ale nie kasa,
+        # którą można dziś bezpiecznie wydać.
+        real_cash_for_materials = account_balance - month_vat - monthly_zus - cash_buffer - planned_material_order_budget
+        safe_to_spend = max(0.0, real_cash_for_materials)
+        cash_shortage = max(0.0, -real_cash_for_materials)
+
+        overdue_clients = sorted(overdue_clients_map.values(), key=lambda r: (r["days_late"], r["gross"]), reverse=True)[:10]
+        paid_clients = sorted(paid_clients_map.values(), key=lambda r: r["gross"], reverse=True)[:10]
+        inflow_rows = sorted(inflow_rows, key=lambda r: (r["overdue"], r["due"]), reverse=True)[:25]
+
+        kpis = {
+            "account_balance": account_balance,
+            "unpaid_total": unpaid_total,
+            "overdue_total": overdue_total,
+            "due_7_total": due_7_total,
+            "due_30_total": due_30_total,
+            "month_vat": month_vat,
+            "monthly_zus": monthly_zus,
+            "material_order_cost_est": material_order_cost_est,
+            "material_order_qty": material_order_qty,
+            "stock_units": stock_units,
+            "stock_sale_net": stock_sale_net,
+            "stock_cost_est": stock_cost_est,
+            "stock_profit_est": stock_sale_net - stock_cost_est,
+            "last_30_net": last_30_net,
+            "last_30_profit": last_30_profit,
+            "sold_30_qty": sold_30_qty,
+            "forecast_7_total": forecast_7_total,
+            "forecast_30_total": forecast_30_total,
+            "forecast_7_sales": forecast_7_sales,
+            "forecast_30_sales": forecast_30_sales,
+            "real_cash_for_materials": real_cash_for_materials,
+            "safe_to_spend": safe_to_spend,
+            "cash_shortage": cash_shortage,
+        }
+
+        tpl = r"""
+        {% extends "base.html" %}
+        {% block content %}
+          <div class="card">
+            <div class="flex">
+              <h1 style="margin:0;">Cash flow</h1>
+              <span class="badge">panel wewnętrzny</span>
+              {% if request.args.get('saved') %}<span class="badge">Zapisano</span>{% endif %}
+            </div>
+            <div class="notice" style="margin-top:10px;">
+              Prognoza jest pomocnicza: opiera się na fakturach, terminach płatności i opłaconych/zaległych klientach.
+              Zysk jest liczony z cen sprzedaży netto pomniejszonych o zapisane koszty jednostkowe: materiał, produkcja, transport i pozostałe. Brak kosztów oznacza brak wiarygodnej marży — system nie zgaduje jej procentu.
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Ustawienia płynności</h2>
+            <form method="post" class="grid3">
+              <div><label class="muted small">Stan konta</label><input name="account_balance" value="{{ settings.account_balance }}"></div>
+              <div><label class="muted small">ZUS / stałe koszty miesięczne</label><input name="monthly_zus" value="{{ settings.monthly_zus }}"></div>
+              <div><label class="muted small">Bufor bezpieczeństwa</label><input name="cash_buffer" value="{{ settings.cash_buffer }}"></div>
+              <div><label class="muted small">Zarezerwowane na Zamówienia materiałów</label><input name="planned_material_order_budget" value="{{ settings.planned_material_order_budget }}"></div>
+              <div><label class="muted small">Korekta wzrostu prognozy %</label><input name="growth_percent" value="{{ settings.growth_percent }}"></div>
+              <div class="flex" style="align-items:flex-end;"><button class="btn primary" type="submit">Zapisz cash flow</button></div>
+            </form>
+          </div>
+
+          <div class="grid3">
+            <div class="card"><h2>Stan konta</h2><div style="font-size:26px;font-weight:800;">{{ "%.2f"|format(k.account_balance) }} PLN</div></div>
+            <div class="card"><h2>Do wpływu</h2><div style="font-size:26px;font-weight:800;">{{ "%.2f"|format(k.unpaid_total) }} PLN</div><div class="muted">z niezapłaconych faktur</div></div>
+            <div class="card"><h2>Zaległości</h2><div style="font-size:26px;font-weight:800;color:{% if k.overdue_total>0 %}#b00020{% else %}#067a2d{% endif %};">{{ "%.2f"|format(k.overdue_total) }} PLN</div></div>
+
+            <div class="card"><h2>VAT do zapłaty</h2><div style="font-size:24px;font-weight:800;">{{ "%.2f"|format(k.month_vat) }} PLN</div><div class="muted">orientacyjnie z faktur z bieżącego miesiąca</div></div>
+            <div class="card"><h2>ZUS / koszty stałe</h2><div style="font-size:24px;font-weight:800;">{{ "%.2f"|format(k.monthly_zus) }} PLN</div></div>
+            <div class="card"><h2>Zamówienia materiałów w drodze</h2><div style="font-size:24px;font-weight:800;">{{ "%.2f"|format(k.material_order_cost_est) }} PLN</div><div class="muted">{{ k.material_order_qty }} jednostek wg wpisanego kosztu materiału / j.</div></div>
+
+            <div class="card"><h2>Prognoza 7 dni</h2><div style="font-size:24px;font-weight:800;">{{ "%.2f"|format(k.forecast_7_total) }} PLN</div><div class="muted">terminy płatności + sprzedaż wg ostatnich 30 dni</div></div>
+            <div class="card"><h2>Prognoza 30 dni</h2><div style="font-size:24px;font-weight:800;">{{ "%.2f"|format(k.forecast_30_total) }} PLN</div><div class="muted">uwzględnia korektę wzrostu</div></div>
+<div class="card"><h2>Możesz dziś wydać na Zamówienia materiałów</h2><div style="font-size:24px;font-weight:800;color:{% if k.safe_to_spend<=0 %}#b00020{% else %}#067a2d{% endif %};">{{ "%.2f"|format(k.safe_to_spend) }} PLN</div><div class="muted">realnie z konta: po VAT, ZUS, buforze i rezerwie</div>{% if k.cash_shortage > 0 %}<div class="muted" style="color:#b00020;font-weight:700;">Brakuje {{ "%.2f"|format(k.cash_shortage) }} PLN do bufora/kosztów.</div>{% endif %}</div>
+          </div>
+
+          <div class="card">
+            <h2>Magazyn i marża</h2>
+            <div class="flex">
+              <span class="badge">Stan: {{ k.stock_units }} szt.</span>
+              <span class="badge">Wartość sprzedaży netto: {{ "%.2f"|format(k.stock_sale_net) }} PLN</span>
+              <span class="badge">Szac. koszt zakupu: {{ "%.2f"|format(k.stock_cost_est) }} PLN</span>
+              <span class="badge">Szac. zysk w magazynie: {{ "%.2f"|format(k.stock_profit_est) }} PLN</span>
+              <span class="badge">Sprzedane 30 dni: {{ k.sold_30_qty }} szt.</span>
+            </div>
+          </div>
+
+          <div class="grid2">
+            <div class="card">
+              <h2>Najbliższe wpływy</h2>
+              <table>
+                <thead><tr><th>Faktura</th><th>Klient</th><th>Termin</th><th>Brutto</th><th>Status</th></tr></thead>
+                <tbody>
+                  {% for r in inflow_rows %}
+                    <tr>
+                      <td><b>{{ r.invoice_no }}</b></td><td>{{ r.buyer }}</td><td>{{ r.due }}</td>
+                      <td>{{ "%.2f"|format(r.gross) }}</td>
+                      <td>{% if r.overdue %}<span class="badge" style="color:#b00020;">zaległa {{ -r.days }} dni</span>{% elif r.days <= 7 %}<span class="badge">do 7 dni</span>{% else %}<span class="badge">oczekuje</span>{% endif %}</td>
+                    </tr>
+                  {% endfor %}
+                  {% if not inflow_rows %}<tr><td colspan="5" class="muted">Brak niezapłaconych faktur.</td></tr>{% endif %}
+                </tbody>
+              </table>
+            </div>
+
+            <div class="card">
+              <h2>Popularne SKU z niskim zapasem</h2>
+              <p class="muted">Ranking pokazuje uchwyty najczęściej zamawiane w ostatnich 90 dniach, przy których stan magazynu jest niski. Towar w drodze z materiałów zmniejsza sugerowaną ilość do domówienia.</p>
+              <table>
+                <thead><tr><th>SKU</th><th>Nazwa</th><th>30 dni</th><th>90 dni</th><th>Stan</th><th>W drodze</th><th>Sugeruj</th></tr></thead>
+                <tbody>
+                  {% for r in reorder_rows %}
+                    <tr>
+                      <td><b>{{ r.sku }}</b></td>
+                      <td>{{ r.name or r.model or '-' }}</td>
+                      <td>{{ r.ordered_30 }}</td>
+                      <td>{{ r.ordered_90 }}</td>
+                      <td>{{ r.stock_qty }}</td>
+                      <td>{{ r.incoming_qty }}</td>
+                      <td><b>{{ r.suggested_qty }}</b></td>
+                    </tr>
+                  {% endfor %}
+                  {% if not reorder_rows %}<tr><td colspan="7" class="muted">Brak popularnych SKU z niskim zapasem według ostatnich zamówień.</td></tr>{% endif %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="grid2">
+            <div class="card">
+              <h2>Klienci zalegający</h2>
+              <table>
+                <thead><tr><th>Klient</th><th>Faktur</th><th>Zalega</th><th>Najdłużej</th></tr></thead>
+                <tbody>
+                  {% for r in overdue_clients %}
+                    <tr><td><b>{{ r.buyer }}</b></td><td>{{ r.count }}</td><td>{{ "%.2f"|format(r.gross) }} PLN</td><td>{{ r.days_late }} dni</td></tr>
+                  {% endfor %}
+                  {% if not overdue_clients %}<tr><td colspan="4" class="muted">Brak zaległych płatności.</td></tr>{% endif %}
+                </tbody>
+              </table>
+            </div>
+
+            <div class="card">
+              <h2>Klienci, którzy zapłacili</h2>
+              <table>
+                <thead><tr><th>Klient</th><th>Faktur</th><th>Wpłynęło</th><th>Ostatnio</th></tr></thead>
+                <tbody>
+                  {% for r in paid_clients %}
+                    <tr><td><b>{{ r.buyer }}</b></td><td>{{ r.count }}</td><td>{{ "%.2f"|format(r.gross) }} PLN</td><td>{{ r.last }}</td></tr>
+                  {% endfor %}
+                  {% if not paid_clients %}<tr><td colspan="4" class="muted">Brak oznaczonych wpłat z ostatnich 30 dni.</td></tr>{% endif %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        {% endblock %}
+        """
+        return render_template_string(tpl, title="Cash flow", base_url=base_url, db_path=db_path,
+                                      settings=settings, k=kpis, inflow_rows=inflow_rows,
+                                      overdue_clients=overdue_clients, paid_clients=paid_clients,
+                                      reorder_rows=reorder_rows)
