@@ -2694,6 +2694,27 @@ def _admin_password_ok(candidate: str) -> bool:
     return bool(ADMIN_PASSWORD) and hmac.compare_digest(ADMIN_PASSWORD, candidate)
 
 
+def role_may_write(role: str, path: str) -> bool:
+    """Role separation: every write is limited to the person's operational area."""
+    role = (role or "").lower()
+    if role == "admin":
+        return True
+    if path.startswith("/admin/"):
+        return False
+    if role == "manager":
+        return not (path.startswith("/ksef") or path.startswith("/invoices"))
+    if role == "accounting":
+        return (path.startswith("/invoices") or path.startswith("/ksef") or path.startswith("/cash-flow")
+                or path.startswith("/customers") or path.startswith("/company") or path.startswith("/pricing")
+                or (path.startswith("/orders/") and "/invoice" in path))
+    if role == "warehouse":
+        return path.startswith("/beton/wz") or path.startswith("/beton/transports") or path.startswith("/operations")
+    if role == "office":
+        return ((path == "/orders/new" or path.startswith("/orders/"))
+                and "/invoice" not in path and "/status" not in path) or path.startswith("/customers")
+    return False
+
+
 @app.before_request
 def security_gate():
     path = request.path
@@ -2728,6 +2749,20 @@ def security_gate():
         if path.startswith("/api/"):
             return jsonify(ok=False, error="Brak autoryzacji administratora"), 401
         return redirect(url_for("login", next=request.full_path if request.query_string else path))
+
+    # Role and account activity are read from the database on each request, so an
+    # administrator's change takes effect immediately without waiting for logout.
+    if session.get("user_id"):
+        c = conn()
+        current_user = c.execute("SELECT role,active FROM app_users WHERE id=? AND deleted_at IS NULL", (session["user_id"],)).fetchone()
+        c.close()
+        if not current_user or not int(current_user["active"]):
+            session.clear()
+            return redirect(url_for("login"))
+        session["role"] = current_user["role"]
+
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not role_may_write(session.get("role"), path):
+        return "Brak uprawnienia dla tej roli.", 403
 
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         if request.is_json:
@@ -2908,6 +2943,34 @@ def _admin_only():
 def admin_users():
     _admin_only()
     error = ""
+    roles = [("admin", "Administrator"), ("manager", "Kierownik"), ("accounting", "Księgowość"), ("office", "Biuro"), ("warehouse", "Magazyn")]
+    if request.method == "POST":
+        username = norm(request.form.get("username"))
+        display_name = norm(request.form.get("display_name"))
+        password = request.form.get("password") or ""
+        role = norm(request.form.get("role")) or "office"
+        if role not in {r[0] for r in roles}:
+            error = "Nieprawidłowa rola."
+        elif not username or not display_name:
+            error = "Podaj login oraz imię i nazwisko."
+        elif len(password) < 12:
+            error = "Hasło musi mieć co najmniej 12 znaków."
+        else:
+            c = conn()
+            try:
+                stamp = now_iso()
+                c.execute("INSERT INTO app_users(username,display_name,password_hash,role,created_at,updated_at) VALUES(?,?,?,?,?,?)", (username, display_name, generate_password_hash(password), role, stamp, stamp))
+                c.commit()
+                return redirect(url_for("admin_users"))
+            except sqlite3.IntegrityError:
+                error = "Taki login już istnieje."
+            finally:
+                c.close()
+    c = conn()
+    users = c.execute("SELECT * FROM app_users WHERE deleted_at IS NULL ORDER BY active DESC, role, display_name").fetchall()
+    c.close()
+    return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Użytkownicy i uprawnienia</h1><div class="card"><p class="muted">Tylko administrator główny tworzy konta, zmienia role i wyłącza dostęp.</p>{% if error %}<div class="notice">{{error}}</div>{% endif %}<h2>Dodaj konto</h2><form method="post" class="grid3"><div><label>Imię i nazwisko</label><input name="display_name" required></div><div><label>Login</label><input name="username" required></div><div><label>Hasło (min. 12)</label><input name="password" type="password" minlength="12" required></div><div><label>Rola</label><select name="role">{% for value,label in roles %}<option value="{{value}}">{{label}}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn primary">Utwórz konto</button></div></form></div><div class="card"><h2>Role i dostęp</h2><table><thead><tr><th>Osoba</th><th>Login</th><th>Rola</th><th>Ostatnie logowanie</th><th>Dostęp</th></tr></thead><tbody>{% for u in users %}<tr><td><b>{{u.display_name}}</b></td><td>{{u.username}}</td><td><form method="post" action="{{url_for('admin_user_role',user_id=u.id)}}"><select name="role">{% for value,label in roles %}<option value="{{value}}" {% if value==u.role %}selected{% endif %}>{{label}}</option>{% endfor %}</select><button class="btn">Zapisz rolę</button></form></td><td>{{u.last_login_at or '—'}}</td><td>{% if u.id == session.get('user_id') %}<span class="badge">Twoje konto</span>{% else %}<form method="post" action="{{url_for('admin_user_toggle',user_id=u.id)}}"><button class="btn">{{'Wyłącz' if u.active else 'Włącz'}}</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="5">Brak kont.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''', users=users, roles=roles, error=error, base_url=BASE_URL, db_path=DB_PATH)
+    error = ""
     if request.method == "POST":
         username = norm(request.form.get("username"))
         display_name = norm(request.form.get("display_name"))
@@ -2952,6 +3015,27 @@ def admin_user_toggle(user_id):
     if user["active"] and user["role"] == "admin" and c.execute("SELECT COUNT(*) FROM app_users WHERE role='admin' AND active=1 AND deleted_at IS NULL").fetchone()[0] <= 1:
         c.close(); return "Nie można wyłączyć ostatniego administratora.", 400
     c.execute("UPDATE app_users SET active=?,updated_at=? WHERE id=?", (0 if user["active"] else 1, now_iso(), user_id)); c.commit(); c.close()
+    return redirect(url_for("admin_users"))
+
+
+@app.post("/admin/users/<int:user_id>/role")
+def admin_user_role(user_id):
+    _admin_only()
+    role = norm(request.form.get("role"))
+    allowed = {"admin", "manager", "accounting", "office", "warehouse"}
+    if role not in allowed:
+        return "Nieprawidłowa rola.", 400
+    c = conn()
+    user = c.execute("SELECT * FROM app_users WHERE id=? AND deleted_at IS NULL", (user_id,)).fetchone()
+    if not user:
+        c.close()
+        abort(404)
+    if user["role"] == "admin" and role != "admin" and c.execute("SELECT COUNT(*) FROM app_users WHERE role='admin' AND active=1 AND deleted_at IS NULL").fetchone()[0] <= 1:
+        c.close()
+        return "Nie można odebrać roli ostatniemu administratorowi.", 400
+    c.execute("UPDATE app_users SET role=?,updated_at=? WHERE id=?", (role, now_iso(), user_id))
+    c.commit()
+    c.close()
     return redirect(url_for("admin_users"))
 
 
