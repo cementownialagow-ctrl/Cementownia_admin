@@ -123,6 +123,16 @@ def save_row_to_supabase(table, row, conflict='id'):
         raise RuntimeError('Brak połączenia z Supabase. Nie można zapisać danych bezpiecznie w chmurze.')
     D['supabase_request'](f'/rest/v1/{table}', method='POST', params={'on_conflict': conflict}, payload=[dict(row)], prefer='resolution=merge-duplicates,return=minimal')
 
+def existing_auth_user_id(email):
+    """Find an account left behind by an interrupted earlier creation attempt."""
+    result=D['supabase_request']('/auth/v1/admin/users',method='GET',params={'page':1,'per_page':1000}) or {}
+    users=result.get('users',[]) if isinstance(result,dict) else []
+    wanted=(email or '').strip().lower()
+    for item in users:
+        if (item.get('email') or '').strip().lower()==wanted and item.get('id'):
+            return str(item['id'])
+    return ''
+
 def provision_driver_account(driver_id, username, password, update=False):
     if not D['supabase_enabled']():
         raise RuntimeError('Nie można nadać hasła: brakuje SUPABASE_URL lub SUPABASE_SERVICE_ROLE_KEY na Render.')
@@ -136,16 +146,19 @@ def provision_driver_account(driver_id, username, password, update=False):
         raise ValueError('Nie znaleziono kierowcy.')
     email=driver_auth_email(username)
     if account:
-        D['supabase_request'](f"/auth/v1/admin/users/{account['auth_user_id']}",method='PUT',payload={'password':password,'email_confirm':True,'user_metadata':{'driver_id':driver_id,'username':username}})
         auth_user_id=account['auth_user_id']
     else:
         # Save the driver in Supabase before creating the protected profile relation.
         D['supabase_request']('/rest/v1/drivers',method='POST',payload=[dict(driver)],prefer='resolution=merge-duplicates,return=minimal')
-        auth=D['supabase_request']('/auth/v1/admin/users',method='POST',payload={'email':email,'password':password,'email_confirm':True,'user_metadata':{'driver_id':driver_id,'username':username}})
-        auth_user_id=(auth or {}).get('id')
+        try:
+            auth=D['supabase_request']('/auth/v1/admin/users',method='POST',payload={'email':email,'password':password,'email_confirm':True,'user_metadata':{'driver_id':driver_id,'username':username}})
+            auth_user_id=(auth or {}).get('id')
+        except RuntimeError:
+            auth_user_id=existing_auth_user_id(email)
         if not auth_user_id:
-            raise RuntimeError('Supabase nie zwrócił identyfikatora konta kierowcy.')
-        D['supabase_request']('/rest/v1/driver_profiles',method='POST',payload=[{'user_id':auth_user_id,'driver_id':driver_id,'active':True}],prefer='resolution=merge-duplicates,return=minimal')
+            raise RuntimeError('Nie udało się odnaleźć ani utworzyć konta kierowcy w Supabase.')
+    D['supabase_request'](f"/auth/v1/admin/users/{auth_user_id}",method='PUT',payload={'password':password,'email_confirm':True,'user_metadata':{'driver_id':driver_id,'username':username}})
+    D['supabase_request']('/rest/v1/driver_profiles',method='POST',params={'on_conflict':'driver_id'},payload=[{'user_id':auth_user_id,'driver_id':driver_id,'active':True}],prefer='resolution=merge-duplicates,return=minimal')
     with D['conn']() as c:
         c.execute('INSERT INTO driver_accounts(driver_id,username,auth_user_id,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(driver_id) DO UPDATE SET username=excluded.username,updated_at=excluded.updated_at',(driver_id,username,auth_user_id,stamp(),stamp()))
     return username
