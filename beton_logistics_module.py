@@ -1,3 +1,6 @@
+import re
+import unicodedata
+
 from flask import Blueprint, abort, current_app, g, jsonify, redirect, render_template_string, request, session, url_for
 
 bp=Blueprint('beton',__name__,url_prefix='/beton')
@@ -11,6 +14,9 @@ def register_beton_logistics(app,deps):
         CREATE TABLE IF NOT EXISTS drivers(
           id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT,email TEXT,
           active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
+        CREATE TABLE IF NOT EXISTS driver_accounts(
+          driver_id INTEGER PRIMARY KEY REFERENCES drivers(id) ON DELETE CASCADE,
+          username TEXT NOT NULL UNIQUE,auth_user_id TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS vehicles(
           id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,brand TEXT,model TEXT,registration_no TEXT NOT NULL UNIQUE,
           trailer_no TEXT,year INTEGER,vin TEXT,current_mileage REAL NOT NULL DEFAULT 0,driver_id INTEGER REFERENCES drivers(id),
@@ -99,6 +105,41 @@ def next_wz_no(c):
     year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM wz_documents WHERE wz_no LIKE ?",(f'WZ/{year}/%',)).fetchone()[0]+1
     return f'WZ/{year}/{n:05d}'
 
+def driver_auth_email(username):
+    value=unicodedata.normalize('NFD',(username or '').strip().lower())
+    value=''.join(ch for ch in value if unicodedata.category(ch)!='Mn')
+    value=re.sub(r'[^a-z0-9._-]+','',value)
+    if not value:
+        raise ValueError('Login kierowcy może zawierać litery, cyfry, kropkę, myślnik i podkreślenie.')
+    return f'{value}@kierowca.betonlagow.local'
+
+def provision_driver_account(driver_id, username, password, update=False):
+    if not D['supabase_enabled']():
+        raise RuntimeError('Nie można nadać hasła: brakuje SUPABASE_URL lub SUPABASE_SERVICE_ROLE_KEY na Render.')
+    username=(username or '').strip()
+    if len(username)<3 or len(password or '')<12:
+        raise ValueError('Login musi mieć min. 3 znaki, a hasło min. 12 znaków.')
+    with D['conn']() as c:
+        driver=c.execute('SELECT * FROM drivers WHERE id=? AND deleted_at IS NULL',(driver_id,)).fetchone()
+        account=c.execute('SELECT * FROM driver_accounts WHERE driver_id=?',(driver_id,)).fetchone()
+    if not driver:
+        raise ValueError('Nie znaleziono kierowcy.')
+    email=driver_auth_email(username)
+    if account:
+        D['supabase_request'](f"/auth/v1/admin/users/{account['auth_user_id']}",method='PUT',payload={'password':password,'email_confirm':True,'user_metadata':{'driver_id':driver_id,'username':username}})
+        auth_user_id=account['auth_user_id']
+    else:
+        # Save the driver in Supabase before creating the protected profile relation.
+        D['supabase_request']('/rest/v1/drivers',method='POST',payload=[dict(driver)],prefer='resolution=merge-duplicates,return=minimal')
+        auth=D['supabase_request']('/auth/v1/admin/users',method='POST',payload={'email':email,'password':password,'email_confirm':True,'user_metadata':{'driver_id':driver_id,'username':username}})
+        auth_user_id=(auth or {}).get('id')
+        if not auth_user_id:
+            raise RuntimeError('Supabase nie zwrócił identyfikatora konta kierowcy.')
+        D['supabase_request']('/rest/v1/driver_profiles',method='POST',payload=[{'user_id':auth_user_id,'driver_id':driver_id,'active':True}],prefer='resolution=merge-duplicates,return=minimal')
+    with D['conn']() as c:
+        c.execute('INSERT INTO driver_accounts(driver_id,username,auth_user_id,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(driver_id) DO UPDATE SET username=excluded.username,updated_at=excluded.updated_at',(driver_id,username,auth_user_id,stamp(),stamp()))
+    return username
+
 @bp.get('/wz')
 def wz_list():
     with D['conn']() as c:
@@ -167,6 +208,17 @@ def wz_ready(wz_id):
 @bp.get('/drivers')
 def drivers():
     with D['conn']() as c:
+        ds=c.execute('''SELECT d.*,a.username,a.auth_user_id FROM drivers d LEFT JOIN driver_accounts a ON a.driver_id=d.id WHERE d.deleted_at IS NULL ORDER BY d.active DESC,d.name''').fetchall()
+        vs=c.execute('SELECT v.*,d.name driver_name FROM vehicles v LEFT JOIN drivers d ON d.id=v.driver_id WHERE v.deleted_at IS NULL ORDER BY v.active DESC,v.registration_no').fetchall()
+    return render_template_string('''{% extends "base.html" %}{% block content %}
+      <h1>Kierowcy i pojazdy</h1>
+      {% if request.args.get('error') %}<div class="notice">{{request.args.get('error')}}</div>{% endif %}
+      {% if request.args.get('ok') %}<div class="notice">{{request.args.get('ok')}}</div>{% endif %}
+      <div class="row"><div class="card"><h2>Dodaj kierowcę i konto</h2><form method="post" action="{{url_for('beton.driver_add')}}"><label>Imię i nazwisko</label><input name="name" required><label>Telefon</label><input name="phone"><label>Login do panelu kierowcy</label><input name="username" placeholder="np. Kicia" required><label>Hasło kierowcy (min. 12 znaków)</label><input type="password" name="password" required><button class="btn primary" style="margin-top:12px">Dodaj kierowcę i ustaw hasło</button></form></div><div class="card"><h2>Dodaj pojazd</h2><form method="post" action="{{url_for('beton.vehicle_add')}}"><label>Numer rejestracyjny</label><input name="registration_no" required><label>Naczepa</label><input name="trailer_no"><label>Marka / model</label><input name="brand"><input name="model"><label>Domyślny kierowca</label><select name="driver_id"><option value="">—</option>{% for d in ds %}<option value="{{d.id}}">{{d.name}}</option>{% endfor %}</select><button class="btn primary" style="margin-top:12px">Dodaj pojazd</button></form></div></div>
+      <div class="card"><h2>Kierowcy</h2><table><thead><tr><th>Kierowca</th><th>Login</th><th>Telefon</th><th>Status</th><th>Hasło</th></tr></thead><tbody>{% for x in ds %}<tr><td><b>{{x.name}}</b></td><td>{{x.username or 'Brak konta'}}</td><td>{{x.phone or '-'}}</td><td><span class="badge">{{'Aktywny' if x.active else 'Nieaktywny'}}</span></td><td><form method="post" action="{{url_for('beton.driver_password',driver_id=x.id)}}"><input name="username" value="{{x.username or ''}}" placeholder="login" required><input name="password" type="password" placeholder="nowe hasło (min. 12)" required><button class="btn">Zmień hasło</button></form></td></tr>{% else %}<tr><td colspan="5">Brak kierowców.</td></tr>{% endfor %}</tbody></table></div>
+      <div class="card"><h2>Pojazdy</h2><table><thead><tr><th>Rejestracja</th><th>Marka / model</th><th>Naczepa</th><th>Kierowca</th></tr></thead><tbody>{% for x in vs %}<tr><td><b>{{x.registration_no}}</b></td><td>{{x.brand or ''}} {{x.model or ''}}</td><td>{{x.trailer_no or '-'}}</td><td>{{x.driver_name or '-'}}</td></tr>{% else %}<tr><td colspan="4">Brak pojazdów.</td></tr>{% endfor %}</tbody></table></div>
+    {% endblock %}''',ds=ds,vs=vs,title='Kierowcy i pojazdy',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+    with D['conn']() as c:
         ds=c.execute('SELECT * FROM drivers WHERE deleted_at IS NULL ORDER BY active DESC,name').fetchall()
         vs=c.execute('SELECT v.*,d.name driver_name FROM vehicles v LEFT JOIN drivers d ON d.id=v.driver_id WHERE v.deleted_at IS NULL ORDER BY v.active DESC,v.registration_no').fetchall()
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Kierowcy i pojazdy</h1></div><div class="row"><div class="card"><h2>Dodaj kierowcę</h2><form method="post" action="{{url_for('beton.driver_add')}}"><label>Imię i nazwisko</label><input name="name" required><label>Telefon</label><input name="phone"><label>E-mail / login</label><input name="email" type="email"><button class="btn primary" style="margin-top:12px">Dodaj kierowcę</button></form></div><div class="card"><h2>Dodaj pojazd</h2><form method="post" action="{{url_for('beton.vehicle_add')}}"><div class="row"><div><label>Numer rejestracyjny</label><input name="registration_no" required></div><div><label>Naczepa</label><input name="trailer_no"></div><div><label>Marka</label><input name="brand"></div><div><label>Model</label><input name="model"></div><div><label>Rok</label><input name="year" type="number"></div><div><label>VIN</label><input name="vin"></div><div><label>Przebieg</label><input name="current_mileage" type="number" value="0"></div><div><label>Domyślny kierowca</label><select name="driver_id"><option value="">—</option>{% for d in ds %}<option value="{{d.id}}">{{d.name}}</option>{% endfor %}</select></div></div><button class="btn primary" style="margin-top:12px">Dodaj pojazd</button></form></div></div><div class="card"><h2>Kierowcy</h2><table><thead><tr><th>Kierowca</th><th>Telefon</th><th>E-mail</th><th>Status</th></tr></thead><tbody>{% for x in ds %}<tr><td><b>{{x.name}}</b></td><td>{{x.phone or '-'}}</td><td>{{x.email or '-'}}</td><td><span class="badge">{{'Aktywny' if x.active else 'Nieaktywny'}}</span></td></tr>{% endfor %}</tbody></table></div><div class="card"><h2>Pojazdy</h2><table><thead><tr><th>Rejestracja</th><th>Marka / model</th><th>Naczepa</th><th>Kierowca</th><th>Przebieg</th></tr></thead><tbody>{% for x in vs %}<tr><td><b>{{x.registration_no}}</b></td><td>{{x.brand or ''}} {{x.model or ''}}</td><td>{{x.trailer_no or '-'}}</td><td>{{x.driver_name or '-'}}</td><td>{{x.current_mileage}}</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',ds=ds,vs=vs,title='Kierowcy i pojazdy',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
@@ -174,8 +226,25 @@ def drivers():
 @bp.post('/drivers/add')
 def driver_add():
     s=stamp()
-    with D['conn']() as c:c.execute('INSERT INTO drivers(name,phone,email,created_at,updated_at) VALUES(?,?,?,?,?)',(request.form['name'].strip(),request.form.get('phone','').strip(),request.form.get('email','').strip().lower(),s,s))
-    return redirect(url_for('beton.drivers'))
+    try:
+        username=request.form.get('username','').strip()
+        password=request.form.get('password','')
+        with D['conn']() as c:
+            cur=c.execute('INSERT INTO drivers(name,phone,email,created_at,updated_at) VALUES(?,?,?,?,?)',(request.form['name'].strip(),request.form.get('phone','').strip(),driver_auth_email(username),s,s))
+            driver_id=cur.lastrowid
+        provision_driver_account(driver_id,username,password)
+        return redirect(url_for('beton.drivers',ok=f'Konto kierowcy {username} zostało utworzone.'))
+    except Exception as exc:
+        return redirect(url_for('beton.drivers',error=str(exc)))
+
+@bp.post('/drivers/<int:driver_id>/password')
+def driver_password(driver_id):
+    try:
+        username=request.form.get('username','').strip()
+        provision_driver_account(driver_id,username,request.form.get('password',''),update=True)
+        return redirect(url_for('beton.drivers',ok=f'Hasło dla {username} zostało zmienione.'))
+    except Exception as exc:
+        return redirect(url_for('beton.drivers',error=str(exc)))
 
 @bp.post('/vehicles/add')
 def vehicle_add():
@@ -221,7 +290,10 @@ def transport_view(transport_id):
 def driver_transports_api():
     email=(g.client_user.get('email') or '').strip().lower()
     with D['conn']() as c:
-        rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE lower(d.email)=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(email,)).fetchall()
+        rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no,
+          (SELECT a.status FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) plant_status,
+          (SELECT b.code FROM dispatch_appointments a LEFT JOIN loading_bays b ON b.id=a.loading_bay_id WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) loading_bay
+          FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE lower(d.email)=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(email,)).fetchall()
         result=[]
         for r in rows:
             x=dict(r); x['items']=[dict(z) for z in c.execute('SELECT w.sku,ti.qty FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id WHERE ti.transport_id=?',(r['id'],))]; result.append(x)
@@ -238,11 +310,17 @@ def driver_transport_status_api(transport_id):
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
         transitions={'assigned':{'issued','problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'issued','in_transit','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
+        appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
+        if status in {'issued','in_transit'} and appointment and appointment['status']!='ready_to_leave':
+            return jsonify(ok=False,error='Dyspozytor musi najpierw oznaczyć transport jako gotowy do wyjazdu.'),409
         sql='UPDATE transports SET status=?,driver_notes=?,receiver_name=?,updated_by=?,updated_at=?'+(f',{field}=?' if field else '')+' WHERE id=?'; values=[status,str(data.get('notes',''))[:2000],str(data.get('receiver_name',''))[:200],email,stamp()]
         if field:values.append(stamp())
         values.append(transport_id); c.execute(sql,values)
         if status=='returned':c.execute("UPDATE wz_documents SET status='returned' WHERE id=? AND status IN ('issued','in_transport')",(row['wz_id'],))
         elif status in {'issued','in_transit','delivered'}:c.execute("UPDATE wz_documents SET status='in_transport' WHERE id=? AND status='issued'",(row['wz_id'],))
+        if status=='in_transit' and appointment:
+            c.execute("UPDATE dispatch_appointments SET status='departed',updated_by=?,updated_at=? WHERE id=?",(email,stamp(),appointment['id']))
+            c.execute("INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)",(appointment['id'],'ready_to_leave','departed','Potwierdzenie wyjazdu przez kierowcę',email,stamp()))
         c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(email,'status:'+status,'transport',transport_id,'{}',stamp()))
     return jsonify(ok=True,status=status)
 
