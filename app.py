@@ -41,6 +41,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
 from cash_flow_module import register_cash_flow
 from beton_logistics_module import register_beton_logistics
+from dispatch_module import register_dispatch
 from operations_module import register_operations
 try:
     from ksef_api import ksef_config_summary, send_invoice_to_ksef
@@ -954,6 +955,9 @@ SUPABASE_SYNC_TABLES = [
     ("transports", "id"),
     ("transport_items", "id"),
     ("delivery_photos", "id"),
+    ("loading_bays", "id"),
+    ("dispatch_appointments", "id"),
+    ("appointment_status_history", "id"),
     ("audit_log", "id"),
     ("audit_events", "id"),
     ("departments", "id"),
@@ -985,6 +989,9 @@ SUPABASE_PULL_TABLES = [
     ("transports", "id"),
     ("transport_items", "id"),
     ("delivery_photos", "id"),
+    ("loading_bays", "id"),
+    ("dispatch_appointments", "id"),
+    ("appointment_status_history", "id"),
     ("audit_log", "id"),
     ("audit_events", "id"),
     ("departments", "id"),
@@ -2708,7 +2715,7 @@ def role_may_write(role: str, path: str) -> bool:
                 or path.startswith("/customers") or path.startswith("/company") or path.startswith("/pricing")
                 or (path.startswith("/orders/") and "/invoice" in path))
     if role == "warehouse":
-        return path.startswith("/beton/wz") or path.startswith("/beton/transports") or path.startswith("/operations")
+        return path.startswith("/beton/wz") or path.startswith("/beton/transports") or path.startswith("/dispatch") or path.startswith("/operations")
     if role == "office":
         return ((path == "/orders/new" or path.startswith("/orders/"))
                 and "/invoice" not in path and "/status" not in path) or path.startswith("/customers")
@@ -2872,6 +2879,7 @@ BASE = r"""
       <a href="{{ url_for('invoices') }}">Faktury</a>
       <a href="{{ url_for('beton.wz_list') }}">Dokumenty WZ</a>
       <a href="{{ url_for('beton.transports') }}">Transporty</a>
+      <a href="{{ url_for('dispatch.appointments') }}">Awizacje i kolejka</a>
       <a href="{{ url_for('beton.drivers') }}">Kierowcy i pojazdy</a>
       <a href="{{ url_for('ops.operations') }}">Koszty i zużycie</a>
       <a href="{{ url_for('ops.analytics') }}">Analizy i raporty</a>
@@ -3774,6 +3782,13 @@ register_beton_logistics(app, {
     "now_iso": now_iso,
     "supabase_enabled": supabase_enabled,
     "supabase_request": supabase_request,
+    "BASE_URL": BASE_URL,
+    "DB_PATH": DB_PATH,
+})
+
+register_dispatch(app, {
+    "conn": conn,
+    "now_iso": now_iso,
     "BASE_URL": BASE_URL,
     "DB_PATH": DB_PATH,
 })
