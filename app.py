@@ -1193,6 +1193,22 @@ def supabase_storage_upload_file(local_path: str, object_path: str, bucket: str 
         resp.read()
     return supabase_storage_ref(object_path, bucket)
 
+def supabase_storage_upload_bytes(data: bytes, object_path: str, bucket: str | None = None, content_type: str = "application/octet-stream") -> str:
+    """Upload used by the driver portal; the browser never receives Supabase keys."""
+    if not supabase_enabled():
+        raise RuntimeError("Brak konfiguracji Supabase")
+    bucket = bucket or SUPABASE_STORAGE_BUCKET
+    ensure_supabase_storage_bucket(bucket)
+    req = urllib.request.Request(supabase_storage_object_url(bucket, object_path), data=data, method="POST")
+    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
+    req.add_header("Content-Type", content_type or "application/octet-stream")
+    req.add_header("x-upsert", "false")
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        if resp.status >= 300:
+            raise RuntimeError(f"Supabase Storage HTTP {resp.status}")
+    return supabase_storage_ref(object_path, bucket)
+
 
 def supabase_storage_download_bytes(storage_ref: str) -> tuple[bytes, str]:
     parsed = parse_supabase_storage_ref(storage_ref)
@@ -2761,6 +2777,10 @@ def security_gate():
     if is_client_api:
         if request.method == "OPTIONS":
             return None
+        if path == "/api/driver/login":
+            if not _rate_limit("driver_login", 8, 15 * 60):
+                return jsonify(ok=False, error="Zbyt wiele prób logowania. Spróbuj później."), 429
+            return None
         if path == "/api/client/orders" and not _rate_limit("client_orders", 12, 10 * 60):
             return jsonify(ok=False, error="Zbyt wiele prób złożenia zamówienia"), 429
         if not _rate_limit("client_api", 180, 60):
@@ -3759,6 +3779,7 @@ register_beton_logistics(app, {
     "now_iso": now_iso,
     "supabase_enabled": supabase_enabled,
     "supabase_request": supabase_request,
+    "supabase_storage_upload_bytes": supabase_storage_upload_bytes,
     "BASE_URL": BASE_URL,
     "DB_PATH": DB_PATH,
 })
