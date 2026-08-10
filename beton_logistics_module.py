@@ -113,7 +113,9 @@ def driver_auth_email(username):
     value=re.sub(r'[^a-z0-9._-]+','',value)
     if not value:
         raise ValueError('Login kierowcy może zawierać litery, cyfry, kropkę, myślnik i podkreślenie.')
-    return f'{value}@kierowca.betonlagow.local'
+    # Supabase Auth odrzuca końcówkę .local (HTTP 422). To jest techniczny
+    # identyfikator, bez wysyłki e-maili, ale z poprawną domeną publiczną.
+    return f'{value}@kierowca.betonlagow.app'
 
 def save_row_to_supabase(table, row, conflict='id'):
     """Critical operational records are saved centrally before the response."""
