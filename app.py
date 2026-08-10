@@ -909,12 +909,12 @@ if not CLIENT_ALLOWED_ORIGINS:
     app.logger.warning("CLIENT_ALLOWED_ORIGINS jest puste; przeglądarkowe żądania tworzenia zamówień będą odrzucane.")
 SUPABASE_STORAGE_BUCKET = (os.environ.get("SUPABASE_STORAGE_BUCKET") or "invoice-pdfs").strip()
 SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "1").strip().lower() in ("1", "true", "yes", "on")
+INVENTORY_AUTOMATION_ENABLED = (os.environ.get("INVENTORY_AUTOMATION_ENABLED") or "0").strip().lower() in ("1", "true", "yes", "on")
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
 SUPABASE_MIN_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_PULL_INTERVAL_SEC") or "2").strip())
 
 SUPABASE_SYNC_TABLES = [
     ("products", "id"),
-    ("stock", "product_id"),
     ("customers", "id"),
     ("orders", "id"),
     ("order_items", "id"),
@@ -950,7 +950,6 @@ SUPABASE_PULL_TABLES = [
     ("products", "id"),
     ("orders", "id"),
     ("material_orders", "id"),
-    ("stock", "product_id"),
     ("order_items", "id"),
     ("material_order_items", "id"),
     ("invoices", "id"),
@@ -2451,7 +2450,7 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
             continue
 
         warehouse_issued = int(order_row["warehouse_issued"] or 0)
-        if warehouse_issued == 0:
+        if warehouse_issued == 0 and INVENTORY_AUTOMATION_ENABLED:
             cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
             for it in cur.fetchall():
                 pid = int(it["product_id"])
@@ -2459,7 +2458,8 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
                 cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
                 cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
                 changed_product_ids.append(pid)
-            warehouse_issued = 1
+        # FV kończy obieg handlowy; nie rozchoduje automatycznie materiałów produkcyjnych.
+        warehouse_issued = 1
 
         if norm(order_row["status"]).lower() != "issued" or int(order_row["warehouse_issued"] or 0) != warehouse_issued:
             cur.execute("UPDATE orders SET status='issued', warehouse_issued=? WHERE id=?", (warehouse_issued, order_id))
@@ -2504,24 +2504,10 @@ def reconcile_orders_after_invoice_change(order_ids: list[int]):
         current_status = norm(order_row["status"]).lower()
 
         if fully and warehouse_issued == 0:
-            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
-            for it in cur.fetchall():
-                pid = int(it["product_id"])
-                qty = int(it["qty"] or 0)
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-                changed_product_ids.append(pid)
             cur.execute("UPDATE orders SET status='issued', warehouse_issued=1 WHERE id=?", (order_id,))
             changed_order_ids.append(order_id)
 
         elif not fully and warehouse_issued == 1:
-            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
-            for it in cur.fetchall():
-                pid = int(it["product_id"])
-                qty = int(it["qty"] or 0)
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
-                changed_product_ids.append(pid)
             next_status = "confirmed" if current_status == "issued" else (current_status or "confirmed")
             cur.execute("UPDATE orders SET status=?, warehouse_issued=0 WHERE id=?", (next_status, order_id))
             changed_order_ids.append(order_id)
@@ -2833,10 +2819,7 @@ BASE = r"""
       <a href="{{ url_for('ops.operations') }}">Koszty i zużycie</a>
       <a href="{{ url_for('ops.analytics') }}">Analizy i raporty</a>
       <a href="{{ url_for('ksef_dashboard') }}">KSeF</a>
-      <a href="{{ url_for('client_searches') }}">Wyszukiwania</a>
-      <a href="{{ url_for('stock') }}">Stan magazynu</a>
       <a href="{{ url_for('material_orders') }}">Zamówienia materiałów</a>
-      <a href="{{ url_for('order_scan') }}">Skan QR</a>
       <div class="nav-dropdown">
         <button class="nav-drop-btn" type="button">Ustawienia ▾</button>
         <div class="nav-dropdown-menu">
@@ -3101,7 +3084,7 @@ def home():
           </div></div></div>
         </div>
         <div class="card quick-card"><div class="panel-title"><span>ϟ</span><h2>Szybkie akcje</h2></div><div class="quick-grid">
-          <a class="btn" href="{{ url_for('order_new') }}"><b>＋</b><span>Nowe zamówienie</span></a><a class="btn" href="{{ url_for('products') }}"><b>◇</b><span>Dodaj produkt</span></a><a class="btn" href="{{ url_for('material_orders') }}"><b>⇢</b><span>Zamów materiały</span></a><a class="btn" href="{{ url_for('stock') }}"><b>⇧</b><span>Wydanie z magazynu</span></a><a class="btn" href="{{ url_for('order_scan') }}"><b>▧</b><span>Skanuj QR</span></a><a class="btn" href="{{ url_for('invoices') }}"><b>▤</b><span>Faktury</span></a>
+          <a class="btn" href="{{ url_for('order_new') }}"><b>＋</b><span>Nowe zamówienie</span></a><a class="btn" href="{{ url_for('products') }}"><b>◇</b><span>Dodaj produkt</span></a><a class="btn" href="{{ url_for('material_orders') }}"><b>⇢</b><span>Zamów materiały</span></a><a class="btn" href="{{ url_for('invoices') }}"><b>▤</b><span>Faktury</span></a>
         </div>
       </div>
       </div>
@@ -4252,18 +4235,16 @@ def products():
     if q:
         like = f"%{q}%"
         cur.execute("""
-          SELECT p.*, COALESCE(s.qty,0) AS stock
+          SELECT p.*
           FROM products p
-          LEFT JOIN stock s ON s.product_id=p.id
           WHERE p.sku LIKE ? OR p.model LIKE ? OR p.ean LIKE ? OR p.name LIKE ?
           ORDER BY p.sku
           LIMIT 1000
         """, (like, like, like, like))
     else:
         cur.execute("""
-          SELECT p.*, COALESCE(s.qty,0) AS stock
+          SELECT p.*
           FROM products p
-          LEFT JOIN stock s ON s.product_id=p.id
           ORDER BY p.sku
           LIMIT 1000
         """)
@@ -4275,7 +4256,7 @@ def products():
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">Produkty</h1>
+          <h1 style="margin:0;">Produkty końcowe / receptury</h1>
           <div class="right"></div>
         </div>
         <form method="get" class="grid3" style="margin-top:10px;">
@@ -4308,7 +4289,6 @@ def products():
               <th>Model</th>
               <th>EAN</th>
               <th>Nazwa</th>
-              <th>Stan</th>
             </tr>
           </thead>
           <tbody>
@@ -4318,7 +4298,6 @@ def products():
               <td>{{ r["model"] or "" }}</td>
               <td>{{ r["ean"] or "" }}</td>
               <td>{{ r["name"] or "" }}</td>
-              <td><span class="badge">{{ r["stock"] }}</span></td>
             </tr>
             {% endfor %}
             {% if not rows %}
@@ -5336,7 +5315,7 @@ def order_item_add(order_id):
     if not o:
         c.close()
         abort(404)
-    if int(o["warehouse_issued"] or 0) == 1:
+    if INVENTORY_AUTOMATION_ENABLED and int(o["warehouse_issued"] or 0) == 1:
         c.close()
         return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
 
@@ -5382,7 +5361,7 @@ def order_item_update(order_id, item_id):
     if not o:
         c.close()
         abort(404)
-    if int(o["warehouse_issued"] or 0) == 1:
+    if INVENTORY_AUTOMATION_ENABLED and int(o["warehouse_issued"] or 0) == 1:
         c.close()
         return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
     invoiced_qty = int(invoiced_qty_by_order_item_ids([item_id]).get(int(item_id)) or 0)
@@ -5441,7 +5420,7 @@ def order_delete(order_id):
     invoice_ids = [int(r["id"]) for r in cur.fetchall()]
 
     changed_product_ids = []
-    if int(o["warehouse_issued"] or 0) == 1:
+    if INVENTORY_AUTOMATION_ENABLED and int(o["warehouse_issued"] or 0) == 1:
         for it in items:
             pid = int(it["product_id"])
             qty = int(it["qty"])
@@ -5497,9 +5476,10 @@ def order_status_update(order_id):
     changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
 
-    # Jedyny moment zdjÄ™cia stanu:
-    # przy przejĹ›ciu na "in_delivery" i tylko jeĹ›li jeszcze nie byĹ‚o wydane.
-    if new_status == "in_delivery" and warehouse_issued == 0:
+    # Opcjonalny, starszy tryb magazynowy. W Beton Łagów jest domyślnie wyłączony:
+    # wydanie betonu dokumentuje WZ/transport, ale nie rozchodowuje automatycznie
+    # materiałów produkcyjnych (cementu, żwiru ani piasku).
+    if new_status == "in_delivery" and warehouse_issued == 0 and INVENTORY_AUTOMATION_ENABLED:
         cur.execute("""
           SELECT oi.product_id, oi.qty
           FROM order_items oi
@@ -5515,6 +5495,10 @@ def order_status_update(order_id):
             cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
             changed_product_ids.append(pid)
 
+        warehouse_issued = 1
+
+    # To tylko znacznik przebiegu dokumentu WZ, nie ruch stanu magazynowego.
+    elif new_status == "in_delivery" and warehouse_issued == 0:
         warehouse_issued = 1
 
     cur.execute(
@@ -8862,7 +8846,7 @@ def material_order_status(package_id):
     items = cur.fetchall()
 
     # PrzejĹ›cie NA arrived: fizycznie przyjÄ™to towar -> dodaj na stan.
-    if old_status != "arrived" and status == "arrived":
+    if INVENTORY_AUTOMATION_ENABLED and old_status != "arrived" and status == "arrived":
         for it in items:
             pid = it["product_id"]
             qty = int(it["qty"])
@@ -8870,7 +8854,7 @@ def material_order_status(package_id):
             cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
 
     # CofniÄ™cie Z arrived na inny status: towar wraca jako "w drodze" -> odejmij ze stanu.
-    elif old_status == "arrived" and status != "arrived":
+    elif INVENTORY_AUTOMATION_ENABLED and old_status == "arrived" and status != "arrived":
         for it in items:
             pid = it["product_id"]
             qty = int(it["qty"])
