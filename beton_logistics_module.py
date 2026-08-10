@@ -519,26 +519,27 @@ def driver_transports_api():
 def driver_transport_status_api(transport_id):
     driver_id=current_driver_id(); email=(g.client_user.get('email') or '').strip().lower(); data=request.get_json(silent=True) or {}; status=str(data.get('status',''))
     if not driver_id:return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
-    allowed={'issued','in_transit','delivered','returned','problem'}
+    allowed={'issued','in_transit','closed','delivered','returned','problem'}
     if status not in allowed:return jsonify(ok=False,error='Niedozwolony status'),400
     field={'issued':'issued_at','in_transit':'departed_at','delivered':'delivered_at','returned':'returned_at'}.get(status)
     with D['conn']() as c:
-        row=c.execute('''SELECT t.id,t.status,t.wz_id,t.issued_at,t.departed_at,t.delivered_at,t.returned_at
+        row=c.execute('''SELECT t.id,t.status,t.wz_id,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.updated_at
           FROM transports t JOIN drivers d ON d.id=t.driver_id
           WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL''',(transport_id,driver_id)).fetchone()
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
-        transitions={'assigned':{'issued','problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'issued','in_transit','delivered','returned'}}
+        transitions={'assigned':{'issued','problem'},'issued':{'in_transit','problem'},'in_transit':{'closed','problem'},'closed':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'issued','in_transit','closed','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
         # Tylko kierowca ma obowiązkową przerwę między kolejnymi etapami.
         # Pracownik, dyspozytor i administrator zmieniają etap w panelu głównym bez tej blokady.
         previous=[row[key] for key in ('issued_at','departed_at','delivered_at','returned_at') if row[key]]
+        if row['status']=='closed' and row['updated_at']:
+            previous.append(row['updated_at'])
         if previous and status != 'problem':
             try:
                 last_action=max(previous)
                 elapsed=(datetime.strptime(stamp(), '%Y-%m-%d %H:%M:%S')-datetime.strptime(last_action, '%Y-%m-%d %H:%M:%S')).total_seconds()
                 if 0 <= elapsed < 300:
-                    minutes_left=max(1, int((300-elapsed+59)//60))
-                    return jsonify(ok=False,error=f'Kolejny etap możesz potwierdzić za około {minutes_left} min.'),429
+                    return jsonify(ok=False,error='Zbyt szybko kliknięto kolejny etap. Potwierdzenie nie jest teraz możliwe.'),429
             except (TypeError, ValueError):
                 pass
         appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
@@ -548,7 +549,7 @@ def driver_transport_status_api(transport_id):
         if field:values.append(stamp())
         values.append(transport_id); c.execute(sql,values)
         if status=='returned':c.execute("UPDATE wz_documents SET status='returned' WHERE id=? AND status IN ('issued','in_transport')",(row['wz_id'],))
-        elif status in {'issued','in_transit','delivered'}:c.execute("UPDATE wz_documents SET status='in_transport' WHERE id=? AND status='issued'",(row['wz_id'],))
+        elif status in {'issued','in_transit','closed','delivered'}:c.execute("UPDATE wz_documents SET status='in_transport' WHERE id=? AND status='issued'",(row['wz_id'],))
         if status=='in_transit' and appointment:
             c.execute("UPDATE dispatch_appointments SET status='departed',updated_by=?,updated_at=? WHERE id=?",(email,stamp(),appointment['id']))
             c.execute("INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)",(appointment['id'],'ready_to_leave','departed','Potwierdzenie wyjazdu przez kierowcę',email,stamp()))
