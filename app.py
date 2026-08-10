@@ -32,7 +32,6 @@ from flask import render_template_string
 from jinja2 import DictLoader
 from werkzeug.security import check_password_hash, generate_password_hash
 
-import qrcode
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
@@ -444,11 +443,8 @@ def init_db():
     if "nip" not in customer_cols:
         cur.execute("ALTER TABLE customers ADD COLUMN nip TEXT")
 
-    # migracja: QR zamĂłwieĹ„
     cur.execute("PRAGMA table_info(orders)")
     order_cols = {r[1] for r in cur.fetchall()}
-    if "qr_data_url" not in order_cols:
-        cur.execute("ALTER TABLE orders ADD COLUMN qr_data_url TEXT")
     if "warehouse_issued" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN warehouse_issued INTEGER NOT NULL DEFAULT 0")
     if "idempotency_key" not in order_cols:
@@ -705,24 +701,6 @@ def link_orders_to_customers_by_email(sync_remote: bool = True):
                 pass
 
     return len(changed)
-
-
-def make_qr_data_url(value: str) -> str:
-    raw_value = norm(value)
-    if not raw_value:
-        return ""
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=8,
-        border=1
-    )
-    qr.add_data(raw_value)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def next_invoice_no(issue_date: str) -> str:
@@ -1620,7 +1598,6 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
         "status": "new",
         "note": note,
         "created_at": created_at,
-        "qr_data_url": "",
     }
     if idempotency_key:
         order_payload["idempotency_key"] = idempotency_key
@@ -1629,15 +1606,14 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
         raise RuntimeError("Supabase nie zwrĂłciĹ‚ ID dla zamĂłwienia")
 
     order_no = make_order_no(order_id, created_at)
-    qr_data_url = ""
-    supabase_update_rows("orders", {"order_no": order_no, "qr_data_url": qr_data_url}, {"id": order_id})
+    supabase_update_rows("orders", {"order_no": order_no}, {"id": order_id})
 
     c = conn()
     try:
         cur = c.cursor()
         cur.execute(
-            "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at, qr_data_url=excluded.qr_data_url, idempotency_key=excluded.idempotency_key",
-            (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, qr_data_url, idempotency_key)
+            "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at, idempotency_key=excluded.idempotency_key",
+            (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, idempotency_key)
         )
 
         for pid, qty in items:
@@ -3839,6 +3815,7 @@ register_beton_logistics(app, {
     "supabase_request": supabase_request,
     "supabase_storage_upload_bytes": supabase_storage_upload_bytes,
     "pull_shared_tables_from_supabase": pull_shared_tables_from_supabase,
+    "sync_local_rows_to_supabase": sync_local_rows_to_supabase,
     "BASE_URL": BASE_URL,
     "DB_PATH": DB_PATH,
 })
@@ -3846,6 +3823,7 @@ register_beton_logistics(app, {
 register_dispatch(app, {
     "conn": conn,
     "now_iso": now_iso,
+    "sync_local_rows_to_supabase": sync_local_rows_to_supabase,
     "BASE_URL": BASE_URL,
     "DB_PATH": DB_PATH,
 })
@@ -5067,7 +5045,6 @@ def orders():
                 <td class="flex">
                   <a class="btn" href="{{ url_for('order_view', order_id=r['id']) }}">SzczegĂłĹ‚y</a>
                   {% if r['status'] != 'issued' %}
-                    <a class="btn" href="{{ url_for('order_label', order_id=r['id']) }}">Etykieta 30x50</a>
                     <form method="post" action="{{ url_for('order_delete', order_id=r['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ zamĂłwienie?')">
                       <button class="btn danger" type="submit">UsuĹ„</button>
                     </form>
@@ -5296,14 +5273,13 @@ def order_create():
         cur = c.cursor()
         created_at = now_iso()
         cur.execute("""
-          INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url)
-          VALUES(?,?,?,?,?,?,?,?,?,?)
-        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, ""))
+          INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at)
+          VALUES(?,?,?,?,?,?,?,?,?)
+        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at))
         oid = cur.lastrowid
 
         order_no = make_order_no(oid, created_at)
-        qr_data_url = ""
-        cur.execute("UPDATE orders SET order_no=?, qr_data_url=? WHERE id=?", (order_no, qr_data_url, oid))
+        cur.execute("UPDATE orders SET order_no=? WHERE id=?", (order_no, oid))
 
         for pid, qty in items:
             cur.execute("SELECT sku FROM products WHERE id=?", (pid,))
@@ -5461,7 +5437,6 @@ def order_view(order_id):
                 </select>
                 <button class="btn" type="submit">ZmieĹ„ status</button>
               </form>
-              <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
             {% endif %}
               {% if locked %}
                 <span class="badge">Wydane z magazynu</span>
@@ -5773,15 +5748,11 @@ def order_status_update(order_id):
 
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id, order_no, qr_data_url, status, created_at, warehouse_issued FROM orders WHERE id=?", (order_id,))
+    cur.execute("SELECT id, order_no, status, created_at, warehouse_issued FROM orders WHERE id=?", (order_id,))
     o = cur.fetchone()
     if not o:
         c.close()
         abort(404)
-
-    qr_data_url = (o["qr_data_url"] or "").strip()
-    if new_status == "confirmed":
-        qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
 
     changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
@@ -5812,8 +5783,8 @@ def order_status_update(order_id):
         warehouse_issued = 1
 
     cur.execute(
-        "UPDATE orders SET status=?, qr_data_url=?, warehouse_issued=? WHERE id=?",
-        (new_status, qr_data_url, warehouse_issued, order_id)
+        "UPDATE orders SET status=?, warehouse_issued=? WHERE id=?",
+        (new_status, warehouse_issued, order_id)
     )
     c.commit()
     c.close()
@@ -5822,7 +5793,7 @@ def order_status_update(order_id):
         try:
             supabase_update_rows(
                 "orders",
-                {"status": new_status, "qr_data_url": qr_data_url, "warehouse_issued": warehouse_issued},
+                {"status": new_status, "warehouse_issued": warehouse_issued},
                 {"id": order_id}
             )
         except Exception:
@@ -7108,7 +7079,6 @@ def api_order_lookup():
             "customer_phone": o["customer_phone"],
             "customer_email": o["customer_email"],
             "note": o["note"],
-            "qr_data_url": o["qr_data_url"] or "",
             "warehouse_issued": int(o["warehouse_issued"] or 0),
             "total_net": total_net,
             "total_gross": total_gross,
@@ -8722,165 +8692,6 @@ def invoice_edit_admin(invoice_id):
     {% endblock %}
     """
     return render_template_string(tpl, title="Edytuj fakturę", base_url=BASE_URL, db_path=DB_PATH, inv=inv, buyer_address=buyer_address, msg=msg, edit_items=edit_items)
-
-@app.get("/orders/by-code/<path:token>")
-def order_by_code(token):
-    maybe_pull_shared_from_supabase()
-    c = conn()
-    cur = c.cursor()
-    cur.execute("SELECT id, order_no, created_at FROM orders WHERE order_no=? LIMIT 1", (norm(token),))
-    row = cur.fetchone()
-    if not row:
-        cur.execute("SELECT id, order_no, created_at FROM orders ORDER BY id DESC")
-        all_rows = cur.fetchall()
-        for r in all_rows:
-            if canonical_order_no(r["id"], r["created_at"], r["order_no"]) == norm(token):
-                row = r
-                break
-    c.close()
-    if not row:
-        return "Nie znaleziono zamĂłwienia", 404
-    return redirect(url_for("order_view", order_id=row["id"]))
-
-
-@app.get("/orders/scan")
-def order_scan():
-    tpl = r"""
-    {% extends "base.html" %}
-    {% block content %}
-      <style>
-        #qrScannerModal.hidden{display:none}
-      </style>
-
-      <div class="card">
-        <h1 id="openQrScanner" style="cursor:pointer;text-decoration:underline;">Skanuj QR zamĂłwienia</h1>
-        <div>
-          <input id="orderCodeInput" placeholder="Wklej kod zamĂłwienia ZAM-... albo kliknij â€žSkanuj QR zamĂłwieniaâ€ť" />
-          <button id="btnShowOrderByCode" class="btn primary" type="button" style="margin-top:8px">PokaĹĽ zamĂłwienie</button>
-        </div>
-        <div id="orderScanOut" class="muted" style="margin-top:10px"></div>
-      </div>
-
-      <div id="qrScannerModal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:9999;padding:16px;box-sizing:border-box;">
-        <div style="max-width:420px;margin:4vh auto;background:#fff;border-radius:16px;padding:12px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;">
-            <b>Skanuj QR</b>
-            <button id="closeQrScanner" class="btn" type="button">Zamknij</button>
-          </div>
-          <div class="muted" style="margin-bottom:8px;">Uruchamia siÄ™ tylko tylny aparat.</div>
-          <div id="orderQrReader" style="width:100%;min-height:280px;"></div>
-        </div>
-      </div>
-
-      <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
-      <script>
-        const $ = (id)=>document.getElementById(id);
-
-        function parseOrderCode(value){
-          const raw = String(value || '').trim();
-          if(!raw) return '';
-
-          const match = raw.match(/ZAM-[0-9]{6}[0-9]+|ZAM-[0-9]{8}-[A-Z0-9-]+/i);
-          if(match) return match[0].toUpperCase();
-
-          try {
-            const url = new URL(raw);
-            const fromPath = url.pathname.match(/ZAM-[0-9]{6}[0-9]+|ZAM-[0-9]{8}-[A-Z0-9-]+/i);
-            if(fromPath) return fromPath[0].toUpperCase();
-          } catch(e) {}
-
-          return raw.toUpperCase();
-        }
-
-        function showOrderByCode(rawCode){
-          const code = parseOrderCode(rawCode || $('orderCodeInput').value || '');
-          if(!code){
-            $('orderScanOut').innerHTML = '<div class="muted">Wpisz albo zeskanuj kod ZAM-...</div>';
-            return;
-          }
-          window.location.href = '/orders/by-code/' + encodeURIComponent(code);
-        }
-
-        $('btnShowOrderByCode').onclick = () => showOrderByCode();
-
-        let orderQrScanner = null;
-        let orderQrScannerRunning = false;
-
-        async function startOrderQrScanner(){
-          if(!window.Html5Qrcode) return;
-          if(!orderQrScanner){
-            orderQrScanner = new Html5Qrcode('orderQrReader');
-          }
-          if(orderQrScannerRunning) return;
-
-          const onSuccess = async (decodedText) => {
-            const parsedCode = parseOrderCode(decodedText);
-            $('orderCodeInput').value = parsedCode || decodedText;
-            await stopOrderQrScanner();
-            $('qrScannerModal').classList.add('hidden');
-            showOrderByCode(parsedCode || decodedText);
-          };
-
-          try {
-            await orderQrScanner.start(
-              { facingMode: { exact: 'environment' } },
-              { fps: 10, qrbox: 220, aspectRatio: 1.0 },
-              onSuccess,
-              () => {}
-            );
-            orderQrScannerRunning = true;
-          } catch (e1) {
-            try {
-              await orderQrScanner.start(
-                { facingMode: 'environment' },
-                { fps: 10, qrbox: 220, aspectRatio: 1.0 },
-                onSuccess,
-                () => {}
-              );
-              orderQrScannerRunning = true;
-            } catch (e2) {
-              $('orderScanOut').innerHTML = '<div class="muted">Nie udaĹ‚o siÄ™ uruchomiÄ‡ tylnego aparatu.</div>';
-              $('qrScannerModal').classList.add('hidden');
-            }
-          }
-        }
-
-        async function stopOrderQrScanner(){
-          try {
-            if(orderQrScanner && orderQrScannerRunning){
-              await orderQrScanner.stop();
-              await orderQrScanner.clear();
-            }
-          } catch (e) {}
-          orderQrScannerRunning = false;
-        }
-
-        $('openQrScanner').onclick = async () => {
-          $('qrScannerModal').classList.remove('hidden');
-          await startOrderQrScanner();
-        };
-
-        $('closeQrScanner').onclick = async () => {
-          await stopOrderQrScanner();
-          $('qrScannerModal').classList.add('hidden');
-        };
-
-        $('qrScannerModal').onclick = async (e) => {
-          if(e.target && e.target.id === 'qrScannerModal'){
-            await stopOrderQrScanner();
-            $('qrScannerModal').classList.add('hidden');
-          }
-        };
-
-        window.addEventListener('beforeunload', () => {
-          stopOrderQrScanner();
-        });
-      </script>
-    {% endblock %}
-    """
-    return render_template_string(tpl, title="Skan QR", base_url=BASE_URL, db_path=DB_PATH)
-
-
 
 # -------------------------
 # ZAMÓWIENIA MATERIAŁÓW
