@@ -171,7 +171,15 @@ def driver_login_api():
     password=data.get('password') or ''
     try:
         email=driver_auth_email(username)
-        auth=D['supabase_request']('/auth/v1/token',method='POST',params={'grant_type':'password'},payload={'email':email,'password':password}) or {}
+        auth=D['supabase_request'](
+            '/auth/v1/token',
+            method='POST',
+            params={'grant_type':'password'},
+            payload={'email':email,'password':password},
+            # Pobranie sesji kierowcy nie może korzystać z tajnego klucza
+            # serwisowego. Anon key zostaje wyłącznie na Render.
+            use_anon_key=True,
+        ) or {}
         access_token=auth.get('access_token')
         if not access_token:
             raise ValueError('Nieprawidłowy login lub hasło.')
