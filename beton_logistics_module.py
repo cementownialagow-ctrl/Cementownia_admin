@@ -1,11 +1,12 @@
 import re
 import os
+import io
 import secrets
 import time
 import unicodedata
 from datetime import datetime
 
-from flask import Blueprint, abort, current_app, g, jsonify, redirect, render_template_string, request, session, url_for
+from flask import Blueprint, abort, current_app, g, jsonify, redirect, render_template_string, request, send_file, session, url_for
 
 bp=Blueprint('beton',__name__,url_prefix='/beton')
 driver_api=Blueprint('driver_api',__name__,url_prefix='/api/driver')
@@ -260,6 +261,7 @@ def wz_view(wz_id):
             FROM wz_items wi LEFT JOIN products p ON p.id=wi.product_id
             WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()
         transport=c.execute('SELECT * FROM transports WHERE wz_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1',(wz_id,)).fetchone()
+        photos=c.execute('SELECT id,created_at FROM delivery_photos WHERE transport_id=? AND deleted_at IS NULL ORDER BY created_at DESC',(transport['id'],)).fetchall() if transport else []
     return render_template_string('''{% extends "base.html" %}{% block content %}
       <div class="flex"><h1>{{w.wz_no}}</h1><span class="badge">{{w.status}}</span><a class="btn right" target="_blank" href="{{url_for('beton.wz_print',wz_id=w.id)}}">Drukuj WZ</a><form method="post" action="{{url_for('beton.wz_delete',wz_id=w.id)}}" onsubmit="return confirm('Usunąć WZ {{w.wz_no}}? Dokument i przypisany transport znikną z bieżącej listy.');"><button class="btn danger" type="submit">Usuń WZ</button></form></div>
       <div class="card">
@@ -275,7 +277,20 @@ def wz_view(wz_id):
         <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status=='issued' and not transport %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przypisz kierowcę i auto</a>{% elif w.status=='returned' %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ — gotowe do faktury VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Transport {{transport.transport_no}}</a>{% endif %}</div>
       </div>
       <div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>
-    {% endblock %}''',w=w,items=items,transport=transport,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+      <div class="card"><h2>Zdjęcia podpisanego WZ</h2>{% for p in photos %}<div class="flex" style="margin:8px 0"><span>{{p.created_at}}</span><a class="btn" href="{{url_for('beton.photo_download',photo_id=p.id)}}">Pobierz zdjęcie</a></div>{% else %}<span class="muted">Brak zdjęć.</span>{% endfor %}</div>
+    {% endblock %}''',w=w,items=items,transport=transport,photos=photos,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+
+@bp.get('/photos/<int:photo_id>/download')
+def photo_download(photo_id):
+    with D['conn']() as c:
+        photo=c.execute('SELECT storage_ref FROM delivery_photos WHERE id=? AND deleted_at IS NULL',(photo_id,)).fetchone()
+    if not photo: abort(404)
+    try:
+        raw, filename=D['supabase_storage_download_bytes'](photo['storage_ref'])
+        return send_file(io.BytesIO(raw), as_attachment=True, download_name=filename)
+    except Exception:
+        current_app.logger.exception('Nie udało się pobrać zdjęcia podpisanego WZ')
+        return 'Nie udało się pobrać zdjęcia z Supabase.', 502
 
 
 @bp.post('/wz/<int:wz_id>/delete')
@@ -550,14 +565,22 @@ def driver_transport_status_api(transport_id):
         sql='UPDATE transports SET status=?,driver_notes=?,receiver_name=?,updated_by=?,updated_at=?'+(f',{field}=?' if field else '')+' WHERE id=?'; values=[status,str(data.get('notes',''))[:2000],str(data.get('receiver_name',''))[:200],email,stamp()]
         if field:values.append(stamp())
         values.append(transport_id); c.execute(sql,values)
-        if status=='returned':c.execute("UPDATE wz_documents SET status='returned' WHERE id=? AND status IN ('issued','in_transport')",(row['wz_id'],))
-        elif status in {'issued','in_transit','closed','delivered'}:c.execute("UPDATE wz_documents SET status='in_transport' WHERE id=? AND status='issued'",(row['wz_id'],))
+        # Podpisane WZ zamyka część dostawczą i od razu daje księgowości
+        # możliwość wystawienia faktury. Powrót auta na bazę pozostaje
+        # osobnym etapem logistycznym, ale nie blokuje fakturowania.
+        if status=='delivered':
+            c.execute("UPDATE wz_documents SET status='ready_invoice',ready_by=?,ready_at=? WHERE id=? AND status IN ('issued','in_transport')",(email,stamp(),row['wz_id']))
+        elif status=='returned':
+            c.execute("UPDATE wz_documents SET status='returned' WHERE id=? AND status IN ('issued','in_transport')",(row['wz_id'],))
+        elif status in {'issued','in_transit','closed'}:
+            c.execute("UPDATE wz_documents SET status='in_transport' WHERE id=? AND status='issued'",(row['wz_id'],))
         if status=='in_transit' and appointment:
             c.execute("UPDATE dispatch_appointments SET status='departed',updated_by=?,updated_at=? WHERE id=?",(email,stamp(),appointment['id']))
             c.execute("INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)",(appointment['id'],'ready_to_leave','departed','Potwierdzenie wyjazdu przez kierowcę',email,stamp()))
             appointment_id_to_sync=appointment['id']
         c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(email,'status:'+status,'transport',transport_id,'{}',stamp()))
     D['sync_local_rows_to_supabase']('transports','id',[transport_id])
+    D['sync_local_rows_to_supabase']('wz_documents','id',[row['wz_id']])
     if appointment_id_to_sync:
         D['sync_local_rows_to_supabase']('dispatch_appointments','id',[appointment_id_to_sync])
     return jsonify(ok=True,status=status)
