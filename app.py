@@ -190,6 +190,13 @@ def init_db():
         model TEXT,
         ean TEXT,
         name TEXT,
+        unit TEXT NOT NULL DEFAULT 'm3',
+        unit_net_price REAL NOT NULL DEFAULT 0,
+        unit_gross_price REAL NOT NULL DEFAULT 0,
+        unit_material_cost REAL NOT NULL DEFAULT 0,
+        unit_production_cost REAL NOT NULL DEFAULT 0,
+        unit_transport_cost REAL NOT NULL DEFAULT 0,
+        unit_other_cost REAL NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
     )
     """)
@@ -434,6 +441,19 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN warehouse_issued INTEGER NOT NULL DEFAULT 0")
     if "idempotency_key" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN idempotency_key TEXT")
+
+    product_cols = {r[1] for r in cur.execute("PRAGMA table_info(products)").fetchall()}
+    for col, definition in {
+        "unit": "TEXT NOT NULL DEFAULT 'm3'",
+        "unit_net_price": "REAL NOT NULL DEFAULT 0",
+        "unit_gross_price": "REAL NOT NULL DEFAULT 0",
+        "unit_material_cost": "REAL NOT NULL DEFAULT 0",
+        "unit_production_cost": "REAL NOT NULL DEFAULT 0",
+        "unit_transport_cost": "REAL NOT NULL DEFAULT 0",
+        "unit_other_cost": "REAL NOT NULL DEFAULT 0",
+    }.items():
+        if col not in product_cols:
+            cur.execute(f"ALTER TABLE products ADD COLUMN {col} {definition}")
 
     # Migracja nazewnictwa z odziedziczonego modułu „China” do zamówień materiałów.
     old_material_tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -4267,8 +4287,9 @@ def products():
       </div>
 
       <div class="card">
-        <h2>Import CSV (478 pozycji)</h2>
+        <h2>Import CSV wyrobów gotowych</h2>
         <div class="muted">Wybierz plik CSV z Excela. Minimalnie: kolumna SKU (unikalna). PozostaĹ‚e: model, ean, name/nazwa.</div>
+        <div class="notice" style="margin-top:10px;">Kolumny dla betoniarni: <b>kod</b>, <b>produkt</b>, <b>jednostka</b> (m3, t, kg, szt.), <b>cena_netto</b>, <b>cena_brutto</b>, <b>koszt_materialu</b>, <b>koszt_produkcji</b>, <b>koszt_transportu</b>, <b>koszt_inny</b>. Ceny i koszty są podawane za jedną jednostkę.</div>
         <form method="post" action="{{ url_for('products_import') }}" enctype="multipart/form-data" class="row" style="margin-top:10px;">
           <div>
             <input type="file" name="file" accept=".csv,text/csv" required>
@@ -4286,18 +4307,22 @@ def products():
           <thead>
             <tr>
               <th>SKU</th>
-              <th>Model</th>
-              <th>EAN</th>
-              <th>Nazwa</th>
+              <th>Produkt</th>
+              <th>Jednostka</th>
+              <th>Cena netto / j.</th>
+              <th>Cena brutto / j.</th>
+              <th>Koszt całkowity / j.</th>
             </tr>
           </thead>
           <tbody>
             {% for r in rows %}
             <tr>
               <td><b>{{ r["sku"] }}</b></td>
-              <td>{{ r["model"] or "" }}</td>
-              <td>{{ r["ean"] or "" }}</td>
-              <td>{{ r["name"] or "" }}</td>
+              <td>{{ r["name"] or r["model"] or "" }}</td>
+              <td>{{ r["unit"] or "m3" }}</td>
+              <td>{{ "%.2f"|format(r["unit_net_price"] or 0) }} PLN</td>
+              <td>{{ "%.2f"|format(r["unit_gross_price"] or 0) }} PLN</td>
+              <td>{{ "%.2f"|format((r["unit_material_cost"] or 0) + (r["unit_production_cost"] or 0) + (r["unit_transport_cost"] or 0) + (r["unit_other_cost"] or 0)) }} PLN</td>
             </tr>
             {% endfor %}
             {% if not rows %}
@@ -4339,6 +4364,18 @@ def products_import():
     i_model = guess_col(headers, ["model", "model_uchwytu", "nazwa_modelu"])
     i_ean = guess_col(headers, ["ean", "gtin"])
     i_name = guess_col(headers, ["name", "nazwa", "produkt", "product"])
+    i_unit = guess_col(headers, ["jednostka", "jm", "unit", "miara"])
+    i_net = guess_col(headers, ["cena_netto", "cena jednostkowa netto", "netto", "price_net", "unit_net_price"])
+    i_gross = guess_col(headers, ["cena_brutto", "cena jednostkowa brutto", "brutto", "price_gross", "unit_gross_price"])
+    i_material_cost = guess_col(headers, ["koszt_materialu", "koszt materiału", "material_cost"])
+    i_production_cost = guess_col(headers, ["koszt_produkcji", "production_cost"])
+    i_transport_cost = guess_col(headers, ["koszt_transportu", "transport_cost"])
+    i_other_cost = guess_col(headers, ["koszt_inny", "koszt pozostały", "other_cost"])
+
+    # A cement-plant export may identify a product by its name only.
+    # The internal SKU then uses that name as a stable import key.
+    if i_sku is None and i_name is not None:
+        i_sku = i_name
 
     if i_sku is None:
         return "CSV musi mieÄ‡ kolumnÄ™ SKU / Symbol / Indeks", 400
@@ -4351,28 +4388,38 @@ def products_import():
     for row in data:
         if not row or len(row) <= i_sku:
             continue
-        sku = norm(row[i_sku])
+        sku = norm(row[i_sku]) if i_sku is not None and len(row) > i_sku else ""
+        if not sku:
+            sku = f"BETON-{data.index(row)+1}"
         if not sku:
             continue
         model = norm(row[i_model]) if i_model is not None and len(row) > i_model else ""
         ean = norm(row[i_ean]) if i_ean is not None and len(row) > i_ean else ""
         name = norm(row[i_name]) if i_name is not None and len(row) > i_name else ""
+        unit = norm(row[i_unit]) if i_unit is not None and len(row) > i_unit else "m3"
+        net = to_float(row[i_net], 0) if i_net is not None and len(row) > i_net else 0
+        gross = to_float(row[i_gross], 0) if i_gross is not None and len(row) > i_gross else round(net * 1.23, 2)
+        material_cost = to_float(row[i_material_cost], 0) if i_material_cost is not None and len(row) > i_material_cost else 0
+        production_cost = to_float(row[i_production_cost], 0) if i_production_cost is not None and len(row) > i_production_cost else 0
+        transport_cost = to_float(row[i_transport_cost], 0) if i_transport_cost is not None and len(row) > i_transport_cost else 0
+        other_cost = to_float(row[i_other_cost], 0) if i_other_cost is not None and len(row) > i_other_cost else 0
 
         cur.execute("SELECT id FROM products WHERE sku=?", (sku,))
         exists = cur.fetchone()
         if exists:
-            cur.execute("UPDATE products SET model=?, ean=?, name=? WHERE sku=?", (model, ean, name, sku))
+            cur.execute("UPDATE products SET model=?, ean=?, name=?, unit=?, unit_net_price=?, unit_gross_price=?, unit_material_cost=?, unit_production_cost=?, unit_transport_cost=?, unit_other_cost=? WHERE sku=?", (model, ean, name, unit, net, gross, material_cost, production_cost, transport_cost, other_cost, sku))
             updated += 1
             pid = exists["id"]
         else:
             cur.execute(
-                "INSERT INTO products(sku, model, ean, name, created_at) VALUES (?,?,?,?,?)",
-                (sku, model, ean, name, now_iso())
+                "INSERT INTO products(sku, model, ean, name, unit, unit_net_price, unit_gross_price, unit_material_cost, unit_production_cost, unit_transport_cost, unit_other_cost, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sku, model, ean, name, unit, net, gross, material_cost, production_cost, transport_cost, other_cost, now_iso())
             )
             pid = cur.lastrowid
             added += 1
 
         cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+        cur.execute("INSERT INTO pricing(model, net_price, gross_price, created_at) VALUES (?,?,?,?) ON CONFLICT(model) DO UPDATE SET net_price=excluded.net_price, gross_price=excluded.gross_price, created_at=excluded.created_at", (model or sku, net, gross, now_iso()))
 
     c.commit()
     c.close()
