@@ -3,6 +3,7 @@ import os
 import secrets
 import time
 import unicodedata
+from datetime import datetime
 
 from flask import Blueprint, abort, current_app, g, jsonify, redirect, render_template_string, request, session, url_for
 
@@ -522,10 +523,24 @@ def driver_transport_status_api(transport_id):
     if status not in allowed:return jsonify(ok=False,error='Niedozwolony status'),400
     field={'issued':'issued_at','in_transit':'departed_at','delivered':'delivered_at','returned':'returned_at'}.get(status)
     with D['conn']() as c:
-        row=c.execute('SELECT t.id,t.status,t.wz_id FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,driver_id)).fetchone()
+        row=c.execute('''SELECT t.id,t.status,t.wz_id,t.issued_at,t.departed_at,t.delivered_at,t.returned_at
+          FROM transports t JOIN drivers d ON d.id=t.driver_id
+          WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL''',(transport_id,driver_id)).fetchone()
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
         transitions={'assigned':{'issued','problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'issued','in_transit','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
+        # Tylko kierowca ma obowiązkową przerwę między kolejnymi etapami.
+        # Pracownik, dyspozytor i administrator zmieniają etap w panelu głównym bez tej blokady.
+        previous=[row[key] for key in ('issued_at','departed_at','delivered_at','returned_at') if row[key]]
+        if previous and status != 'problem':
+            try:
+                last_action=max(previous)
+                elapsed=(datetime.strptime(stamp(), '%Y-%m-%d %H:%M:%S')-datetime.strptime(last_action, '%Y-%m-%d %H:%M:%S')).total_seconds()
+                if 0 <= elapsed < 300:
+                    minutes_left=max(1, int((300-elapsed+59)//60))
+                    return jsonify(ok=False,error=f'Kolejny etap możesz potwierdzić za około {minutes_left} min.'),429
+            except (TypeError, ValueError):
+                pass
         appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
         if status in {'issued','in_transit'} and appointment and appointment['status']!='ready_to_leave':
             return jsonify(ok=False,error='Dyspozytor musi najpierw oznaczyć transport jako gotowy do wyjazdu.'),409
