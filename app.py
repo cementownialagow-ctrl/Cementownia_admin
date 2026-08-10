@@ -100,6 +100,14 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
 
+@app.get("/brand-logo.png")
+def brand_logo():
+    """Serves the logo placed next to app.py (the deployment layout used on GitHub)."""
+    path = find_logo_path()
+    if not path:
+        abort(404)
+    return send_file(path, mimetype="image/png", conditional=True)
+
 
 _MOJIBAKE_REPLACEMENTS = {
     "Ä…": "ą", "Ä‡": "ć", "Ä™": "ę", "Ĺ‚": "ł", "Ĺ„": "ń",
@@ -2815,7 +2823,7 @@ def login():
         else:
             error = "Nieprawidłowy login lub hasło."
         c.close()
-    return render_template_string(r'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Logowanie — Beton Łagów</title><style>body{margin:0;font-family:Inter,Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,calc(100% - 28px));background:#fff;padding:30px;border-radius:24px;box-shadow:0 18px 55px rgba(20,35,65,.13)}.logo{display:block;max-width:210px;max-height:74px;object-fit:contain;margin:0 0 15px}.muted{color:#718096;font-size:13px;margin-bottom:22px}label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dfe3ec;border-radius:13px;font:inherit}button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:13px;background:#5577ee;color:#fff;font-weight:700}.error{background:#fff1f2;color:#b9384c;padding:10px;border-radius:12px;font-size:12px}</style></head><body><form class="box" method="post"><img class="logo" src="{{ url_for('static',filename='logo.png') }}" alt="Beton Łagów"><div class="muted">Zaloguj się jako administrator.</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<label>Login</label><input name="username" autocomplete="username" required><label>Hasło</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Zaloguj</button></form></body></html>''', error=error)
+    return render_template_string(r'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Logowanie — Beton Łagów</title><style>body{margin:0;font-family:Inter,Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,calc(100% - 28px));background:#fff;padding:30px;border-radius:24px;box-shadow:0 18px 55px rgba(20,35,65,.13)}.logo{display:block;max-width:210px;max-height:74px;object-fit:contain;margin:0 0 15px}.muted{color:#718096;font-size:13px;margin-bottom:22px}label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dfe3ec;border-radius:13px;font:inherit}button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:13px;background:#5577ee;color:#fff;font-weight:700}.error{background:#fff1f2;color:#b9384c;padding:10px;border-radius:12px;font-size:12px}</style></head><body><form class="box" method="post"><img class="logo" src="{{ url_for('brand_logo') }}" alt="Beton Łagów"><div class="muted">Zaloguj się jako administrator.</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<label>Login</label><input name="username" autocomplete="username" required><label>Hasło</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Zaloguj</button></form></body></html>''', error=error)
 
 
 @app.get("/logout")
@@ -2871,7 +2879,7 @@ BASE = r"""
 <body>
   <button class="mobile-toggle" type="button" onclick="document.querySelector('.top').classList.toggle('open')">☰</button>
   <div class="top">
-    <div class="brand"><img src="{{ url_for('static',filename='logo.png') }}" alt="Beton Łagów"></div>
+    <div class="brand"><img src="{{ url_for('brand_logo') }}" alt="Beton Łagów"></div>
     <div class="nav flex">
       <a class="{% if request.endpoint == 'home' %}active{% endif %}" href="{{ url_for('home') }}">Pulpit</a>
       <a class="{% if request.endpoint in ['orders','order_view'] %}active{% endif %}" href="{{ url_for('orders') }}">Zamówienia</a>
@@ -8897,19 +8905,6 @@ def material_orders():
             <input name="package_no" placeholder="np. PO-2026-02-01" required>
           </div>
           <div>
-            <label class="muted small">Tracking</label>
-            <input name="tracking" placeholder="UPS / DHL...">
-          </div>
-          <div>
-            <label class="muted small">Status</label>
-            <select name="status">
-              <option value="planned">planned</option>
-              <option value="ordered">ordered</option>
-              <option value="shipped">shipped</option>
-              <option value="arrived">arrived</option>
-            </select>
-          </div>
-          <div>
             <label class="muted small">Notatka</label>
             <input name="note">
           </div>
@@ -8923,7 +8918,7 @@ def material_orders():
         <h2>Zamówienia materiałów (max 200)</h2>
         <table>
           <thead>
-            <tr><th>Nr</th><th>Status</th><th>Tracking</th><th>Notatka</th><th>Data</th><th>Akcje</th></tr>
+            <tr><th>Nr</th><th>Status</th><th>Notatka</th><th>Data</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for p in packs %}
@@ -8940,19 +8935,11 @@ def material_orders():
                     <button class="btn" type="submit">ZmieĹ„</button>
                   </form>
                 </td>
-                <td>
-                  <form method="post" action="{{ url_for('material_order_tracking', package_id=p['id']) }}" class="flex">
-                    <input name="tracking" value="{{ p['tracking'] or '' }}" placeholder="nr trackingu" style="width:180px;">
-                    <button class="btn" type="submit">Zapisz</button>
-                    {% if p['tracking'] %}
-                      <a class="btn" target="_blank" href="https://t.17track.net/en#nums={{ p['tracking']|urlencode }}">17TRACK</a>
-                    {% endif %}
-                  </form>
-                </td>
                 <td>{{ p['note'] or "-" }}</td>
                 <td class="muted">{{ p['created_at'] }}</td>
                 <td class="flex">
-                  <a class="btn primary" href="{{ url_for('material_order_detail', package_id=p['id']) }}">ZawartoĹ›Ä‡</a>
+                  <a class="btn primary" href="{{ url_for('material_order_detail', package_id=p['id']) }}">Pozycje</a>
+                  <a class="btn" target="_blank" href="{{ url_for('material_order_print', package_id=p['id']) }}">Drukuj</a>
                   <form method="post" action="{{ url_for('material_order_delete', package_id=p['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ paczkÄ™?')">
                     <button class="btn danger" type="submit">UsuĹ„</button>
                   </form>
@@ -8972,8 +8959,7 @@ def material_orders():
 @app.post("/material-orders/create")
 def material_order_create():
     package_no = norm(request.form.get("package_no"))
-    status = norm(request.form.get("status")) or "planned"
-    tracking = norm(request.form.get("tracking"))
+    status = "draft"
     note = norm(request.form.get("note"))
 
     if not package_no:
@@ -8985,7 +8971,7 @@ def material_order_create():
         cur.execute("""
           INSERT INTO material_orders(package_no, status, tracking, note, created_at)
           VALUES(?,?,?,?,?)
-        """, (package_no, status, tracking, note, now_iso()))
+        """, (package_no, status, "", note, now_iso()))
         c.commit()
     except sqlite3.IntegrityError:
         pass
@@ -9054,6 +9040,17 @@ def material_order_tracking(package_id):
     if ref.endswith(f"/material-orders/{package_id}"):
         return redirect(url_for("material_order_detail", package_id=package_id))
     return redirect(url_for("material_orders"))
+
+@app.get("/material-orders/<int:package_id>/print")
+def material_order_print(package_id):
+    c = conn(); cur = c.cursor()
+    pack = cur.execute("SELECT * FROM material_orders WHERE id=?", (package_id,)).fetchone()
+    if not pack:
+        c.close(); abort(404)
+    items = cur.execute("""SELECT mi.sku,mi.qty,p.name,p.unit FROM material_order_items mi
+        LEFT JOIN products p ON p.id=mi.product_id WHERE mi.package_id=? ORDER BY mi.id""", (package_id,)).fetchall()
+    c.close()
+    return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{p.package_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}table{width:100%;border-collapse:collapse;margin-top:24px}th,td{border:1px solid #222;padding:9px;text-align:left}button{padding:8px 12px}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Zamówienie materiałów {{p.package_no}}</h1><p>Data utworzenia: {{p.created_at[:10]}}</p><p><b>Dostawca / uwagi:</b> {{p.note or '—'}}</p><table><thead><tr><th>Materiał</th><th>Jednostka</th><th>Ilość</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.name or i.sku}}</td><td>{{i.unit or 'szt.'}}</td><td>{{i.qty}}</td></tr>{% else %}<tr><td colspan="3">Brak pozycji.</td></tr>{% endfor %}</tbody></table><div style="margin-top:80px;display:flex;justify-content:space-between"><span>____________________________<br>Osoba zamawiająca</span><span>____________________________<br>Akceptacja dostawcy</span></div></html>''', p=pack, items=items)
 
 @app.get("/material-orders/<int:package_id>")
 def material_order_detail(package_id):
@@ -9228,4 +9225,3 @@ def material_order_item_delete(package_id, item_id):
 # =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=os.environ.get("FLASK_DEBUG") == "1")
-
