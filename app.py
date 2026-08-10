@@ -3130,6 +3130,10 @@ def admin_user_role(user_id):
 
 @app.get("/admin/audit")
 def admin_audit():
+    # Render's local SQLite is temporary. Always refresh the history from the
+    # central database before displaying it, otherwise a redeploy shows an
+    # empty journal despite the records existing in Supabase.
+    maybe_pull_shared_from_supabase(force=True)
     actor_filter = norm(request.args.get("actor")); path_filter = norm(request.args.get("path"))
     sql = "SELECT * FROM audit_events WHERE 1=1"; params = []
     if actor_filter: sql += " AND (actor_username LIKE ? OR actor_display_name LIKE ?)"; params += [f"%{actor_filter}%", f"%{actor_filter}%"]
@@ -3890,16 +3894,21 @@ def write_audit_event(response):
         parts = [p for p in request.path.split("/") if p]
         entity_type = parts[0] if parts else "application"
         entity_id = next((p for p in reversed(parts) if p.isdigit()), None)
+        event_id = cloud_row_id()
         c = conn()
-        c.execute("""INSERT INTO audit_events(request_id,actor_type,actor_id,actor_username,actor_display_name,
+        c.execute("""INSERT INTO audit_events(id,request_id,actor_type,actor_id,actor_username,actor_display_name,
                     actor_role,action,method,path,entity_type,entity_id,payload_json,response_status,ip_address,user_agent,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
-                    request.headers.get("X-Request-ID") or str(uuid.uuid4()), actor_type, actor_id, username,
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    event_id, request.headers.get("X-Request-ID") or str(uuid.uuid4()), actor_type, actor_id, username,
                     display_name, role, request.endpoint or f"{request.method} {request.path}", request.method,
                     request.path, entity_type, entity_id, json.dumps(payload, ensure_ascii=False, default=str)[:12000],
                     response.status_code, (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip(),
                     (request.user_agent.string or "")[:500], now_iso()))
         c.commit(); c.close()
+        # This record must not wait for a later request: it is the evidence of
+        # the operation that has just happened.
+        if supabase_enabled():
+            sync_local_rows_to_supabase("audit_events", "id", [event_id])
     except Exception:
         app.logger.exception("Nie udało się zapisać zdarzenia audytowego")
     return response
