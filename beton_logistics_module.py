@@ -518,6 +518,7 @@ def driver_transports_api():
 @driver_api.post('/transports/<int:transport_id>/status')
 def driver_transport_status_api(transport_id):
     driver_id=current_driver_id(); email=(g.client_user.get('email') or '').strip().lower(); data=request.get_json(silent=True) or {}; status=str(data.get('status',''))
+    appointment_id_to_sync=None
     if not driver_id:return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
     allowed={'issued','in_transit','closed','delivered','returned','problem'}
     if status not in allowed:return jsonify(ok=False,error='Niedozwolony status'),400
@@ -553,7 +554,11 @@ def driver_transport_status_api(transport_id):
         if status=='in_transit' and appointment:
             c.execute("UPDATE dispatch_appointments SET status='departed',updated_by=?,updated_at=? WHERE id=?",(email,stamp(),appointment['id']))
             c.execute("INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)",(appointment['id'],'ready_to_leave','departed','Potwierdzenie wyjazdu przez kierowcę',email,stamp()))
+            appointment_id_to_sync=appointment['id']
         c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(email,'status:'+status,'transport',transport_id,'{}',stamp()))
+    D['sync_local_rows_to_supabase']('transports','id',[transport_id])
+    if appointment_id_to_sync:
+        D['sync_local_rows_to_supabase']('dispatch_appointments','id',[appointment_id_to_sync])
     return jsonify(ok=True,status=status)
 
 @driver_api.get('/transports/<int:transport_id>/invoice')
@@ -577,15 +582,19 @@ def driver_delivery_photo_api(transport_id):
     if not raw or len(raw)>10*1024*1024:
         return jsonify(ok=False,error='Zdjęcie jest puste lub większe niż 10 MB.'),400
     with D['conn']() as c:
-        row=c.execute('SELECT t.id FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,driver_id)).fetchone()
+        row=c.execute('SELECT t.id,t.status FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,driver_id)).fetchone()
     if not row:
         return jsonify(ok=False,error='Brak dostępu do transportu.'),403
+    if row['status'] not in {'delivered','returned'}:
+        return jsonify(ok=False,error='Zdjęcie podpisanego WZ można dodać po potwierdzeniu etapu „WZ podpisane”.'),409
     ext={'image/jpeg':'jpg','image/png':'png','image/webp':'webp'}[photo.mimetype]
     object_path=f"{g.client_user['id']}/{transport_id}/{int(time.time()*1000)}-{os.urandom(4).hex()}.{ext}"
     try:
         storage_ref=D['supabase_storage_upload_bytes'](raw,object_path,bucket='delivery-photos',content_type=photo.mimetype)
+        photo_id=cloud_id()
         with D['conn']() as c:
-            c.execute('INSERT INTO delivery_photos(transport_id,storage_ref,photo_type,caption,created_by,created_at) VALUES(?,?,?,?,?,?)',(transport_id,storage_ref,'delivery','',g.client_user['id'],stamp()))
+            c.execute('INSERT INTO delivery_photos(id,transport_id,storage_ref,photo_type,caption,created_by,created_at) VALUES(?,?,?,?,?,?,?)',(photo_id,transport_id,storage_ref,'signed_wz','Podpisane WZ',g.client_user['id'],stamp()))
+        D['sync_local_rows_to_supabase']('delivery_photos','id',[photo_id])
         return jsonify(ok=True)
     except Exception:
         current_app.logger.exception('Nie udało się przesłać zdjęcia dostawy')
