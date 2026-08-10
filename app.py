@@ -52,6 +52,9 @@ except Exception:
         return {"configured": False, "missing": ["ksef_api.py"], "env": "", "base_url": ""}
 
 _EMAIL_IMPORT_ERROR = ""
+# Wersja dla Beton Łagów nie wysyła automatycznych wiadomości do klientów.
+# Adres e-mail pozostaje jedynie polem kontaktowym na dokumencie.
+EMAIL_NOTIFICATIONS_ENABLED = False
 try:
     from email_module import (
         email_config_summary,
@@ -5442,10 +5445,10 @@ def order_view(order_id):
       <div class="card">
         <div class="flex">
           <h1 style="margin:0;">{{ order_display_no(o['id'], o['created_at'], o['order_no'], o['note']) }}</h1>
-          <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
-            <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
+            <a class="btn primary" href="{{ url_for('beton.wz_new', order_id=o['id']) }}">Wystaw WZ</a>
+            {% if false %}
             <form method="post" action="{{ url_for('order_confirmation_resend', order_id=o['id']) }}">
               <button class="btn" type="submit">Wyślij ponownie potwierdzenie</button>
             </form>
@@ -5459,6 +5462,7 @@ def order_view(order_id):
                 <button class="btn" type="submit">ZmieĹ„ status</button>
               </form>
               <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
+            {% endif %}
               {% if locked %}
                 <span class="badge">Wydane z magazynu</span>
               {% endif %}
@@ -6181,14 +6185,14 @@ def order_invoice(order_id):
                       <button class="btn" type="submit">Regeneruj PDF</button>
                     </form>
                     {% if not inv['sent_to_client'] %}
-                      <form method="post" action="{{ url_for('order_invoice_send', order_id=o['id'], invoice_id=inv['id']) }}">
+                      <form method="post" action="{{ url_for('order_invoice_send', order_id=o['id'], invoice_id=inv['id']) }}" style="display:none">
                         <button class="btn primary" type="submit">WyĹ›lij fakturÄ™ klientowi</button>
                       </form>
                     {% else %}
-                      <span class="badge">Widoczna w panelu klienta</span>
+                      <span class="badge" style="display:none">Widoczna w panelu klienta</span>
                     {% endif %}
                     {% if not inv['paid'] %}
-                      <form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv['id']) }}">
+                      <form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv['id']) }}" style="display:none">
                         <input type="hidden" name="next" value="{{ request.full_path }}">
                         <button class="btn" type="submit">Przypomnij o płatności</button>
                       </form>
@@ -6319,135 +6323,6 @@ def order_print(order_id):
     cpdf.save()
     buf.seek(0)
     fname = safe_filename(canonical_order_no(o["id"], o["created_at"], o["order_no"])) + "_druk_zamowienia.pdf"
-    return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=fname)
-
-
-# -------------------------
-# LABEL 30x50 (QR + dane)
-# -------------------------
-
-@app.get("/orders/<int:order_id>/label")
-def order_label(order_id):
-    c = conn()
-    cur = c.cursor()
-    cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
-    o = cur.fetchone()
-    c.close()
-    if not o:
-        abort(404)
-
-    # Etykieta 30x50 ma zawsze uĹĽywaÄ‡ aktualnego QR z poprawnym numerem ZAM-...
-    # i nadpisywaÄ‡ stare QR-y wygenerowane kiedy zamĂłwienie miaĹ‚o jeszcze TEMP.
-    qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
-
-    c = conn()
-    cur = c.cursor()
-    cur.execute("UPDATE orders SET qr_data_url=? WHERE id=?", (qr_data_url, order_id))
-    c.commit()
-    c.close()
-    if supabase_enabled():
-        try:
-            supabase_update_rows("orders", {"qr_data_url": qr_data_url}, {"id": order_id})
-        except Exception:
-            pass
-
-    # PDF 30x50 mm
-    w = 30 * mm
-    h = 50 * mm
-
-    buf = io.BytesIO()
-    cpdf = canvas.Canvas(buf, pagesize=(w, h))
-
-    # Umieszczenie QR
-    qr_bytes = b""
-    if qr_data_url.startswith("data:image"):
-        try:
-            qr_bytes = base64.b64decode(qr_data_url.split(",", 1)[1])
-        except Exception:
-            qr_bytes = b""
-
-    if not qr_bytes:
-        fallback_qr = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
-        if fallback_qr.startswith("data:image"):
-            qr_bytes = base64.b64decode(fallback_qr.split(",", 1)[1])
-
-    qr_buf = io.BytesIO(qr_bytes)
-    qr_img = ImageReader(qr_buf)
-
-    # QR na gĂłrze (wiÄ™kszy), dane poniĹĽej
-    margin = 2 * mm
-    qr_size = 26 * mm  # zostaje margines
-    cpdf.drawImage(qr_img, margin, h - margin - qr_size, width=qr_size, height=qr_size, preserveAspectRatio=True, mask='auto')
-
-    # Dane zamawiajÄ…cego + nr zamĂłwienia
-    pdf_font, pdf_font_bold = get_pdf_font_names()
-    text_y = h - margin - qr_size - 2*mm
-    max_text_width = w - (2 * margin)
-
-    def wrap_pdf_text(value, font_name, font_size, max_width):
-        words = str(value or "").split()
-        if not words:
-            return []
-        lines = []
-        current = words[0]
-        for word in words[1:]:
-            test = current + " " + word
-            if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
-                current = test
-            else:
-                lines.append(current)
-                current = word
-        lines.append(current)
-        return lines
-
-    customer_lines = wrap_pdf_text((o["customer_name"] or "")[:60], pdf_font_bold, 6.2, max_text_width)
-    if not customer_lines:
-        customer_lines = [""]
-
-    cpdf.setFont(pdf_font_bold, 6.2)
-    cpdf.drawString(margin, text_y, customer_lines[0][:60])
-
-    order_no_value = order_display_no(o['id'], o['created_at'], o['order_no'], o['note'])
-    order_no_lines = [f"Nr: {order_no_value}"]
-
-    if pdfmetrics.stringWidth(order_no_lines[0], pdf_font_bold, 5.1) > max_text_width:
-        order_no_lines = [f"Nr: {order_no_value[:13]}", order_no_value[13:]]
-
-    cpdf.setFont(pdf_font_bold, 5.1)
-    cpdf.drawString(margin, text_y - 3.2*mm, order_no_lines[0])
-    extra_offset_mm = 0
-    if len(order_no_lines) > 1 and order_no_lines[1].strip():
-        cpdf.drawString(margin, text_y - 6.0*mm, order_no_lines[1].strip())
-        extra_offset_mm = 2.8
-
-    cpdf.setFont(pdf_font, 6.0)
-    addr = (o["customer_address"] or "").strip()
-    phone = (o["customer_phone"] or "").strip()
-
-    lines = []
-    if addr:
-        # podziel na linie i dodatkowo Ĺ‚am dĹ‚ugie
-        for ln in addr.splitlines():
-            ln = ln.strip()
-            if not ln:
-                continue
-            while len(ln) > 42:
-                lines.append(ln[:42])
-                ln = ln[42:]
-            lines.append(ln)
-    if phone:
-        lines.append(f"Tel: {phone}")
-
-    y = text_y - (6.8 + extra_offset_mm)*mm
-    for ln in lines[:6]:
-        cpdf.drawString(margin, y, ln)
-        y -= 3.2*mm
-
-    cpdf.showPage()
-    cpdf.save()
-    buf.seek(0)
-
-    fname = safe_filename(canonical_order_no(o["id"], o["created_at"], o["order_no"])) + "_label_30x50.pdf"
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=fname)
 
 
@@ -6661,6 +6536,8 @@ def _record_email_event(event_key, event_type, ref_id, recipient, result):
 
 def _send_saved_order_confirmation(order_id: int, force: bool = False) -> dict:
     """Send a confirmation using the order saved by the warehouse backend."""
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        return {"ok": True, "skipped": True, "reason": "email_notifications_disabled"}
     c = conn()
     try:
         cur = c.cursor()
@@ -8182,6 +8059,8 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
 @app.post("/invoices/<int:invoice_id>/payment-reminder")
 def invoice_payment_reminder_admin(invoice_id):
     _set_invoice_payment_state(invoice_id, reminder=1, paid=0)
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        return _redirect_after_invoice_action()
     try:
         if send_payment_reminder:
             invoice_row, pdf_url = _invoice_email_context(invoice_id)
@@ -8517,6 +8396,8 @@ def _invoice_email_context(invoice_id: int):
 
 
 def _send_invoice_to_client(invoice_id: int) -> int:
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        return 0
     c = conn()
     cur = c.cursor()
     cur.execute("""
