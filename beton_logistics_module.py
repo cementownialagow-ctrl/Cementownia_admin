@@ -209,6 +209,12 @@ def driver_login_api():
 
 @bp.get('/wz')
 def wz_list():
+    # Render nie zachowuje lokalnej SQLite po wdrożeniu. Dokumenty i zdjęcia
+    # muszą być odświeżone z centralnego Supabase przed pokazaniem listy.
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        current_app.logger.exception('Nie udało się odświeżyć dokumentów WZ z Supabase')
     with D['conn']() as c:
         rows=c.execute('''SELECT w.*,o.customer_name,i.invoice_no,
           (SELECT t.transport_no FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL ORDER BY t.id DESC LIMIT 1) transport_no
@@ -249,6 +255,11 @@ def wz_new():
 
 @bp.get('/wz/<int:wz_id>')
 def wz_view(wz_id):
+    # W szczególności pobierz metadane zdjęć przesłanych z panelu kierowcy.
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        current_app.logger.exception('Nie udało się odświeżyć WZ z Supabase')
     with D['conn']() as c:
         w=c.execute('''SELECT w.*,o.customer_name,o.order_no,o.customer_address,o.note AS order_delivery_address,
             COALESCE(NULLIF(w.destination,''), o.customer_address) AS destination,
