@@ -1130,14 +1130,24 @@ def supabase_request(path: str, method: str = "GET", params: dict | None = None,
     if prefer:
         req.add_header("Prefer", prefer)
 
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        if not raw:
-            return None
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        if "application/json" in ctype or raw[:1] in (b"[", b"{"):
-            return json.loads(raw.decode("utf-8"))
-        return raw.decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            if not raw:
+                return None
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "application/json" in ctype or raw[:1] in (b"[", b"{"):
+                return json.loads(raw.decode("utf-8"))
+            return raw.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        # Nie chowaj użytecznej odpowiedzi Supabase za samym kodem HTTP 422.
+        raw = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            body = json.loads(raw)
+            raw = str(body.get("msg") or body.get("message") or body.get("error") or raw)
+        except Exception:
+            pass
+        raise RuntimeError(f"Supabase HTTP {exc.code}: {raw or 'brak szczegółów'}") from exc
 
 
 def supabase_storage_ref(object_path: str, bucket: str | None = None) -> str:
