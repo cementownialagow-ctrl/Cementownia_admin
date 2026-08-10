@@ -2673,7 +2673,7 @@ def prepare_invoice_edit_items(edit_items: list[dict], form):
 # =========================
 
 CLIENT_API_PATHS = {
-    "/api/client_stock_catalog", "/api/client_search_log", "/api/client/orders",
+    "/api/client_search_log", "/api/client/orders",
     "/api/order_lookup", "/api/client_invoices", "/api/client_order_email",
 }
 _rate_lock = threading.Lock()
@@ -2815,7 +2815,7 @@ def login():
         else:
             error = "Nieprawidłowy login lub hasło."
         c.close()
-    return render_template_string(r'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Logowanie — Beton Łagów</title><style>body{margin:0;font-family:Inter,Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,calc(100% - 28px));background:#fff;padding:30px;border-radius:24px;box-shadow:0 18px 55px rgba(20,35,65,.13)}h1{margin:0 0 5px}.muted{color:#718096;font-size:13px;margin-bottom:22px}label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dfe3ec;border-radius:13px;font:inherit}button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:13px;background:#5577ee;color:#fff;font-weight:700}.error{background:#fff1f2;color:#b9384c;padding:10px;border-radius:12px;font-size:12px}</style></head><body><form class="box" method="post"><h1>Panel magazynu</h1><div class="muted">Zaloguj się jako administrator.</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<label>Login</label><input name="username" autocomplete="username" required><label>Hasło</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Zaloguj</button></form></body></html>''', error=error)
+    return render_template_string(r'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Logowanie — Beton Łagów</title><style>body{margin:0;font-family:Inter,Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,calc(100% - 28px));background:#fff;padding:30px;border-radius:24px;box-shadow:0 18px 55px rgba(20,35,65,.13)}.logo{display:block;max-width:210px;max-height:74px;object-fit:contain;margin:0 0 15px}.muted{color:#718096;font-size:13px;margin-bottom:22px}label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dfe3ec;border-radius:13px;font:inherit}button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:13px;background:#5577ee;color:#fff;font-weight:700}.error{background:#fff1f2;color:#b9384c;padding:10px;border-radius:12px;font-size:12px}</style></head><body><form class="box" method="post"><img class="logo" src="{{ url_for('static',filename='logo.png') }}" alt="Beton Łagów"><div class="muted">Zaloguj się jako administrator.</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<label>Login</label><input name="username" autocomplete="username" required><label>Hasło</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Zaloguj</button></form></body></html>''', error=error)
 
 
 @app.get("/logout")
@@ -2851,7 +2851,7 @@ BASE = r"""
     :root{--navy:#12213d;--navy2:#0b1730;--blue:#5577ee;--blue2:#3f63dc;--mint:#31b98b;--amber:#f5a524;--red:#e05263;--ink:#17233c;--muted:#718096;--bg:#f5f6fa;--line:#e7eaf2;--card:#fff;--radius:22px;--shadow:0 12px 35px rgba(31,45,78,.07)}
     *{box-sizing:border-box}html{background:var(--bg)}body{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:radial-gradient(circle at 85% -10%,#eaf0ff 0,transparent 28%),var(--bg);color:var(--ink);line-height:1.45}
     .top{position:fixed;inset:10px auto 10px 10px;width:238px;background:linear-gradient(165deg,var(--navy),var(--navy2));color:#fff;padding:22px 14px;border-radius:26px;display:flex;flex-direction:column;z-index:1100;box-shadow:0 24px 50px rgba(10,24,54,.22);overflow-y:auto}
-    .brand{font-size:19px;font-weight:800;letter-spacing:-.3px;padding:4px 10px 20px;display:flex;align-items:center;gap:10px}.brand:before{content:"◇";display:grid;place-items:center;width:36px;height:36px;border:1px solid rgba(255,255,255,.32);border-radius:12px;background:rgba(255,255,255,.08);font-size:20px}
+    .brand{padding:4px 10px 20px}.brand img{display:block;width:100%;max-width:185px;max-height:72px;object-fit:contain;object-position:left center}
     .nav{display:flex!important;flex-direction:column;align-items:stretch!important;gap:5px!important;flex-wrap:nowrap!important;width:100%}.nav a,.nav-drop-btn{display:flex;align-items:center;color:#dce5f7;text-decoration:none;padding:11px 12px;border:0;border-radius:13px;background:transparent;font:inherit;font-size:14px;font-weight:600;cursor:pointer;transition:.18s ease}.nav a:hover,.nav-drop-btn:hover,.nav a.active{background:rgba(93,128,246,.24);color:#fff;transform:translateX(2px)}
     .nav a:before{width:25px;font-size:16px;opacity:.9}.nav a:nth-child(1):before{content:"⌂"}.nav a:nth-child(2):before{content:"▣"}.nav a:nth-child(3):before{content:"＋"}.nav a:nth-child(4):before{content:"▤"}.nav a:nth-child(5):before{content:"K"}.nav a:nth-child(6):before{content:"⌕"}.nav a:nth-child(7):before{content:"▦"}.nav a:nth-child(8):before{content:"◇"}.nav a:nth-child(9):before{content:"▧"}
     .nav-dropdown{position:relative;display:block}.nav-drop-btn{width:100%;text-align:left}.nav-drop-btn:before{content:"⚙";width:25px}.nav-dropdown-menu{display:none;margin:4px 0 2px 12px;border-left:1px solid rgba(255,255,255,.16);padding:2px 0 2px 8px}.nav-dropdown:hover .nav-dropdown-menu,.nav-dropdown:focus-within .nav-dropdown-menu{display:grid;gap:2px}.nav-dropdown-menu a{font-size:13px;padding:8px 10px}.nav-dropdown-menu a:before{display:none}
@@ -2871,7 +2871,7 @@ BASE = r"""
 <body>
   <button class="mobile-toggle" type="button" onclick="document.querySelector('.top').classList.toggle('open')">☰</button>
   <div class="top">
-    <div class="brand">Beton Łagów</div>
+    <div class="brand"><img src="{{ url_for('static',filename='logo.png') }}" alt="Beton Łagów"></div>
     <div class="nav flex">
       <a class="{% if request.endpoint == 'home' %}active{% endif %}" href="{{ url_for('home') }}">Pulpit</a>
       <a class="{% if request.endpoint in ['orders','order_view'] %}active{% endif %}" href="{{ url_for('orders') }}">Zamówienia</a>
@@ -3094,52 +3094,10 @@ def home():
     maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT COUNT(*) AS n FROM products")
-    n_products = cur.fetchone()["n"]
     cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','confirmed','in_delivery')")
     n_orders_current = cur.fetchone()["n"]
-    cur.execute("SELECT COUNT(*) AS n FROM material_orders WHERE status IN ('planned','ordered','shipped')")
-    n_material_order_active = cur.fetchone()["n"]
-    cur.execute("SELECT COALESCE(SUM(qty),0) AS n FROM stock")
-    n_stock_qty = cur.fetchone()["n"]
-    cur.execute("""
-      SELECT COALESCE(SUM(ci.qty),0) AS n
-      FROM material_order_items ci
-      JOIN material_orders cp ON cp.id=ci.package_id
-      WHERE cp.status IN ('planned', 'ordered', 'shipped')
-    """)
-    n_in_delivery_qty = cur.fetchone()["n"]
-
-    cur.execute("""
-      SELECT COALESCE(SUM(
-        (COALESCE(s.qty,0) + COALESCE(d.in_delivery_qty,0)) * COALESCE(pr.net_price,0)
-      ), 0) AS v
-      FROM products p
-      LEFT JOIN stock s ON s.product_id=p.id
-      LEFT JOIN (
-        SELECT ci.product_id, SUM(ci.qty) AS in_delivery_qty
-        FROM material_order_items ci
-        JOIN material_orders cp ON cp.id=ci.package_id
-        WHERE cp.status IN ('planned', 'ordered', 'shipped')
-        GROUP BY ci.product_id
-      ) d ON d.product_id=p.id
-      LEFT JOIN pricing pr ON (
-        TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
-        OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku))
-      )
-    """)
-    inventory_value_net = float(cur.fetchone()["v"] or 0)
     cur.execute("SELECT COUNT(*) AS n FROM orders WHERE date(created_at)=date('now','localtime')")
     n_orders_today = int(cur.fetchone()["n"] or 0)
-    cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status='issued' AND date(created_at)=date('now','localtime')")
-    n_issued_today = int(cur.fetchone()["n"] or 0)
-    cur.execute("""
-      SELECT p.id, p.sku, COALESCE(p.model,p.name,p.sku) AS label, COALESCE(s.qty,0) AS qty
-      FROM products p LEFT JOIN stock s ON s.product_id=p.id
-      WHERE COALESCE(s.qty,0) <= 10
-      ORDER BY COALESCE(s.qty,0), p.sku LIMIT 5
-    """)
-    low_stock_rows = [dict(r) for r in cur.fetchall()]
     cur.execute("""
       SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,
              COALESCE(SUM(oi.qty * COALESCE(pr.net_price,0)),0) AS total_net
@@ -3168,16 +3126,14 @@ def home():
       </style>
 
       <div class="dashboard-head">
-        <div><h1>Pulpit</h1><div class="muted">Dzień dobry — oto dzisiejszy obraz magazynu.</div></div>
+        <div><h1>Pulpit</h1><div class="muted">Dzisiejszy obraz realizacji zamówień i dostaw.</div></div>
         <form class="search-shell" action="{{ url_for('orders') }}"><input name="q" placeholder="Szukaj zamówień, produktów, klientów..."></form>
         <a class="btn primary" href="{{ url_for('order_new') }}">＋ Nowe zamówienie</a>
       </div>
 
       <div class="metrics">
         <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
-        <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>Wydane dzisiaj</span><b>{{ n_issued_today }}</b><small>{{ n_stock_qty }} szt. na stanie</small></div></div>
-        <div class="metric" style="--soft:#fff6e6;--tone:#db8a13"><div class="icon">△</div><div><span>Niski stan</span><b>{{ low_stock_rows|length }}</b><small>Wymaga uwagi</small></div></div>
-        <div class="metric" style="--soft:#edf3ff;--tone:#5577ee"><div class="icon">▤</div><div><span>Wartość magazynu</span><b>{{ "{:,.0f}".format(inventory_value_net).replace(',', ' ') }} zł</b><small>Netto z towarem w drodze</small></div></div>
+        <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>W realizacji</span><b>{{ n_orders_current }}</b><small>zamówienia wymagające obsługi</small></div></div>
       </div>
 
       <div class="dash-grid">
@@ -3189,10 +3145,6 @@ def home():
           </tbody></table>
         </div>
         <div class="side-stack">
-          <div class="card"><div class="panel-title"><span style="color:#e69a20">△</span><h2>Niski stan</h2><a class="btn" href="{{ url_for('stock') }}">Wszystkie</a></div><div class="stock-list">
-            {% for p in low_stock_rows %}<div class="stock-item"><div class="stock-icon">◇</div><div><div class="stock-name">{{ p.label }}</div><div class="stock-sku">SKU: {{ p.sku }}</div></div><div class="stock-qty">{{ p.qty }} szt.</div></div>{% endfor %}
-            {% if not low_stock_rows %}<div class="muted">Wszystkie stany są bezpieczne.</div>{% endif %}
-          </div></div>
           <div class="card"><div class="panel-title"><h2>Status zamówień</h2></div><div class="donut-wrap"><div class="donut" style="--p1:{{ status_new*100/status_divisor }};--p2:{{ status_work*100/status_divisor }};--p3:{{ status_done*100/status_divisor }}"><div class="donut-label"><b>{{ status_total }}</b>łącznie</div></div><div class="legend">
             <div class="legend-row"><i class="legend-dot" style="background:#5577ee"></i><span>Nowe</span><b>{{ status_new }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#65a7ec"></i><span>W realizacji</span><b>{{ status_work }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#31b98b"></i><span>Zrealizowane</span><b>{{ status_done }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#e05263"></i><span>Anulowane</span><b>{{ status_cancelled }}</b></div>
           </div></div></div>
@@ -3205,10 +3157,7 @@ def home():
     {% endblock %}
     """
     return render_template_string(tpl, title="Start", base_url=BASE_URL, db_path=DB_PATH,
-                                  n_products=n_products, n_orders_current=n_orders_current, n_material_order_active=n_material_order_active,
-                                  n_stock_qty=n_stock_qty, n_in_delivery_qty=n_in_delivery_qty,
-                                  inventory_value_net=inventory_value_net, n_orders_today=n_orders_today,
-                                  n_issued_today=n_issued_today, low_stock_rows=low_stock_rows,
+                                  n_orders_current=n_orders_current, n_orders_today=n_orders_today,
                                   recent_orders=recent_orders, status_new=status_new, status_work=status_work,
                                   status_done=status_done, status_cancelled=status_cancelled, status_total=status_total,
                                   status_divisor=status_divisor)
@@ -4534,7 +4483,6 @@ def products_import():
 # STOCK
 # -------------------------
 
-@app.get("/stock")
 def stock():
     maybe_pull_shared_from_supabase()
     q = norm(request.args.get("q"))
@@ -4699,7 +4647,6 @@ async function applyDelta(){
     """
     return render_template_string(tpl, title="Magazyn", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q)
 
-@app.post("/api/stock_delta")
 def api_stock_delta():
     data = request.get_json(force=True, silent=True) or {}
     sku = norm(data.get("sku"))
@@ -6368,7 +6315,6 @@ def order_label(order_id):
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=fname)
 
 
-@app.get("/api/client_stock_catalog")
 def api_client_stock_catalog():
     maybe_pull_shared_from_supabase()
 
@@ -9282,3 +9228,4 @@ def material_order_item_delete(package_id, item_id):
 # =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=os.environ.get("FLASK_DEBUG") == "1")
+
