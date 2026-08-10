@@ -1036,6 +1036,11 @@ _supabase_sync_state = {
 def supabase_enabled() -> bool:
     return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
+
+def cloud_row_id() -> int:
+    """Return a bigint ID for Supabase tables without an identity generator."""
+    return int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
+
 def _chunks(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
@@ -1600,7 +1605,9 @@ def remote_first_create_customer(name: str, address: str, phone: str, email: str
 
 def remote_first_create_order(customer_id, customer_name, customer_address, customer_phone, customer_email, note, items, idempotency_key=None):
     created_at = now_iso()
+    order_id = cloud_row_id()
     order_payload = {
+        "id": order_id,
         "order_no": "TEMP",
         "customer_id": customer_id if customer_id else None,
         "customer_name": customer_name,
@@ -1615,10 +1622,9 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
     if idempotency_key:
         order_payload["idempotency_key"] = idempotency_key
     created_order = supabase_insert_row("orders", order_payload)
-    if not created_order or "id" not in created_order:
+    if not created_order:
         raise RuntimeError("Supabase nie zwrĂłciĹ‚ ID dla zamĂłwienia")
 
-    order_id = int(created_order["id"])
     order_no = make_order_no(order_id, created_at)
     qr_data_url = ""
     supabase_update_rows("orders", {"order_no": order_no, "qr_data_url": qr_data_url}, {"id": order_id})
@@ -1636,18 +1642,20 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
             p = cur.fetchone()
             if not p:
                 raise ValueError(f"Nie istnieje produkt ID {pid}")
+            item_id = cloud_row_id()
             created_item = supabase_insert_row("order_items", {
+                "id": item_id,
                 "order_id": order_id,
                 "product_id": pid,
                 "sku": p["sku"],
                 "qty": qty,
                 "created_at": now_iso(),
             })
-            if not created_item or "id" not in created_item:
+            if not created_item:
                 raise RuntimeError("Supabase nie zwrócił ID dla pozycji zamówienia")
             cur.execute(
                 "INSERT INTO order_items(id, order_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku, qty=excluded.qty, created_at=excluded.created_at",
-                (int(created_item["id"]), order_id, pid, p["sku"], qty, created_item.get("created_at") or now_iso())
+                (int(created_item.get("id") or item_id), order_id, pid, p["sku"], qty, created_item.get("created_at") or now_iso())
             )
         c.commit()
     except Exception:
@@ -5258,7 +5266,7 @@ def order_create():
             # W istniejącej tabeli Supabase kolumna products.id nie zawsze ma
             # generator ID. Nadajemy więc wspólny, niekolidujący identyfikator
             # zamiast oczekiwać, że Supabase sam go utworzy.
-            pid = int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
+            pid = cloud_row_id()
             c = conn()
             try:
                 cur = c.cursor()
