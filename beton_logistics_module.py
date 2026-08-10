@@ -1,5 +1,6 @@
 import re
 import os
+import secrets
 import time
 import unicodedata
 
@@ -100,6 +101,7 @@ def register_beton_logistics(app,deps):
 
 def stamp(): return D['now_iso']()
 def actor(): return session.get('display_name') or session.get('username') or 'kierowca'
+def cloud_id(): return int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
 def next_no(c):
     year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM transports WHERE transport_no LIKE ?",(f'TR/{year}/%',)).fetchone()[0]+1
     return f'TR/{year}/{n:05d}'
@@ -169,6 +171,11 @@ def driver_login_api():
     data=request.get_json(silent=True) or {}
     username=(data.get('username') or '').strip()
     password=data.get('password') or ''
+    if not username or not password:
+        return jsonify(ok=False,code='DRIVER-INPUT',error='Wpisz login i hasło.'),400
+    if not D['supabase_enabled']():
+        current_app.logger.error('Logowanie kierowcy: brak konfiguracji Supabase na Render.')
+        return jsonify(ok=False,code='DRIVER-CONFIG',error='Panel kierowcy nie jest jeszcze połączony z Supabase. Administrator: sprawdź SUPABASE_URL i SUPABASE_SERVICE_ROLE_KEY na Render.'),503
     try:
         email=driver_auth_email(username)
         auth=D['supabase_request'](
@@ -184,8 +191,19 @@ def driver_login_api():
         if not access_token:
             raise ValueError('Nieprawidłowy login lub hasło.')
         return jsonify(ok=True,access_token=access_token,expires_in=auth.get('expires_in') or 3600)
-    except Exception:
-        return jsonify(ok=False,error='Nieprawidłowy login lub hasło.'),401
+    except ValueError:
+        return jsonify(ok=False,code='DRIVER-CREDENTIALS',error='Nieprawidłowy login lub hasło. Sprawdź też, czy konto kierowcy ma ustawione hasło w panelu administratora.'),401
+    except RuntimeError as exc:
+        # Nie przekazujemy odpowiedzi Supabase ani żadnych sekretów do telefonu,
+        # ale operator dostaje rozróżnialny komunikat i kod do zgłoszenia.
+        current_app.logger.warning('Logowanie kierowcy %s nie powiodło się: %s', username, exc)
+        reason=str(exc)
+        if 'Invalid login credentials' in reason or 'invalid login credentials' in reason:
+            return jsonify(ok=False,code='DRIVER-CREDENTIALS',error='Nieprawidłowy login lub hasło. Sprawdź też, czy konto kierowcy ma ustawione hasło w panelu administratora.'),401
+        return jsonify(ok=False,code='DRIVER-AUTH',error='Nie można zweryfikować konta kierowcy w Supabase. Administrator: sprawdź logi Render oraz zmienne SUPABASE_URL, SUPABASE_ANON_KEY i SUPABASE_SERVICE_ROLE_KEY.'),502
+    except Exception as exc:
+        current_app.logger.exception('Nieoczekiwany błąd logowania kierowcy %s: %s', username, exc)
+        return jsonify(ok=False,code='DRIVER-ERROR',error='Wewnętrzny błąd logowania. Administrator: sprawdź logi Render (kod DRIVER-ERROR).'),500
 
 @bp.get('/wz')
 def wz_list():
@@ -254,6 +272,12 @@ def wz_ready(wz_id):
 
 @bp.get('/drivers')
 def drivers():
+    # Render does not retain SQLite after a deploy. Restore the operational
+    # lists from Supabase before this page is rendered.
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        pass
     with D['conn']() as c:
         ds=c.execute('''SELECT d.*,a.username,a.auth_user_id FROM drivers d LEFT JOIN driver_accounts a ON a.driver_id=d.id WHERE d.deleted_at IS NULL ORDER BY d.active DESC,d.name''').fetchall()
         vs=c.execute('SELECT v.*,d.name driver_name FROM vehicles v LEFT JOIN drivers d ON d.id=v.driver_id WHERE v.deleted_at IS NULL ORDER BY v.active DESC,v.registration_no').fetchall()
@@ -276,11 +300,14 @@ def driver_add():
     try:
         username=request.form.get('username','').strip()
         password=request.form.get('password','')
+        driver_id=cloud_id()
+        driver_row={'id':driver_id,'name':request.form['name'].strip(),'phone':request.form.get('phone','').strip(),'email':driver_auth_email(username),'active':1,'created_at':s,'updated_at':s,'deleted_at':None}
+        # Supabase first: a driver is never reported as saved if the central
+        # record failed. This protects against data disappearing on redeploy.
+        save_row_to_supabase('drivers', driver_row)
         with D['conn']() as c:
-            cur=c.execute('INSERT INTO drivers(name,phone,email,created_at,updated_at) VALUES(?,?,?,?,?)',(request.form['name'].strip(),request.form.get('phone','').strip(),driver_auth_email(username),s,s))
-            driver_id=cur.lastrowid
+            c.execute('INSERT INTO drivers(id,name,phone,email,active,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?)',(driver_id,driver_row['name'],driver_row['phone'],driver_row['email'],1,s,s,None))
             driver=c.execute('SELECT * FROM drivers WHERE id=?',(driver_id,)).fetchone()
-        save_row_to_supabase('drivers', driver)
         provision_driver_account(driver_id,username,password)
         with D['conn']() as c:
             account=c.execute('SELECT * FROM driver_accounts WHERE driver_id=?',(driver_id,)).fetchone()
@@ -302,10 +329,12 @@ def driver_password(driver_id):
 def vehicle_add():
     s=stamp()
     try:
+        vehicle_id=cloud_id()
+        vehicle_row={'id':vehicle_id,'name':request.form.get('name',''),'brand':request.form.get('brand',''),'model':request.form.get('model',''),'registration_no':request.form['registration_no'].strip().upper(),'trailer_no':request.form.get('trailer_no','').strip().upper(),'year':request.form.get('year') or None,'vin':request.form.get('vin',''),'current_mileage':request.form.get('current_mileage') or 0,'driver_id':request.form.get('driver_id') or None,'active':1,'created_at':s,'updated_at':s,'deleted_at':None}
+        # As above, do not leave a successful-looking local-only vehicle.
+        save_row_to_supabase('vehicles', vehicle_row)
         with D['conn']() as c:
-            cur=c.execute('INSERT INTO vehicles(name,brand,model,registration_no,trailer_no,year,vin,current_mileage,driver_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(request.form.get('name',''),request.form.get('brand',''),request.form.get('model',''),request.form['registration_no'].strip().upper(),request.form.get('trailer_no','').strip().upper(),request.form.get('year') or None,request.form.get('vin',''),request.form.get('current_mileage') or 0,request.form.get('driver_id') or None,s,s))
-            vehicle=c.execute('SELECT * FROM vehicles WHERE id=?',(cur.lastrowid,)).fetchone()
-        save_row_to_supabase('vehicles', vehicle)
+            c.execute('INSERT INTO vehicles(id,name,brand,model,registration_no,trailer_no,year,vin,current_mileage,driver_id,active,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(vehicle_id,vehicle_row['name'],vehicle_row['brand'],vehicle_row['model'],vehicle_row['registration_no'],vehicle_row['trailer_no'],vehicle_row['year'],vehicle_row['vin'],vehicle_row['current_mileage'],vehicle_row['driver_id'],1,s,s,None))
         return redirect(url_for('beton.drivers',ok='Pojazd został zapisany w Supabase.'))
     except Exception as exc:
         return redirect(url_for('beton.drivers',error=str(exc)))
