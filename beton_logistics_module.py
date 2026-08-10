@@ -224,7 +224,7 @@ def wz_new():
         if request.method=='POST':
             if not order:abort(400)
             s=stamp(); wz_id=cloud_id(); cur=c.execute('''INSERT INTO wz_documents(id,wz_no,order_id,issue_location,warehouse_location,destination,status,created_by,created_at,notes)
-              VALUES(?,?,?,?,?,?,'created',?,?,?)''',(wz_id,next_wz_no(c),order_id,request.form.get('issue_location','Miejscowość X').strip(),request.form.get('warehouse_location','Miejscowość Y').strip(),request.form.get('destination','').strip() or (order['customer_address'] or '').strip(),actor(),s,request.form.get('notes','').strip()))
+              VALUES(?,?,?,?,?,?,'created',?,?,?)''',(wz_id,next_wz_no(c),order_id,request.form.get('issue_location','Miejscowość X').strip(),request.form.get('warehouse_location','Miejscowość Y').strip(),request.form.get('destination','').strip() or (order['note'] or '').strip() or (order['customer_address'] or '').strip(),actor(),s,request.form.get('notes','').strip()))
             count=0
             for item in items:
                 qty=float(request.form.get(f'qty_{item["id"]}') or 0)
@@ -248,19 +248,19 @@ def wz_new():
 @bp.get('/wz/<int:wz_id>')
 def wz_view(wz_id):
     with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.customer_name,o.order_no,o.customer_address,
+        w=c.execute('''SELECT w.*,o.customer_name,o.order_no,o.customer_address,o.note AS order_delivery_address,
             COALESCE(NULLIF(w.destination,''), o.customer_address) AS destination,
             i.invoice_no FROM wz_documents w JOIN orders o ON o.id=w.order_id
             LEFT JOIN invoices i ON i.id=w.invoice_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
         if not w:abort(404)
         w=dict(w)
-        w['destination']=(w.get('destination') or w.get('customer_address') or '').strip()
+        w['destination']=(w.get('destination') or w.get('order_delivery_address') or w.get('customer_address') or '').strip()
         items=c.execute('''SELECT wi.*, COALESCE(p.name, wi.sku) AS sku
             FROM wz_items wi LEFT JOIN products p ON p.id=wi.product_id
             WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()
         transport=c.execute('SELECT * FROM transports WHERE wz_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1',(wz_id,)).fetchone()
     return render_template_string('''{% extends "base.html" %}{% block content %}
-      <div class="flex"><h1>{{w.wz_no}}</h1><span class="badge">{{w.status}}</span><a class="btn right" target="_blank" href="{{url_for('beton.wz_print',wz_id=w.id)}}">Drukuj WZ</a></div>
+      <div class="flex"><h1>{{w.wz_no}}</h1><span class="badge">{{w.status}}</span><a class="btn right" target="_blank" href="{{url_for('beton.wz_print',wz_id=w.id)}}">Drukuj WZ</a><form method="post" action="{{url_for('beton.wz_delete',wz_id=w.id)}}" onsubmit="return confirm('Usunąć WZ {{w.wz_no}}? Dokument i przypisany transport znikną z bieżącej listy.');"><button class="btn danger" type="submit">Usuń WZ</button></form></div>
       <div class="card">
         <div class="grid3">
           <div><span class="muted">Zamawiający</span><br><b>{{w.customer_name}}</b></div>
@@ -276,15 +276,41 @@ def wz_view(wz_id):
       <div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>
     {% endblock %}''',w=w,items=items,transport=transport,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
+
+@bp.post('/wz/<int:wz_id>/delete')
+def wz_delete(wz_id):
+    """Soft-delete WZ and any linked transport; invoices must be removed first."""
+    s = stamp()
+    with D['conn']() as c:
+        wz = c.execute('SELECT * FROM wz_documents WHERE id=? AND deleted_at IS NULL', (wz_id,)).fetchone()
+        if not wz:
+            abort(404)
+        if wz['invoice_id']:
+            return 'Najpierw usuń powiązaną fakturę VAT, a następnie WZ.', 409
+        transport_ids = [int(row['id']) for row in c.execute(
+            'SELECT id FROM transports WHERE wz_id=? AND deleted_at IS NULL', (wz_id,)
+        ).fetchall()]
+        c.execute('''UPDATE transports SET deleted_at=?, updated_at=?, updated_by=?
+                     WHERE wz_id=? AND deleted_at IS NULL''', (s, s, actor(), wz_id))
+        c.execute('UPDATE wz_documents SET deleted_at=? WHERE id=?', (s, wz_id))
+        c.execute('''INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at)
+                     VALUES(?,?,?,?,?,?)''', (actor(), 'delete', 'wz_document', wz_id, '{"mode":"soft_delete"}', s))
+        c.commit()
+    # Synchronizacja od razu, aby kierowca nie widział anulowanego kursu.
+    D['sync_local_rows_to_supabase']('wz_documents', 'id', [wz_id])
+    if transport_ids:
+        D['sync_local_rows_to_supabase']('transports', 'id', transport_ids)
+    return redirect(url_for('beton.wz_list'))
+
 @bp.get('/wz/<int:wz_id>/print')
 def wz_print(wz_id):
     with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.customer_name,o.customer_address,
+        w=c.execute('''SELECT w.*,o.customer_name,o.customer_address,o.note AS order_delivery_address,
             COALESCE(NULLIF(w.destination,''), o.customer_address) AS destination
             FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
         if not w:abort(404)
         w=dict(w)
-        w['destination']=(w.get('destination') or w.get('customer_address') or '').strip()
+        w['destination']=(w.get('destination') or w.get('order_delivery_address') or w.get('customer_address') or '').strip()
         items=c.execute('''SELECT COALESCE(p.name, wi.sku) AS sku, wi.qty_planned, wi.qty_issued
             FROM wz_items wi LEFT JOIN products p ON p.id=wi.product_id
             WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()
@@ -422,12 +448,16 @@ def transport_new():
     with D['conn']() as c:
         wz_rows=c.execute("""SELECT w.id,w.wz_no,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.status='issued' AND w.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL) ORDER BY w.id DESC""").fetchall()
         ds=c.execute('SELECT * FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name').fetchall(); vs=c.execute('SELECT * FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no').fetchall()
-        wz=c.execute("SELECT w.*,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status='issued'",(wz_id,)).fetchone() if wz_id else None
+        wz=c.execute("SELECT w.*,o.customer_name,o.note AS order_delivery_address,o.customer_address FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status='issued'",(wz_id,)).fetchone() if wz_id else None
         wz_items=c.execute('SELECT * FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall() if wz else []
+        if wz:
+            wz=dict(wz)
+            wz['destination']=(wz.get('destination') or wz.get('order_delivery_address') or wz.get('customer_address') or '').strip()
         if request.method=='POST':
             if not wz:abort(400)
             if not ds or not vs:raise ValueError('Najpierw dodaj kierowcę i pojazd')
-            s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],request.form.get('destination','') or wz['destination'],actor(),actor(),s,s));
+            destination=request.form.get('destination','').strip() or (wz['destination'] or '').strip() or (wz['order_delivery_address'] or '').strip() or (wz['customer_address'] or '').strip()
+            s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],destination,actor(),actor(),s,s));
             for item in wz_items:c.execute('INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)',(cloud_id(),tid,item['id'],item['qty_issued'] or item['qty_planned'],s))
             c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'create','transport',tid,'{}',s))
             c.commit()
@@ -470,12 +500,16 @@ def driver_transports_api():
         return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
     with D['conn']() as c:
         rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no,
+          COALESCE(NULLIF(t.destination,''),NULLIF(w.destination,''),NULLIF(o.note,''),o.customer_address) AS delivery_address,
           (SELECT a.status FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) plant_status,
+          (SELECT a.planned_date FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) planned_date,
+          (SELECT a.time_from FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) planned_departure_time,
+          (SELECT a.time_to FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) planned_delivery_time,
           (SELECT b.code FROM dispatch_appointments a LEFT JOIN loading_bays b ON b.id=a.loading_bay_id WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) loading_bay
           FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE t.driver_id=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(driver_id,)).fetchall()
         result=[]
         for r in rows:
-            x=dict(r); x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
+            x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
                 FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
                 LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(r['id'],))]; result.append(x)
     return jsonify(ok=True,transports=result)
