@@ -947,6 +947,7 @@ SUPABASE_SYNC_TABLES = [
     ("invoice_allocations", "id"),
     ("ksef_documents", "invoice_id"),
     ("drivers", "id"),
+    ("driver_accounts", "driver_id"),
     ("vehicles", "id"),
     ("wz_documents", "id"),
     ("wz_items", "id"),
@@ -968,6 +969,8 @@ SUPABASE_PULL_TABLES = [
     ("pricing", "model"),
     ("customers", "id"),
     ("products", "id"),
+    ("drivers", "id"),
+    ("driver_accounts", "driver_id"),
     ("orders", "id"),
     ("material_orders", "id"),
     ("order_items", "id"),
@@ -976,7 +979,6 @@ SUPABASE_PULL_TABLES = [
     ("invoice_meta", "invoice_id"),
     ("invoice_allocations", "id"),
     ("ksef_documents", "invoice_id"),
-    ("drivers", "id"),
     ("vehicles", "id"),
     ("wz_documents", "id"),
     ("wz_items", "id"),
@@ -3686,6 +3688,8 @@ register_cash_flow(app, {
 register_beton_logistics(app, {
     "conn": conn,
     "now_iso": now_iso,
+    "supabase_enabled": supabase_enabled,
+    "supabase_request": supabase_request,
     "BASE_URL": BASE_URL,
     "DB_PATH": DB_PATH,
 })
@@ -4658,6 +4662,79 @@ def orders():
     except Exception:
         pass
     q = norm(request.args.get("q"))
+    # Operational delivery board: orders are entered by staff, not by a client portal.
+    # It uses the WZ and transport timeline as the source of truth.
+    delivery_tab = norm(request.args.get("tab")) or "realization"
+    allowed_delivery_tabs = {"realization", "issued", "delivery", "delivered", "returned", "all"}
+    if delivery_tab not in allowed_delivery_tabs:
+        delivery_tab = "realization"
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT o.id,o.order_no,o.customer_name,o.created_at,
+             w.id AS wz_id,w.wz_no,w.status AS wz_status,w.created_at AS wz_created_at,w.issued_at,
+             t.id AS transport_id,t.transport_no,t.status AS transport_status,t.driver_id,
+             d.name AS driver_name,v.registration_no,t.departed_at,t.delivered_at,t.returned_at
+      FROM orders o
+      LEFT JOIN wz_documents w ON w.id=(SELECT id FROM wz_documents x WHERE x.order_id=o.id AND x.deleted_at IS NULL ORDER BY x.id DESC LIMIT 1)
+      LEFT JOIN transports t ON t.id=(SELECT id FROM transports x WHERE x.wz_id=w.id AND x.deleted_at IS NULL ORDER BY x.id DESC LIMIT 1)
+      LEFT JOIN drivers d ON d.id=t.driver_id
+      LEFT JOIN vehicles v ON v.id=t.vehicle_id
+      ORDER BY o.id DESC LIMIT 500
+    """)
+    delivery_rows=[]
+    stage_counts={x:0 for x in allowed_delivery_tabs if x != "all"}
+    durations={"realization":[],"issued":[],"delivery":[],"delivered":[]}
+
+    def _delivery_time(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    def _duration_label(seconds):
+        if seconds is None or seconds < 0:
+            return "—"
+        minutes=round(seconds / 60)
+        if minutes < 60:
+            return f"{minutes} min"
+        hours, minutes=divmod(minutes,60)
+        return f"{hours} h {minutes} min"
+    for raw in cur.fetchall():
+        r=dict(raw)
+        ts={key:_delivery_time(r.get(key)) for key in ("created_at","issued_at","departed_at","delivered_at","returned_at")}
+        transport_status=(r.get("transport_status") or "").lower()
+        if transport_status == "returned":
+            stage, stage_label="returned","Auto wróciło na bazę"
+        elif transport_status == "delivered":
+            stage, stage_label="delivered","Dostarczone"
+        elif transport_status == "in_transit":
+            stage, stage_label="delivery","W dostawie"
+        elif r.get("wz_status") in ("issued","in_transport") or transport_status in ("assigned","issued","problem"):
+            stage, stage_label="issued","Wydane / oczekuje na wyjazd"
+        else:
+            stage, stage_label="realization","W realizacji"
+        r["stage"]=stage; r["stage_label"]=stage_label
+        r["t_realization"]=_duration_label((ts["issued_at"]-ts["created_at"]).total_seconds()) if ts["issued_at"] and ts["created_at"] else "—"
+        r["t_wait_departure"]=_duration_label((ts["departed_at"]-ts["issued_at"]).total_seconds()) if ts["departed_at"] and ts["issued_at"] else "—"
+        r["t_delivery"]=_duration_label((ts["delivered_at"]-ts["departed_at"]).total_seconds()) if ts["delivered_at"] and ts["departed_at"] else "—"
+        r["t_return"]=_duration_label((ts["returned_at"]-ts["delivered_at"]).total_seconds()) if ts["returned_at"] and ts["delivered_at"] else "—"
+        for key, start, end in (("realization","created_at","issued_at"),("issued","issued_at","departed_at"),("delivery","departed_at","delivered_at"),("delivered","delivered_at","returned_at")):
+            if ts[start] and ts[end]: durations[key].append((ts[end]-ts[start]).total_seconds())
+        stage_counts[stage]=stage_counts.get(stage,0)+1
+        if (not q or q.lower() in " ".join(str(r.get(k) or "") for k in ("order_no","customer_name","wz_no","transport_no","driver_name")).lower()) and (delivery_tab == "all" or stage == delivery_tab):
+            delivery_rows.append(r)
+    c.close()
+    averages={key:_duration_label(sum(vals)/len(vals)) if vals else "—" for key,vals in durations.items()}
+    board_tpl=r"""
+    {% extends "base.html" %}{% block content %}
+    <div class="card"><div class="flex"><h1 style="margin:0">Realizacja dostaw</h1><a class="btn primary right" href="{{url_for('order_new')}}">+ Nowe zamówienie</a></div><div class="muted" style="margin-top:8px">Tablica operacyjna oparta na dokumentach WZ i statusach kierowców. Czasy pokazują miejsca, w których proces czeka najdłużej.</div><div class="flex" style="margin-top:14px">{% for key,label in [('realization','W realizacji'),('issued','Wydane'),('delivery','W dostawie'),('delivered','Dostarczone'),('returned','Auto na bazie'),('all','Wszystkie')] %}<a class="btn {% if tab==key %}primary{% endif %}" href="{{url_for('orders',tab=key,q=q)}}">{{label}}{% if key!='all' %} ({{counts.get(key,0)}}){% endif %}</a>{% endfor %}</div><form method="get" class="grid3" style="margin-top:12px"><input type="hidden" name="tab" value="{{tab}}"><input name="q" value="{{q}}" placeholder="Szukaj: klient, WZ, transport, kierowca"><button class="btn primary">Szukaj</button><a class="btn" href="{{url_for('orders',tab=tab)}}">Wyczyść</a></form></div>
+    <div class="grid4"><div class="card"><b>Przygotowanie → wydanie</b><div style="font-size:22px">{{averages.realization}}</div></div><div class="card"><b>Wydane → wyjazd</b><div style="font-size:22px">{{averages.issued}}</div></div><div class="card"><b>Wyjazd → dostawa</b><div style="font-size:22px">{{averages.delivery}}</div></div><div class="card"><b>Dostawa → powrót</b><div style="font-size:22px">{{averages.delivered}}</div></div></div>
+    <div class="card"><table><thead><tr><th>Zamówienie / klient</th><th>Etap</th><th>WZ / transport</th><th>Kierowca / auto</th><th>Przygot.</th><th>Oczek. wyjazd</th><th>Dostawa</th><th>Powrót</th><th></th></tr></thead><tbody>{% for r in rows %}<tr><td><b>{{r.order_no}}</b><br>{{r.customer_name}}</td><td><span class="badge">{{r.stage_label}}</span></td><td>{{r.wz_no or 'WZ nie wystawiono'}}{% if r.transport_no %}<br><b>{{r.transport_no}}</b>{% endif %}</td><td>{{r.driver_name or '—'}}<br>{{r.registration_no or ''}}</td><td>{{r.t_realization}}</td><td>{{r.t_wait_departure}}</td><td>{{r.t_delivery}}</td><td>{{r.t_return}}</td><td>{% if r.transport_id %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=r.transport_id)}}">Transport</a>{% elif r.wz_id %}<a class="btn" href="{{url_for('beton.wz_view',wz_id=r.wz_id)}}">WZ</a>{% else %}<a class="btn" href="{{url_for('order_view',order_id=r.id)}}">Zamówienie</a>{% endif %}</td></tr>{% else %}<tr><td colspan="9" class="muted">Brak pozycji w wybranym etapie.</td></tr>{% endfor %}</tbody></table></div>
+    {% endblock %}"""
+    return render_template_string(board_tpl,title="Realizacja dostaw",base_url=BASE_URL,db_path=DB_PATH,rows=delivery_rows,tab=delivery_tab,q=q,counts=stage_counts,averages=averages)
+
     tab = norm(request.args.get("tab")) or "new"
     if tab not in {"new", "issued", "realized", "all"}:
         tab = "new"
