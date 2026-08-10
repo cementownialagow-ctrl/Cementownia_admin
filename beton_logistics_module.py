@@ -501,6 +501,7 @@ def driver_transports_api():
         return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
     with D['conn']() as c:
         rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no,
+          EXISTS(SELECT 1 FROM delivery_photos dp WHERE dp.transport_id=t.id AND dp.deleted_at IS NULL) AS has_signed_wz_photo,
           COALESCE(NULLIF(t.destination,''),NULLIF(w.destination,''),NULLIF(o.note,''),o.customer_address) AS delivery_address,
           (SELECT a.status FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) plant_status,
           (SELECT a.planned_date FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) planned_date,
