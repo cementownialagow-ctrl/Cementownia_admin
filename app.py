@@ -907,6 +907,10 @@ CLIENT_ALLOWED_ORIGINS = {
     for value in os.environ.get("CLIENT_ALLOWED_ORIGINS", "").split(",")
     if value.strip()
 }
+# Panel kierowcy jest osobną stroną Netlify. Ten bezpieczny, znany adres musi
+# zawsze przejść przez CORS, aby kierowca mógł wysłać login do API na Render.
+# Dodatkowe własne domeny nadal można dopisać w CLIENT_ALLOWED_ORIGINS.
+CLIENT_ALLOWED_ORIGINS.add("https://panel-dostawy.netlify.app")
 ADMIN_ACTION_TOKEN = os.environ.get("ADMIN_ACTION_TOKEN", "").strip()
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip()
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
@@ -1110,7 +1114,7 @@ def trigger_background_supabase_sync(reason: str = "write"):
 
 
 
-def supabase_request(path: str, method: str = "GET", params: dict | None = None, payload=None, prefer: str | None = None, timeout: int = 60):
+def supabase_request(path: str, method: str = "GET", params: dict | None = None, payload=None, prefer: str | None = None, timeout: int = 60, use_anon_key: bool = False):
     if not supabase_enabled():
         raise RuntimeError("Brak konfiguracji SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY")
 
@@ -1123,9 +1127,12 @@ def supabase_request(path: str, method: str = "GET", params: dict | None = None,
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
+    # Zwykłe logowanie hasłem jest endpointem publicznego Auth API. Musi użyć
+    # anon key, a nie service-role key (ten drugi służy wyłącznie serwerowi).
+    api_key = SUPABASE_ANON_KEY if use_anon_key and SUPABASE_ANON_KEY else SUPABASE_SERVICE_ROLE_KEY
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
-    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
+    req.add_header("apikey", api_key)
+    req.add_header("Authorization", f"Bearer {api_key}")
     req.add_header("Content-Type", "application/json")
     if prefer:
         req.add_header("Prefer", prefer)
@@ -5217,18 +5224,21 @@ def order_create():
         if manual_name and qty > 0:
             sku = f"RECZNY-{uuid.uuid4().hex[:10].upper()}"
             created_at = now_iso()
+            # W istniejącej tabeli Supabase kolumna products.id nie zawsze ma
+            # generator ID. Nadajemy więc wspólny, niekolidujący identyfikator
+            # zamiast oczekiwać, że Supabase sam go utworzy.
+            pid = int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
             c = conn()
             try:
                 cur = c.cursor()
                 if supabase_enabled():
-                    created = supabase_insert_row("products", {"sku": sku, "model": manual_name, "name": manual_name, "created_at": created_at})
-                    if not created or "id" not in created:
-                        raise RuntimeError("Nie udało się dodać ręcznego produktu do Supabase")
-                    pid = int(created["id"])
+                    supabase_insert_row("products", {
+                        "id": pid, "sku": sku, "model": manual_name, "name": manual_name,
+                        "unit": "m3", "created_at": created_at,
+                    })
                     cur.execute("INSERT INTO products(id,sku,model,ean,name,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET sku=excluded.sku,model=excluded.model,name=excluded.name", (pid, sku, manual_name, "", manual_name, created_at))
                 else:
-                    cur.execute("INSERT INTO products(sku,model,ean,name,created_at) VALUES(?,?,?,?,?)", (sku, manual_name, "", manual_name, created_at))
-                    pid = cur.lastrowid
+                    cur.execute("INSERT INTO products(id,sku,model,ean,name,created_at) VALUES(?,?,?,?,?,?)", (pid, sku, manual_name, "", manual_name, created_at))
                 c.commit()
             finally:
                 c.close()
