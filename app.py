@@ -3039,7 +3039,7 @@ def admin_users():
     c = conn()
     users = c.execute("SELECT * FROM app_users WHERE deleted_at IS NULL ORDER BY active DESC, role, display_name").fetchall()
     c.close()
-    return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Użytkownicy i uprawnienia</h1><div class="card"><p class="muted">Tylko administrator główny tworzy konta, zmienia role i wyłącza dostęp.</p>{% if error %}<div class="notice">{{error}}</div>{% endif %}<h2>Dodaj konto</h2><form method="post" class="grid3"><div><label>Imię i nazwisko</label><input name="display_name" required></div><div><label>Login</label><input name="username" required></div><div><label>Hasło (min. 12)</label><input name="password" type="password" minlength="12" required></div><div><label>Rola</label><select name="role">{% for value,label in roles %}<option value="{{value}}">{{label}}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn primary">Utwórz konto</button></div></form></div><div class="card"><h2>Role i dostęp</h2><table><thead><tr><th>Osoba</th><th>Login</th><th>Rola</th><th>Ostatnie logowanie</th><th>Dostęp</th></tr></thead><tbody>{% for u in users %}<tr><td><b>{{u.display_name}}</b></td><td>{{u.username}}</td><td><form method="post" action="{{url_for('admin_user_role',user_id=u.id)}}"><select name="role">{% for value,label in roles %}<option value="{{value}}" {% if value==u.role %}selected{% endif %}>{{label}}</option>{% endfor %}</select><button class="btn">Zapisz rolę</button></form></td><td>{{u.last_login_at or '—'}}</td><td>{% if u.id == session.get('user_id') %}<span class="badge">Twoje konto</span>{% else %}<form method="post" action="{{url_for('admin_user_toggle',user_id=u.id)}}"><button class="btn">{{'Wyłącz' if u.active else 'Włącz'}}</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="5">Brak kont.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''', users=users, roles=roles, error=error, base_url=BASE_URL, db_path=DB_PATH)
+    return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Użytkownicy i uprawnienia</h1><div class="card"><p class="muted">Tylko administrator główny tworzy konta, zmienia role i wyłącza dostęp.</p>{% if error %}<div class="notice">{{error}}</div>{% endif %}<h2>Dodaj konto</h2><form method="post" class="grid3"><div><label>Imię i nazwisko</label><input name="display_name" required></div><div><label>Login</label><input name="username" required></div><div><label>Hasło (min. 12)</label><input name="password" type="password" minlength="12" required></div><div><label>Rola</label><select name="role">{% for value,label in roles %}<option value="{{value}}">{{label}}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn primary">Utwórz konto</button></div></form></div><div class="card"><h2>Role i dostęp</h2><table><thead><tr><th>Osoba</th><th>Login</th><th>Rola</th><th>Ostatnie logowanie</th><th>Dostęp</th></tr></thead><tbody>{% for u in users %}<tr><td><b>{{u.display_name}}</b></td><td>{{u.username}}</td><td><form method="post" action="{{url_for('admin_user_role',user_id=u.id)}}"><select name="role">{% for value,label in roles %}<option value="{{value}}" {% if value==u.role %}selected{% endif %}>{{label}}</option>{% endfor %}</select><button class="btn">Zapisz rolę</button></form></td><td>{{u.last_login_at or '—'}}</td><td>{% if u.id == session.get('user_id') %}<span class="badge">Twoje konto</span>{% else %}<form method="post" action="{{url_for('admin_user_toggle',user_id=u.id)}}" style="display:inline"><button class="btn">{{'Wyłącz' if u.active else 'Włącz'}}</button></form><form method="post" action="{{url_for('admin_user_delete',user_id=u.id)}}" style="display:inline;margin-left:6px"><button class="btn" style="color:#b42318">Usuń konto</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="5">Brak kont.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''', users=users, roles=roles, error=error, base_url=BASE_URL, db_path=DB_PATH)
     error = ""
     if request.method == "POST":
         username = norm(request.form.get("username"))
@@ -3085,6 +3085,36 @@ def admin_user_toggle(user_id):
     if user["active"] and user["role"] == "admin" and c.execute("SELECT COUNT(*) FROM app_users WHERE role='admin' AND active=1 AND deleted_at IS NULL").fetchone()[0] <= 1:
         c.close(); return "Nie można wyłączyć ostatniego administratora.", 400
     c.execute("UPDATE app_users SET active=?,updated_at=? WHERE id=?", (0 if user["active"] else 1, now_iso(), user_id)); c.commit(); c.close()
+    sync_local_rows_to_supabase("app_users", "id", [user_id])
+    return redirect(url_for("admin_users"))
+
+
+@app.post("/admin/users/<int:user_id>/delete")
+def admin_user_delete(user_id):
+    """Remove a user's access while preserving audit and document history."""
+    _admin_only()
+    if user_id == session.get("user_id"):
+        return "Nie możesz usunąć własnego konta.", 400
+
+    c = conn()
+    user = c.execute("SELECT * FROM app_users WHERE id=? AND deleted_at IS NULL", (user_id,)).fetchone()
+    if not user:
+        c.close()
+        abort(404)
+    active_admins = c.execute(
+        "SELECT COUNT(*) FROM app_users WHERE role='admin' AND active=1 AND deleted_at IS NULL"
+    ).fetchone()[0]
+    if user["active"] and user["role"] == "admin" and active_admins <= 1:
+        c.close()
+        return "Nie można usunąć ostatniego aktywnego administratora.", 400
+
+    timestamp = now_iso()
+    c.execute(
+        "UPDATE app_users SET active=0, deleted_at=?, updated_at=? WHERE id=?",
+        (timestamp, timestamp, user_id),
+    )
+    c.commit()
+    c.close()
     sync_local_rows_to_supabase("app_users", "id", [user_id])
     return redirect(url_for("admin_users"))
 
