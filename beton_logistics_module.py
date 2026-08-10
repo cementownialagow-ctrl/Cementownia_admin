@@ -274,10 +274,11 @@ def wz_view(wz_id):
         <table><thead><tr><th>Produkt</th><th>Plan [m³]</th><th>Wydano [m³]</th></tr></thead><tbody>
           {% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_planned}}</td><td>{{x.qty_issued if x.qty_issued is not none else '—'}}</td></tr>{% endfor %}
         </tbody></table>
-        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status=='issued' and not transport %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przypisz kierowcę i auto</a>{% elif w.status=='returned' %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ — gotowe do faktury VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Transport {{transport.transport_no}}</a>{% endif %}</div>
+        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status=='issued' and not transport %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przypisz kierowcę i auto</a>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Transport {{transport.transport_no}}</a>{% endif %}</div>
       </div>
       <div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>
       <div class="card"><h2>Zdjęcia podpisanego WZ</h2>{% for p in photos %}<div class="flex" style="margin:8px 0"><span>{{p.created_at}}</span><a class="btn" href="{{url_for('beton.photo_download',photo_id=p.id)}}">Pobierz zdjęcie</a></div>{% else %}<span class="muted">Brak zdjęć.</span>{% endfor %}</div>
+      {% if w.status in ['issued','in_transport','returned'] %}<div class="card"><h2>Fakturowanie</h2><p class="muted">Po otrzymaniu podpisanego WZ kliknij poniżej. Status zostanie zapisany, a następnie otworzy się wystawienie faktury VAT.</p><form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form></div>{% endif %}
     {% endblock %}''',w=w,items=items,transport=transport,photos=photos,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
 @bp.get('/photos/<int:photo_id>/download')
@@ -346,10 +347,11 @@ def wz_issue(wz_id):
 def wz_ready(wz_id):
     s=stamp()
     with D['conn']() as c:
-        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status='returned'",(wz_id,)).fetchone()
+        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status IN ('issued','in_transport','returned')",(wz_id,)).fetchone()
         if not w:abort(409)
         c.execute("UPDATE wz_documents SET status='ready_invoice',ready_by=?,ready_at=? WHERE id=?",(actor(),s,wz_id))
-    return redirect(url_for('beton.wz_view',wz_id=wz_id))
+    D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
+    return redirect(url_for('order_invoice',order_id=w['order_id'],wz_id=wz_id))
 
 @bp.get('/drivers')
 def drivers():
