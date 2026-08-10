@@ -218,13 +218,13 @@ def wz_list():
 def wz_new():
     order_id=int(request.values.get('order_id') or 0)
     with D['conn']() as c:
-        orders=c.execute("SELECT id,order_no,customer_name,created_at FROM orders WHERE lower(status) NOT IN ('cancelled') ORDER BY id DESC LIMIT 300").fetchall()
+        orders=c.execute("SELECT id,order_no,customer_name,customer_address,created_at FROM orders WHERE lower(status) NOT IN ('cancelled') ORDER BY id DESC LIMIT 300").fetchall()
         order=c.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone() if order_id else None
         items=c.execute('''SELECT oi.*,COALESCE(p.name,p.sku) product_name,COALESCE((SELECT SUM(wi.qty_planned) FROM wz_items wi JOIN wz_documents wd ON wd.id=wi.wz_id WHERE wi.order_item_id=oi.id AND wd.deleted_at IS NULL),0) wz_reserved FROM order_items oi JOIN products p ON p.id=oi.product_id WHERE oi.order_id=? ORDER BY oi.id''',(order_id,)).fetchall() if order else []
         if request.method=='POST':
             if not order:abort(400)
             s=stamp(); wz_id=cloud_id(); cur=c.execute('''INSERT INTO wz_documents(id,wz_no,order_id,issue_location,warehouse_location,destination,status,created_by,created_at,notes)
-              VALUES(?,?,?,?,?,?,'created',?,?,?)''',(wz_id,next_wz_no(c),order_id,request.form.get('issue_location','Miejscowość X').strip(),request.form.get('warehouse_location','Miejscowość Y').strip(),request.form.get('destination','').strip(),actor(),s,request.form.get('notes','').strip()))
+              VALUES(?,?,?,?,?,?,'created',?,?,?)''',(wz_id,next_wz_no(c),order_id,request.form.get('issue_location','Miejscowość X').strip(),request.form.get('warehouse_location','Miejscowość Y').strip(),request.form.get('destination','').strip() or (order['customer_address'] or '').strip(),actor(),s,request.form.get('notes','').strip()))
             count=0
             for item in items:
                 qty=float(request.form.get(f'qty_{item["id"]}') or 0)
@@ -241,18 +241,31 @@ def wz_new():
 @bp.get('/wz/<int:wz_id>')
 def wz_view(wz_id):
     with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.customer_name,o.order_no,i.invoice_no FROM wz_documents w JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
+        w=c.execute('''SELECT w.*,o.customer_name,o.order_no,o.customer_address,
+            COALESCE(NULLIF(w.destination,''), o.customer_address) AS destination,
+            i.invoice_no FROM wz_documents w JOIN orders o ON o.id=w.order_id
+            LEFT JOIN invoices i ON i.id=w.invoice_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
         if not w:abort(404)
-        items=c.execute('SELECT * FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall()
+        w=dict(w)
+        w['destination']=(w.get('destination') or w.get('customer_address') or '').strip()
+        items=c.execute('''SELECT wi.*, COALESCE(p.name, wi.sku) AS sku
+            FROM wz_items wi LEFT JOIN products p ON p.id=wi.product_id
+            WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()
         transport=c.execute('SELECT * FROM transports WHERE wz_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1',(wz_id,)).fetchone()
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{w.wz_no}}</h1><span class="badge">{{w.status}}</span><a class="btn right" target="_blank" href="{{url_for('beton.wz_print',wz_id=w.id)}}">Drukuj WZ</a></div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{w.customer_name}}</b></div><div><span class="muted">Wystawiono / magazyn</span><br>{{w.issue_location}} → {{w.warehouse_location}}</div><div><span class="muted">Dostawa</span><br>{{w.destination or '—'}}</div></div><div class="line"></div><table><thead><tr><th>Materiał</th><th>Plan</th><th>Wydano</th></tr></thead><tbody>{% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_planned}}</td><td>{{x.qty_issued if x.qty_issued is not none else '—'}}</td></tr>{% endfor %}</tbody></table><div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status=='issued' and not transport %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przypisz kierowcę i auto</a>{% elif w.status=='returned' %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ — gotowe do faktury VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Transport {{transport.transport_no}}</a>{% endif %}</div></div><div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>{% endblock %}''',w=w,items=items,transport=transport,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
 @bp.get('/wz/<int:wz_id>/print')
 def wz_print(wz_id):
     with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.customer_name,o.customer_address FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
+        w=c.execute('''SELECT w.*,o.customer_name,o.customer_address,
+            COALESCE(NULLIF(w.destination,''), o.customer_address) AS destination
+            FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
         if not w:abort(404)
-        items=c.execute('SELECT sku,qty_planned,qty_issued FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall()
+        w=dict(w)
+        w['destination']=(w.get('destination') or w.get('customer_address') or '').strip()
+        items=c.execute('''SELECT COALESCE(p.name, wi.sku) AS sku, wi.qty_planned, wi.qty_issued
+            FROM wz_items wi LEFT JOIN products p ON p.id=wi.product_id
+            WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()
     return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{w.wz_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}h1{margin-bottom:4px}table{border-collapse:collapse;width:100%;margin:22px 0}th,td{border:1px solid #333;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.sign{display:grid;grid-template-columns:1fr 1fr;gap:70px;margin-top:70px}.line{border-top:1px solid #111;padding-top:7px;text-align:center}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Wydanie zewnętrzne {{w.wz_no}}</h1><p>Data: {{w.created_at[:10]}} · Status: {{w.status}}</p><div class="grid"><div><b>Nabywca / odbiorca</b><br>{{w.customer_name}}<br>{{w.customer_address or ''}}</div><div><b>Wydanie</b><br>{{w.issue_location}} → {{w.warehouse_location}}<br>Dostawa: {{w.destination or '—'}}</div></div><table><thead><tr><th>Materiał</th><th>Ilość</th></tr></thead><tbody>{% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td></tr>{% endfor %}</tbody></table><p>Uwagi: {{w.notes or '—'}}</p><div class="sign"><div class="line">Wydał: {{w.issued_by or ''}}</div><div class="line">Odebrał / podpis i pieczęć</div></div></html>''',w=w,items=items)
 
 @bp.post('/wz/<int:wz_id>/issue')
@@ -407,7 +420,9 @@ def transport_view(transport_id):
     with D['conn']() as c:
         x=c.execute('''SELECT t.*,w.wz_no,w.invoice_id,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name FROM transports t JOIN wz_documents w ON w.id=t.wz_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN orders o ON o.id=w.order_id JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id WHERE t.id=?''',(transport_id,)).fetchone()
         if not x:abort(404)
-        items=c.execute('SELECT ti.qty,w.sku FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id WHERE ti.transport_id=?',(transport_id,)).fetchall()
+        items=c.execute('''SELECT ti.qty, COALESCE(p.name, w.sku) AS sku
+            FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
+            LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(transport_id,)).fetchall()
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a>{% if x.invoice_id %}<a class="btn" href="{{url_for('invoice_download_admin',invoice_id=x.invoice_id)}}">Pobierz fakturę</a>{% endif %}</div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><div class="line"></div><table><thead><tr><th>Materiał / SKU</th><th>Ilość</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}}</b></td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',x=x,items=items,title=x['transport_no'],base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
 def current_driver_id():
@@ -438,7 +453,9 @@ def driver_transports_api():
           FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE t.driver_id=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(driver_id,)).fetchall()
         result=[]
         for r in rows:
-            x=dict(r); x['items']=[dict(z) for z in c.execute('SELECT w.sku,ti.qty FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id WHERE ti.transport_id=?',(r['id'],))]; result.append(x)
+            x=dict(r); x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
+                FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
+                LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(r['id'],))]; result.append(x)
     return jsonify(ok=True,transports=result)
 
 @driver_api.post('/transports/<int:transport_id>/status')
