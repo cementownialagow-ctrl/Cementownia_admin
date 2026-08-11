@@ -366,8 +366,23 @@ def wz_list():
 
 @bp.route('/wz/new',methods=['GET','POST'])
 def wz_new():
-    order_id=int(request.values.get('order_id') or 0)
+    try:
+        order_id=int(request.values.get('order_id') or 0)
+    except (TypeError,ValueError):
+        order_id=0
+    # Zamówienie mogło zostać zapisane na innej instancji Rendera.
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        current_app.logger.exception('Nie udało się odświeżyć zamówień przed wystawieniem WZ')
     with D['conn']() as c:
+        if order_id:
+            existing_wz=c.execute('''SELECT id FROM wz_documents
+                WHERE order_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1''',(order_id,)).fetchone()
+            if existing_wz:
+                # Nowe zamówienie tworzy już roboczą WZ automatycznie. Nie
+                # duplikujemy dokumentu — otwieramy właściwą istniejącą WZ.
+                return redirect(url_for('beton.wz_view',wz_id=existing_wz['id']))
         orders=c.execute("SELECT id,order_no,customer_name,customer_address,created_at FROM orders WHERE lower(status) NOT IN ('cancelled') ORDER BY id DESC LIMIT 300").fetchall()
         order=c.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone() if order_id else None
         items=c.execute('''SELECT oi.*,COALESCE(p.name,p.sku) product_name,COALESCE((SELECT SUM(wi.qty_planned) FROM wz_items wi JOIN wz_documents wd ON wd.id=wi.wz_id WHERE wi.order_item_id=oi.id AND wd.deleted_at IS NULL),0) wz_reserved FROM order_items oi JOIN products p ON p.id=oi.product_id WHERE oi.order_id=? ORDER BY oi.id''',(order_id,)).fetchall() if order else []
