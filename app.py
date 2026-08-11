@@ -3371,7 +3371,8 @@ def home():
 
       <div class="metrics">
         <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
-        <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>W realizacji</span><b>{{ n_orders_current }}</b><small><a href="{{ url_for('orders', tab='today') }}">Pozostało do realizacji dzisiaj ({{ today_remaining }})</a></small></div></div>
+        <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>W realizacji</span><b>{{ n_orders_current }}</b></div></div>
+        <a class="metric" style="--soft:#fff5e5;--tone:#c57a10;text-decoration:none;color:inherit" href="{{ url_for('orders', tab='today') }}"><div class="icon">▦</div><div><span>Pozostało do realizacji dzisiaj</span><b>{{ today_remaining }}</b><small>Zobacz dzisiejsze wydania</small></div></a>
       </div>
 
       <div class="dash-grid">
