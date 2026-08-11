@@ -6906,7 +6906,7 @@ def order_invoice(order_id):
     if request.method == "GET":
         data = {
             "invoice_no": next_invoice_no(default_issue),
-            "place": "KotuszĂłw",
+            "place": "Radlin",
             "issue_date": default_issue,
             "sell_date": default_issue,
             "payment_type": "gotowka",
