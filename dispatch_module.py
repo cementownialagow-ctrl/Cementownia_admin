@@ -65,6 +65,11 @@ def appointments():
         if not order_id: abort(400)
         with D["conn"]() as c:
             now = _now()
+            order_plan = c.execute("SELECT delivery_date, delivery_time FROM orders WHERE id=?", (order_id,)).fetchone()
+            # Termin z zamówienia jest źródłem prawdy. Dyspozytor nie wpisuje
+            # go drugi raz podczas przydzielania transportu.
+            planned_date = ((order_plan["delivery_date"] if order_plan else "") or request.form.get("planned_date") or day).strip()
+            planned_delivery_time = ((order_plan["delivery_time"] if order_plan else "") or request.form.get("time_to") or "").strip()
             wz_id = int(request.form.get("wz_id") or 0)
             driver_id = int(request.form.get("driver_id") or 0)
             vehicle_id = int(request.form.get("vehicle_id") or 0)
@@ -84,9 +89,9 @@ def appointments():
                         VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)""", (transport_id, transport_no, wz_id, driver_id, vehicle_id, request.form.get("destination", "").strip(), _actor(), _actor(), now, now))
                     for item in c.execute("SELECT id,qty_issued,qty_planned FROM wz_items WHERE wz_id=?", (wz_id,)).fetchall():
                         c.execute("INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)", (_cloud_id(), transport_id, item["id"], item["qty_issued"] or item["qty_planned"], now))
-            position = c.execute("SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?", (request.form.get("planned_date") or day,)).fetchone()[0]
+            position = c.execute("SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?", (planned_date,)).fetchone()[0]
             c.execute("""INSERT INTO dispatch_appointments(appointment_no,order_id,wz_id,transport_id,driver_id,vehicle_id,loading_bay_id,planned_date,time_from,time_to,shift,queue_position,status,notes,created_by,updated_by,created_at,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'planned',?,?,?,?,?)""", (_number(c), order_id, wz_id or None, transport_id or None, driver_id or None, vehicle_id or None, request.form.get("loading_bay_id") or None, request.form.get("planned_date") or day, request.form.get("time_from") or None, request.form.get("time_to") or None, request.form.get("shift") or None, position, request.form.get("notes", "").strip(), _actor(), _actor(), now, now))
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'planned',?,?,?,?,?)""", (_number(c), order_id, wz_id or None, transport_id or None, driver_id or None, vehicle_id or None, request.form.get("loading_bay_id") or None, planned_date, request.form.get("time_from") or None, planned_delivery_time or None, request.form.get("shift") or None, position, request.form.get("notes", "").strip(), _actor(), _actor(), now, now))
             c.commit()
             if transport_id:
                 D['sync_local_rows_to_supabase']('transports','id',[transport_id])
@@ -116,7 +121,7 @@ def appointments():
             x['display_stage'] = TRANSPORT_STAGE_LABEL.get(x.get('transport_status')) or STAGE_LABEL.get(x['status'], x['status'])
         # W formularzu pokazujemy tylko zamówienia, które nie trafiły jeszcze
         # do harmonogramu ani nie mają przypisanego aktywnego transportu.
-        orders = c.execute("""SELECT o.id,o.order_no,o.customer_name,
+        orders = c.execute("""SELECT o.id,o.order_no,o.customer_name,COALESCE(o.delivery_date,'') delivery_date,COALESCE(o.delivery_time,'') delivery_time,
             COALESCE((SELECT SUM(oi.qty) FROM order_items oi WHERE oi.order_id=o.id),0) AS total_m3,
             MAX(1, CAST((COALESCE((SELECT SUM(oi.qty) FROM order_items oi WHERE oi.order_id=o.id),0)+7.999999)/8 AS INTEGER)) AS required_trips
           FROM orders o
@@ -148,7 +153,7 @@ def appointments():
         drivers = c.execute("SELECT id,name FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name").fetchall()
         vehicles = c.execute("SELECT id,registration_no FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no").fetchall()
         bays = c.execute("SELECT * FROM loading_bays WHERE active=1 ORDER BY code").fetchall()
-    return render_template_string(TPL, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, vehicles=vehicles, bays=bays, day=day, labels=STAGE_LABEL, capacity_notice=request.args.get("capacity_notice", ""), title="Awizacje", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
+    return render_template_string(TPL, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, vehicles=vehicles, bays=bays, day=day, labels=STAGE_LABEL, capacity_notice=request.args.get("capacity_notice", ""), title="Wydaj transport", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
 
 @bp.post("/appointments/<int:appointment_id>/status")
 def appointment_status(appointment_id):
@@ -196,7 +201,7 @@ def queue():
     return render_template_string(QUEUE_TPL, groups=groups, day=day, labels=STAGE_LABEL, title="Kolejka załadunkowa", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
 
 TPL = '''{% extends "base.html" %}{% block content %}
-<div class="flex"><h1>Awizacje zakładowe</h1><a class="btn right" href="{{url_for('dispatch.queue',day=day)}}">Ekran kolejki</a></div>
+<div class="flex"><h1>Wydaj transport</h1><a class="btn right" href="{{url_for('dispatch.queue',day=day)}}">Ekran kolejki</a></div>
 <div class="card"><form method="get" class="flex"><label>Data <input type="date" name="day" value="{{day}}"></label><button class="btn primary">Pokaż dzień</button></form></div>
 <div class="card"><h2>Dodaj awizację</h2>{% if capacity_notice %}<div class="notice warn"><b>Podział transportu:</b> {{capacity_notice}}</div>{% endif %}<form method="post" class="grid3"><input type="hidden" name="planned_date" value="{{day}}"><div><label>Zamówienie</label><select name="order_id" required><option value="">Wybierz</option>{% for x in orders %}<option value="{{x.id}}">{{x.order_no}} · {{x.customer_name}} · {{'%.2f'|format(x.total_m3)|replace('.', ',')}} m³ · min. {{x.required_trips}} podjazd(y)</option>{% endfor %}</select></div><div><label>Planowany wyjazd</label><input name="time_from" type="time"></div><div><label>Planowana dostawa</label><input name="time_to" type="time"></div><div><label>Zmiana</label><input name="shift" placeholder="np. I"></div><div><label>WZ (opcjonalnie)</label><select name="wz_id"><option value="">—</option>{% for x in wzs %}<option value="{{x.id}}">{{x.wz_no}} · {{x.order_no}}</option>{% endfor %}</select></div><div><label>Transport</label><select name="transport_id"><option value="">—</option>{% for x in transports %}<option value="{{x.id}}">{{x.transport_no}}</option>{% endfor %}</select></div><div><label>Stanowisko</label><select name="loading_bay_id"><option value="">—</option>{% for x in bays %}<option value="{{x.id}}">{{x.code}}</option>{% endfor %}</select></div><div><label>Kierowca</label><select name="driver_id"><option value="">—</option>{% for x in drivers %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Auto</label><select name="vehicle_id"><option value="">—</option>{% for x in vehicles %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn primary">Dodaj do harmonogramu</button></div></form></div>
 <div class="card"><table><thead><tr><th>Wyjazd / dostawa</th><th>Awizacja / klient</th><th>Auto / kierowca</th><th>Stanowisko</th><th>Etap transportu</th><th>Kolejka</th><th>Zmień etap zakładowy</th></tr></thead><tbody>{% for x in rows %}<tr><td><b>Wyjazd: {{x.time_from or '—'}}</b><br><b>Dostawa: {{x.time_to or '—'}}</b><br><span class="muted">{{x.shift or ''}}</span></td><td><b>{{x.appointment_no}}</b><br>{{x.customer_name}}<br><span class="muted">{{x.items or 'Pozycje WZ po utworzeniu'}}</span></td><td>{{x.registration_no or '—'}}<br>{{x.driver_name or '—'}}</td><td>{{x.bay_code or '—'}}</td><td><span class="badge">{{x.display_stage}}</span></td><td><form method="post" action="{{url_for('dispatch.appointment_move',appointment_id=x.id)}}"><input type="hidden" name="day" value="{{day}}"><button name="direction" value="up" class="btn">↑</button><button name="direction" value="down" class="btn">↓</button></form></td><td><form method="post" action="{{url_for('dispatch.appointment_status',appointment_id=x.id)}}"><input type="hidden" name="day" value="{{day}}"><select name="status"><option value="">Ustaw etap</option>{% for value,label in labels.items() %}<option value="{{value}}">{{label}}</option>{% endfor %}</select><input name="reason" placeholder="Powód tylko dla problemu/anulowania"><button class="btn primary">Zapisz</button></form></td></tr>{% else %}<tr><td colspan="7">Brak awizacji na ten dzień.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}'''
