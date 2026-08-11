@@ -4901,6 +4901,121 @@ def api_product(product_id):
 # ORDERS
 # -------------------------
 
+def render_orders_workboard(q):
+    """Prosta lista pracy: bez licznikow czasowych i technicznych etapow."""
+    selected = norm(request.args.get("tab")) or "in_progress"
+    allowed = {"in_progress", "planned", "today", "tomorrow", "completed"}
+    if selected not in allowed:
+        selected = "in_progress"
+
+    today = datetime.now().date()
+    tomorrow = today + timedelta(days=1)
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT o.id, o.order_no, o.customer_name, o.created_at,
+               o.delivery_date, o.delivery_time,
+               w.id AS wz_id, w.wz_no, w.status AS wz_status,
+               t.id AS transport_id, t.transport_no, t.status AS transport_status,
+               d.name AS driver_name, v.registration_no
+        FROM orders o
+        LEFT JOIN wz_documents w ON w.id=(
+            SELECT x.id FROM wz_documents x
+            WHERE x.order_id=o.id AND x.deleted_at IS NULL
+            ORDER BY x.id DESC LIMIT 1
+        )
+        LEFT JOIN transports t ON t.id=(
+            SELECT x.id FROM transports x
+            WHERE x.wz_id=w.id AND x.deleted_at IS NULL
+            ORDER BY x.id DESC LIMIT 1
+        )
+        LEFT JOIN drivers d ON d.id=t.driver_id
+        LEFT JOIN vehicles v ON v.id=t.vehicle_id
+        ORDER BY o.created_at DESC LIMIT 300
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    c.close()
+
+    counters = {key: 0 for key in allowed}
+    visible = []
+    for row in rows:
+        date_text = norm(row.get("delivery_date"))
+        try:
+            delivery_day = datetime.strptime(date_text, "%Y-%m-%d").date() if date_text else None
+        except ValueError:
+            delivery_day = None
+        transport_status = norm(row.get("transport_status"))
+        wz_status = norm(row.get("wz_status"))
+
+        if transport_status == "returned" or wz_status in {"returned", "ready_invoice", "invoiced"}:
+            bucket = "completed"
+            row["status_label"] = "Zrealizowane"
+        elif delivery_day == today:
+            bucket = "today"
+            row["status_label"] = {"in_transit": "W dostawie", "delivered": "WZ podpisane"}.get(
+                transport_status, "Do wydania dziś"
+            )
+        elif delivery_day == tomorrow:
+            bucket = "tomorrow"
+            row["status_label"] = "Do wydania jutro"
+        elif delivery_day and delivery_day > tomorrow:
+            bucket = "planned"
+            row["status_label"] = "Zaplanowane"
+        else:
+            bucket = "in_progress"
+            row["status_label"] = {
+                "in_transit": "W dostawie",
+                "delivered": "WZ podpisane",
+                "assigned": "Oczekuje na wyjazd",
+                "issued": "Oczekuje na wyjazd",
+            }.get(transport_status, "W trakcie realizacji")
+        row["bucket"] = bucket
+        row["delivery_label"] = delivery_day.strftime("%d.%m.%Y") if delivery_day else "Termin nieustalony"
+        row["transport_label"] = row.get("transport_no") or "Nieprzydzielony"
+        row["driver_label"] = " · ".join(x for x in (row.get("driver_name"), row.get("registration_no")) if x) or "—"
+        counters[bucket] += 1
+        if bucket != "completed":
+            counters["in_progress"] += 1
+
+        haystack = " ".join(str(row.get(k) or "") for k in ("order_no", "customer_name", "wz_no", "transport_no", "driver_name", "registration_no")).lower()
+        matches = not q or q.lower() in haystack
+        selected_match = bucket != "completed" if selected == "in_progress" else bucket == selected
+        if matches and selected_match:
+            visible.append(row)
+
+    labels = {
+        "in_progress": "W trakcie realizacji",
+        "planned": "Zaplanowane",
+        "today": "Do wydania dziś",
+        "tomorrow": "Do wydania jutro",
+        "completed": "Zrealizowane",
+    }
+    return render_template_string("""
+    {% extends 'base.html' %}
+    {% block content %}
+    <div class="card">
+      <div class="row between"><div><h1>Zamówienia</h1><p class="muted">Bieżąca lista realizacji i planowanych wydań.</p></div><a class="btn" href="{{ url_for('order_new') }}">+ Nowe zamówienie</a></div>
+      <div class="tabs" style="margin:18px 0">
+      {% for key, label in labels.items() %}
+        <a class="btn {% if selected == key %}primary{% endif %}" href="{{ url_for('orders', tab=key, q=q) }}">{{ label }} ({{ counters[key] }})</a>
+      {% endfor %}
+      </div>
+      <form method="get" class="row">
+        <input type="hidden" name="tab" value="{{ selected }}"><input name="q" value="{{ q }}" placeholder="Szukaj: klient, WZ, transport, kierowca">
+        <button class="btn primary">Szukaj</button><a class="btn" href="{{ url_for('orders', tab=selected) }}">Wyczyść</a>
+      </form>
+    </div>
+    <div class="card"><table><thead><tr><th>Zamówienie / klient</th><th>Termin dostawy</th><th>Status</th><th>WZ / transport</th><th>Kierowca / auto</th></tr></thead><tbody>
+    {% for row in rows %}<tr>
+      <td><a href="{{ url_for('order_view', order_id=row.id) }}"><b>{{ row.order_no }}</b></a><br><span class="muted">{{ row.customer_name }}</span></td>
+      <td>{{ row.delivery_label }}</td><td><span class="badge">{{ row.status_label }}</span></td>
+      <td>{% if row.wz_id %}<a href="{{ url_for('beton.wz_view', wz_id=row.wz_id) }}">{{ row.wz_no }}</a>{% else %}—{% endif %}<br><span class="muted">{{ row.transport_label }}</span></td>
+      <td>{{ row.driver_label }}</td>
+    </tr>{% else %}<tr><td colspan="5">Brak zamówień w wybranej kolejce.</td></tr>{% endfor %}
+    </tbody></table></div>
+    {% endblock %}
+    """, rows=visible, counters=counters, labels=labels, selected=selected, q=q)
+
 @app.get("/orders")
 def orders():
     maybe_pull_shared_from_supabase()
@@ -4909,6 +5024,7 @@ def orders():
     except Exception:
         pass
     q = norm(request.args.get("q"))
+    return render_orders_workboard(q)
     # Operational delivery board: orders are entered by staff, not by a client portal.
     # It uses the WZ and transport timeline as the source of truth.
     delivery_tab = norm(request.args.get("tab")) or "realization"
