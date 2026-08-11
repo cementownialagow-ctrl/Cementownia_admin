@@ -3243,13 +3243,90 @@ def admin_audit():
     # central database before displaying it, otherwise a redeploy shows an
     # empty journal despite the records existing in Supabase.
     maybe_pull_shared_from_supabase(force=True)
-    actor_filter = norm(request.args.get("actor")); path_filter = norm(request.args.get("path"))
-    sql = "SELECT * FROM audit_events WHERE 1=1"; params = []
-    if actor_filter: sql += " AND (actor_username LIKE ? OR actor_display_name LIKE ?)"; params += [f"%{actor_filter}%", f"%{actor_filter}%"]
-    if path_filter: sql += " AND path LIKE ?"; params.append(f"%{path_filter}%")
-    sql += " ORDER BY id DESC LIMIT 500"
-    c=conn(); rows=c.execute(sql,params).fetchall(); c.close()
-    return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Dziennik zmian</h1><div class="card"><form method="get" class="flex"><input name="actor" value="{{request.args.get('actor','')}}" placeholder="Osoba" style="max-width:260px"><input name="path" value="{{request.args.get('path','')}}" placeholder="Moduł / ścieżka" style="max-width:260px"><button class="btn">Filtruj</button></form></div><div class="card"><table><thead><tr><th>Czas</th><th>Kto</th><th>Akcja</th><th>Obiekt</th><th>Wynik</th><th>IP</th></tr></thead><tbody>{% for x in rows %}<tr><td>{{x.created_at}}</td><td><b>{{x.actor_display_name or x.actor_username}}</b><br><span class="muted">{{x.actor_role or x.actor_type}}</span></td><td>{{x.action}}<br><span class="muted">{{x.method}} {{x.path}}</span></td><td>{{x.entity_type or '—'}} {{x.entity_id or ''}}</td><td><span class="badge">HTTP {{x.response_status}}</span></td><td>{{x.ip_address or '—'}}</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',rows=rows,base_url=BASE_URL,db_path=DB_PATH)
+    q = norm(request.args.get("q")); actor_filter = norm(request.args.get("actor"))
+    c=conn()
+    sql="SELECT * FROM audit_events WHERE 1=1"; params=[]
+    if actor_filter:
+        sql += " AND (actor_username LIKE ? OR actor_display_name LIKE ?)"
+        params += [f"%{actor_filter}%",f"%{actor_filter}%"]
+    sql += " ORDER BY id DESC LIMIT 2000"
+    events=[dict(x) for x in c.execute(sql,params).fetchall()]
+    orders={str(x['id']):dict(x) for x in c.execute("SELECT id,order_no,customer_name,created_at FROM orders").fetchall()}
+    wz_rows=[dict(x) for x in c.execute("SELECT id,wz_no,order_id FROM wz_documents").fetchall()]
+    wz_by_id={str(x['id']):x for x in wz_rows}
+    transports=[dict(x) for x in c.execute("SELECT id,transport_no,wz_id FROM transports").fetchall()]
+    transport_by_id={str(x['id']):x for x in transports}
+    products={str(x['id']):dict(x) for x in c.execute("SELECT id,sku,name,model FROM products").fetchall()}
+    materials={str(x['id']):dict(x) for x in c.execute("SELECT id,name,unit FROM raw_materials").fetchall()}
+    c.close()
+
+    labels={
+      'order_create':'Utworzył zamówienie','order_item_add':'Dodał pozycję do zamówienia',
+      'order_item_update':'Zmienił ilość w zamówieniu','order_item_delete':'Usunął pozycję z zamówienia',
+      'beton.wz_issue':'Zatwierdził wydanie WZ z magazynu','beton.wz_revert':'Cofnął wydanie WZ i zwrócił materiały',
+      'beton.wz_ready':'Oznaczył WZ jako podpisane i gotowe do faktury','beton.wz_delete':'Usunął dokument WZ',
+      'beton.transport_new':'Przydzielił transport do WZ','dispatch.appointments':'Zapisał lub zmienił wydanie transportu',
+      'driver_api.driver_transport_status_api':'Kierowca zatwierdził etap transportu',
+      'driver_api.driver_photo_upload_api':'Kierowca dodał zdjęcie podpisanego WZ',
+      'order_invoice':'Wystawił fakturę do zamówienia','invoice_delete':'Usunął fakturę',
+      'product_recipe':'Dodał lub zmienił składnik receptury','product_recipe_item_delete':'Usunął składnik z receptury',
+      'raw_material_stock_add':'Dodał materiał na stan magazynowy',
+    }
+    status_labels={'closed':'zamknął załadunek','in_transit':'potwierdził wyjazd','delivered':'potwierdził dostawę i podpisanie WZ','returned':'potwierdził powrót pojazdu','problem':'zgłosił problem'}
+    enriched=[]
+    for event in events:
+        try: payload=json.loads(event.get('payload_json') or '{}')
+        except Exception: payload={}
+        ids=[]
+        if event.get('entity_id'): ids.append(str(event['entity_id']))
+        ids += re.findall(r'(?<!\d)\d{1,20}(?!\d)',event.get('path') or '')
+        for key in ('order_id','wz_id','transport_id'):
+            value=payload.get(key)
+            if isinstance(value,list): value=value[0] if value else None
+            if value: ids.append(str(value))
+        order=None; wz=None; transport=None; product=None; material=None
+        for object_id in ids:
+            if object_id in orders: order=orders[object_id]
+            if object_id in wz_by_id:
+                wz=wz_by_id[object_id]; order=orders.get(str(wz['order_id'])) or order
+            if object_id in transport_by_id:
+                transport=transport_by_id[object_id]; wz=wz_by_id.get(str(transport['wz_id'])) or wz
+                if wz: order=orders.get(str(wz['order_id'])) or order
+            if ('recipe' in (event.get('path') or '') or 'product_recipe' in (event.get('action') or '')) and object_id in products:
+                product=products[object_id]
+            if (event.get('path') or '').startswith('/warehouse/') and object_id in materials:
+                material=materials[object_id]
+        if not order and event.get('action')=='order_create':
+            customer_value=payload.get('customer_name') or payload.get('name') or ''
+            if isinstance(customer_value,list): customer_value=customer_value[0] if customer_value else ''
+            candidates=[x for x in orders.values() if customer_value and (x.get('customer_name') or '').strip().lower()==str(customer_value).strip().lower()]
+            if candidates:
+                order=min(candidates,key=lambda x:abs((datetime.fromisoformat(str(x['created_at']).replace('Z','+00:00')).replace(tzinfo=None)-datetime.fromisoformat(str(event['created_at']).replace('Z','+00:00')).replace(tzinfo=None)).total_seconds()))
+        action=labels.get(event.get('action'))
+        if not action:
+            action=(event.get('action') or 'Zmienił dane').split('.')[-1].replace('_',' ').capitalize()
+        raw_status=payload.get('status')
+        if isinstance(raw_status,list): raw_status=raw_status[0] if raw_status else ''
+        if raw_status in status_labels: action=f"Kierowca {status_labels[raw_status]}"
+        event['action_label']=action
+        event['success']=int(event.get('response_status') or 0)<400
+        event['result_label']='Zapisano' if event['success'] else 'Nie zapisano – błąd'
+        event['order']=order; event['wz']=wz; event['transport']=transport; event['product']=product; event['material']=material
+        product_label=((product.get('name') or product.get('model') or product.get('sku')) if product else '')
+        material_label=(material.get('name') if material else '')
+        event['object_label']=' · '.join(x for x in [order.get('order_no') if order else '',wz.get('wz_no') if wz else '',transport.get('transport_no') if transport else '',product_label,material_label] if x) or 'Operacja systemowa'
+        qty=payload.get('qty') or payload.get('qty_per_unit')
+        if isinstance(qty,list): qty=qty[0] if qty else ''
+        event['detail_label']=(f"Dodano: {qty} {material.get('unit') or ''}" if material and qty else '')
+        haystack=' '.join(str(x or '') for x in [event.get('actor_username'),event.get('actor_display_name'),event['action_label'],event.get('path'),event['object_label'],order.get('customer_name') if order else '',json.dumps(payload,ensure_ascii=False)]).lower()
+        if not q or q.lower() in haystack: enriched.append(event)
+    # Przy wyszukiwaniu zamówienia pokazujemy jego przebieg od początku do końca.
+    if q: enriched.reverse()
+    return render_template_string(r'''{% extends "base.html" %}{% block content %}
+      <h1>Dziennik zmian</h1>
+      <div class="card"><form method="get" class="grid3"><input name="q" value="{{q}}" placeholder="Szukaj: nr zamówienia, WZ, transport, klient"><input name="actor" value="{{actor}}" placeholder="Osoba"><button class="btn primary">Szukaj</button></form>{% if q %}<div class="muted" style="margin-top:10px">Historia dla: <b>{{q}}</b> · od najstarszej czynności do najnowszej</div>{% endif %}</div>
+      <div class="card"><table><thead><tr><th>Czas</th><th>Kto podpisał</th><th>Co zrobił</th><th>Zamówienie / produkt / materiał</th><th>Wynik</th></tr></thead><tbody>{% for x in rows %}<tr><td>{{x.created_at}}</td><td><b>{{x.actor_display_name or x.actor_username}}</b><br><span class="muted">{{'kierowca' if x.actor_type=='driver' else (x.actor_role or 'pracownik')}}</span></td><td><b>{{x.action_label}}</b>{% if x.detail_label %}<br><span class="muted">{{x.detail_label}}</span>{% endif %}{% if not x.success %}<br><span style="color:#b9384c">Operacja nie została zatwierdzona</span>{% endif %}</td><td>{% if x.order %}<a href="{{url_for('order_view',order_id=x.order.id)}}"><b>{{x.order.order_no}}</b></a><br><span class="muted">{{x.order.customer_name}}</span>{% elif x.product %}<a href="{{url_for('product_recipe',product_id=x.product.id)}}"><b>{{x.product.name or x.product.model or x.product.sku}}</b></a><br><span class="muted">SKU: {{x.product.sku}}</span>{% elif x.material %}<b>{{x.material.name}}</b><br><span class="muted">Magazyn surowców</span>{% else %}{{x.object_label}}{% endif %}{% if x.wz %}<br><a href="{{url_for('beton.wz_view',wz_id=x.wz.id)}}">{{x.wz.wz_no}}</a>{% endif %}{% if x.transport %}<br><a href="{{url_for('beton.transport_view',transport_id=x.transport.id)}}">{{x.transport.transport_no}}</a>{% endif %}</td><td><span class="badge {{'st-confirmed' if x.success else 'st-unconfirmed'}}">{{x.result_label}}</span></td></tr>{% else %}<tr><td colspan="5" class="muted">Nie znaleziono czynności. Wyszukaj zamówienie, produkt, materiał, WZ, transport, klienta albo osobę.</td></tr>{% endfor %}</tbody></table></div>
+    {% endblock %}''',rows=enriched,q=q,actor=actor_filter,base_url=BASE_URL,db_path=DB_PATH)
 
 
 @app.route("/admin/test-data", methods=["GET", "POST"])
@@ -4164,6 +4241,22 @@ def write_audit_event(response):
         parts = [p for p in request.path.split("/") if p]
         entity_type = parts[0] if parts else "application"
         entity_id = next((p for p in reversed(parts) if p.isdigit()), None)
+        # Przy tworzeniu obiektu jego ID często pojawia się dopiero w adresie
+        # przekierowania. Zapisujemy je, aby dziennik dało się połączyć z
+        # zamówieniem, WZ i transportem bez czytania technicznej ścieżki.
+        if not entity_id and response.headers.get("Location"):
+            location_ids = re.findall(r'(?<!\d)\d{1,20}(?!\d)', response.headers.get("Location") or "")
+            if location_ids:
+                entity_id = location_ids[-1]
+        endpoint = request.endpoint or ""
+        if endpoint.startswith("beton.wz") or "/wz/" in request.path:
+            entity_type = "wz"
+        elif endpoint.startswith("beton.transport") or "transport" in endpoint:
+            entity_type = "transport"
+        elif endpoint.startswith("order") or request.path.startswith("/orders"):
+            entity_type = "order"
+        elif endpoint.startswith("invoice"):
+            entity_type = "invoice"
         event_id = cloud_row_id()
         c = conn()
         c.execute("""INSERT INTO audit_events(id,request_id,actor_type,actor_id,actor_username,actor_display_name,
