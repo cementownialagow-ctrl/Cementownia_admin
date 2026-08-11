@@ -105,11 +105,11 @@ def appointments():
                 return 'Wybierz dokument WZ, z którego ma powstać transport.', 400
             if not planned_departure_time:
                 return 'Podaj planowaną godzinę wyjazdu.', 400
+            try:
+                planned_departure = datetime.fromisoformat(f"{planned_date}T{planned_departure_time}")
+            except ValueError:
+                return 'Podaj prawidłową datę i godzinę wyjazdu.', 400
             if driver_id:
-                try:
-                    planned_departure = datetime.fromisoformat(f"{planned_date}T{planned_departure_time}")
-                except ValueError:
-                    return 'Podaj prawidłową datę i godzinę wyjazdu.', 400
                 driver_conflicts = c.execute("""SELECT a.planned_date,a.time_from,o.order_no
                     FROM dispatch_appointments a
                     JOIN orders o ON o.id=a.order_id
@@ -123,6 +123,20 @@ def appointments():
                     if abs((planned_departure - other_departure).total_seconds()) < 2 * 60 * 60:
                         return (f"Kierowca ma już kurs {conflict['order_no']} o {conflict['time_from']}. "
                                 "Między planowanymi wyjazdami muszą być co najmniej 2 godziny.", 409)
+            if vehicle_id:
+                vehicle_conflicts = c.execute("""SELECT a.planned_date,a.time_from,o.order_no
+                    FROM dispatch_appointments a
+                    JOIN orders o ON o.id=a.order_id
+                    WHERE a.vehicle_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''""",
+                    (vehicle_id,)).fetchall()
+                for conflict in vehicle_conflicts:
+                    try:
+                        other_departure = datetime.fromisoformat(f"{conflict['planned_date']}T{conflict['time_from']}")
+                    except (TypeError, ValueError):
+                        continue
+                    if abs((planned_departure - other_departure).total_seconds()) < 2 * 60 * 60:
+                        return (f"Auto ma już kurs {conflict['order_no']} o {conflict['time_from']}. "
+                                "Między planowanymi wyjazdami tego samego auta muszą być co najmniej 2 godziny.", 409)
             if not transport_id and (not driver_id or not vehicle_id):
                 return 'Aby utworzyć transport z WZ, wybierz kierowcę i auto.', 400
             # Jedna awizacja z wybranym WZ, kierowcą i autem od razu tworzy kurs.
@@ -215,10 +229,13 @@ def appointments():
         driver_busy = [dict(x) for x in c.execute("""SELECT a.driver_id,a.planned_date,a.time_from,o.order_no
           FROM dispatch_appointments a JOIN orders o ON o.id=a.order_id
           WHERE a.driver_id IS NOT NULL AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''""").fetchall()]
+        vehicle_busy = [dict(x) for x in c.execute("""SELECT a.vehicle_id,a.planned_date,a.time_from,o.order_no
+          FROM dispatch_appointments a JOIN orders o ON o.id=a.order_id
+          WHERE a.vehicle_id IS NOT NULL AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''""").fetchall()]
         vehicles = c.execute("SELECT id,registration_no FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no").fetchall()
         bays = c.execute("SELECT * FROM loading_bays WHERE active=1 ORDER BY code").fetchall()
     dispatch_tpl = TPL.replace('<label>Istniejący transport (opcjonalnie)</label>', '<label>Ilość na nowy transport [m³]</label><input type="number" name="transport_qty" min="0.01" max="8" step="0.01" value="8" required><label>Istniejący transport (opcjonalnie)</label>')
-    return render_template_string(dispatch_tpl, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, driver_busy=driver_busy, vehicles=vehicles, bays=bays, day=day, labels=STAGE_LABEL, capacity_notice=request.args.get("capacity_notice", ""), title="Wydaj transport", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
+    return render_template_string(dispatch_tpl, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, driver_busy=driver_busy, vehicles=vehicles, vehicle_busy=vehicle_busy, bays=bays, day=day, labels=STAGE_LABEL, capacity_notice=request.args.get("capacity_notice", ""), title="Wydaj transport", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
 
 @bp.post("/appointments/<int:appointment_id>/status")
 def appointment_status(appointment_id):
@@ -284,12 +301,18 @@ TPL = '''{% extends "base.html" %}{% block content %}
 <script>
 (() => {
   const busy = {{ driver_busy|tojson }};
+  const vehicleBusy = {{ vehicle_busy|tojson }};
   const order = document.querySelector('select[name="order_id"]');
   const wz = document.querySelector('select[name="wz_id"]');
   const departure = document.querySelector('input[name="time_from"]');
   const driver = document.querySelector('select[name="driver_id"]');
+  const vehicle = document.querySelector('select[name="vehicle_id"]');
   const note = document.getElementById('driver-availability-note');
-  if (!order || !wz || !departure || !driver) return;
+  if (!order || !wz || !departure || !driver || !vehicle) return;
+  const vehicleNote = document.createElement('small');
+  vehicleNote.className = 'muted';
+  vehicleNote.textContent = 'Wybierz godzinę, aby sprawdzić dostępność.';
+  vehicle.insertAdjacentElement('afterend', vehicleNote);
   const refreshWz = () => {
     const orderId = order.value;
     let available = 0;
@@ -324,6 +347,18 @@ TPL = '''{% extends "base.html" %}{% block content %}
     });
     if (driver.selectedOptions[0] && driver.selectedOptions[0].disabled) driver.value = '';
     note.textContent = value ? `Niedostępni kierowcy: ${blocked}. Obowiązuje odstęp minimum 2 godziny.` : 'Wybierz godzinę, aby sprawdzić dostępność.';
+    let blockedVehicles = 0;
+    [...vehicle.options].forEach((item, index) => {
+      if (!index) return;
+      if (!item.dataset.label) item.dataset.label = item.textContent;
+      const clashes = value && vehicleBusy.filter(x => String(x.vehicle_id) === item.value &&
+        Math.abs(new Date(`${date}T${value}`).getTime() - new Date(`${x.planned_date}T${x.time_from}`).getTime()) < 7200000);
+      item.disabled = Boolean(clashes && clashes.length);
+      item.textContent = item.dataset.label + (item.disabled ? ` — zajęte (${clashes[0].time_from})` : '');
+      if (item.disabled) blockedVehicles++;
+    });
+    if (vehicle.selectedOptions[0] && vehicle.selectedOptions[0].disabled) vehicle.value = '';
+    vehicleNote.textContent = value ? `Niedostępne auta: ${blockedVehicles}. Obowiązuje odstęp minimum 2 godziny.` : 'Wybierz godzinę, aby sprawdzić dostępność.';
   };
   order.addEventListener('change', () => { refreshWz(); refresh(); });
   departure.addEventListener('change', refresh);
