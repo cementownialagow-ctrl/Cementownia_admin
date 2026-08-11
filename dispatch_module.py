@@ -74,21 +74,38 @@ def appointments():
             driver_id = int(request.form.get("driver_id") or 0)
             vehicle_id = int(request.form.get("vehicle_id") or 0)
             transport_id = int(request.form.get("transport_id") or 0)
+            if not wz_id:
+                return 'Wybierz wydany dokument WZ dla tego kursu.', 400
             # Jedna awizacja z wybranym WZ, kierowcą i autem od razu tworzy kurs.
             # Dzięki temu kierowca widzi go natychmiast w swoim panelu.
             if not transport_id and wz_id and driver_id and vehicle_id:
-                existing = c.execute("SELECT id FROM transports WHERE wz_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", (wz_id,)).fetchone()
-                if existing:
-                    transport_id = int(existing["id"])
-                else:
+                try:
+                    transport_qty=float((request.form.get("transport_qty") or "").replace(",", "."))
+                except ValueError:
+                    transport_qty=0
+                if transport_qty <= 0 or transport_qty > 8:
+                    return 'Podaj ilość tego kursu od 0,01 do 8 m³.', 400
+                remaining_rows=c.execute('''SELECT wi.*,COALESCE((SELECT SUM(ti.qty) FROM transport_items ti
+                    JOIN transports t ON t.id=ti.transport_id WHERE ti.wz_item_id=wi.id AND t.deleted_at IS NULL),0) assigned
+                    FROM wz_items wi WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()
+                remaining_total=sum(max(0.0,float((x['qty_issued'] if x['qty_issued'] is not None else x['qty_planned']) or 0)-float(x['assigned'] or 0)) for x in remaining_rows)
+                if transport_qty > remaining_total + 0.00001:
+                    return f'Pozostało tylko {remaining_total:g} m³ do przydzielenia.', 400
+                if remaining_total > 0:
                     year = now[:4]
                     number = c.execute("SELECT COUNT(*) FROM transports WHERE transport_no LIKE ?", (f"TR/{year}/%",)).fetchone()[0] + 1
                     transport_no = f"TR/{year}/{number:05d}"
                     transport_id = _cloud_id()
                     c.execute("""INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at)
                         VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)""", (transport_id, transport_no, wz_id, driver_id, vehicle_id, request.form.get("destination", "").strip(), _actor(), _actor(), now, now))
-                    for item in c.execute("SELECT id,qty_issued,qty_planned FROM wz_items WHERE wz_id=?", (wz_id,)).fetchall():
-                        c.execute("INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)", (_cloud_id(), transport_id, item["id"], item["qty_issued"] or item["qty_planned"], now))
+                    left=transport_qty
+                    for item in remaining_rows:
+                        if left <= 0.00001: break
+                        issued=float((item['qty_issued'] if item['qty_issued'] is not None else item['qty_planned']) or 0)
+                        qty=min(max(0.0, issued-float(item['assigned'] or 0)),left)
+                        if qty > 0.00001:
+                            c.execute("INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)", (_cloud_id(), transport_id, item["id"], qty, now))
+                            left-=qty
             position = c.execute("SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?", (planned_date,)).fetchone()[0]
             c.execute("""INSERT INTO dispatch_appointments(appointment_no,order_id,wz_id,transport_id,driver_id,vehicle_id,loading_bay_id,planned_date,time_from,time_to,shift,queue_position,status,notes,created_by,updated_by,created_at,updated_at)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'planned',?,?,?,?,?)""", (_number(c), order_id, wz_id or None, transport_id or None, driver_id or None, vehicle_id or None, request.form.get("loading_bay_id") or None, planned_date, request.form.get("time_from") or None, planned_delivery_time or None, request.form.get("shift") or None, position, request.form.get("notes", "").strip(), _actor(), _actor(), now, now))
@@ -144,16 +161,16 @@ def appointments():
               SELECT 1 FROM dispatch_appointments a
               WHERE a.wz_id=w.id AND a.status NOT IN ('departed','cancelled')
             )
-            AND NOT EXISTS (
-              SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL
-                AND t.status NOT IN ('returned','closed')
-            )
+            AND COALESCE((SELECT SUM(wi.qty_issued) FROM wz_items wi WHERE wi.wz_id=w.id),0) >
+                COALESCE((SELECT SUM(ti.qty) FROM transport_items ti JOIN transports t ON t.id=ti.transport_id
+                  WHERE t.wz_id=w.id AND t.deleted_at IS NULL),0)
           ORDER BY w.id DESC LIMIT 300""").fetchall()
         transports = c.execute("SELECT id,transport_no FROM transports WHERE deleted_at IS NULL AND status NOT IN ('returned','closed') ORDER BY id DESC LIMIT 300").fetchall()
         drivers = c.execute("SELECT id,name FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name").fetchall()
         vehicles = c.execute("SELECT id,registration_no FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no").fetchall()
         bays = c.execute("SELECT * FROM loading_bays WHERE active=1 ORDER BY code").fetchall()
-    return render_template_string(TPL, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, vehicles=vehicles, bays=bays, day=day, labels=STAGE_LABEL, capacity_notice=request.args.get("capacity_notice", ""), title="Wydaj transport", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
+    dispatch_tpl = TPL.replace('<label>Transport</label>', '<label>Ilość na ten transport [m³]</label><input type="number" name="transport_qty" min="0.01" max="8" step="0.01" value="8" required><label>Transport</label>')
+    return render_template_string(dispatch_tpl, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, vehicles=vehicles, bays=bays, day=day, labels=STAGE_LABEL, capacity_notice=request.args.get("capacity_notice", ""), title="Wydaj transport", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
 
 @bp.post("/appointments/<int:appointment_id>/status")
 def appointment_status(appointment_id):
