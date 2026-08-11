@@ -23,6 +23,12 @@ TRANSPORT_STAGE_LABEL = {
     "closed": "Na miejscu", "delivered": "WZ podpisane", "returned": "Wrócił na bazę", "problem": "Problem",
 }
 
+# Uproszczony obieg: dyspozytor wystawia wyjazd, kierowca obsługuje dopiero dostawę.
+STAGES = [("waiting", "Oczekuje"), ("departed", "Wyjechał"),
+          ("cancelled", "Anulowana"), ("problem", "Problem")]
+STAGE_LABEL = dict(STAGES)
+TRANSPORT_STAGE_LABEL.update({"assigned": "Oczekuje", "issued": "Oczekuje", "in_transit": "Wyjechał"})
+
 def _now(): return D["now_iso"]()
 def _actor(): return session.get("display_name") or session.get("username") or "pracownik"
 def _cloud_id(): return int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
@@ -108,7 +114,7 @@ def appointments():
                             left-=qty
             position = c.execute("SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?", (planned_date,)).fetchone()[0]
             c.execute("""INSERT INTO dispatch_appointments(appointment_no,order_id,wz_id,transport_id,driver_id,vehicle_id,loading_bay_id,planned_date,time_from,time_to,shift,queue_position,status,notes,created_by,updated_by,created_at,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'planned',?,?,?,?,?)""", (_number(c), order_id, wz_id or None, transport_id or None, driver_id or None, vehicle_id or None, request.form.get("loading_bay_id") or None, planned_date, request.form.get("time_from") or None, planned_delivery_time or None, request.form.get("shift") or None, position, request.form.get("notes", "").strip(), _actor(), _actor(), now, now))
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'waiting',?,?,?,?,?)""", (_number(c), order_id, wz_id or None, transport_id or None, driver_id or None, vehicle_id or None, request.form.get("loading_bay_id") or None, planned_date, request.form.get("time_from") or None, planned_delivery_time or None, request.form.get("shift") or None, position, request.form.get("notes", "").strip(), _actor(), _actor(), now, now))
             c.commit()
             if transport_id:
                 D['sync_local_rows_to_supabase']('transports','id',[transport_id])
@@ -185,7 +191,18 @@ def appointment_status(appointment_id):
         if target in {"problem", "cancelled"} and not reason: return "Podaj powód problemu lub anulowania.", 400
         now = _now()
         c.execute("UPDATE dispatch_appointments SET status=?,problem_reason=?,updated_by=?,updated_at=? WHERE id=?", (target, reason or None, _actor(), now, appointment_id))
+        if target == 'departed' and row['transport_id']:
+            # Wyjazd jest zatwierdzany przez dyspozytora, nie przez kierowcę.
+            c.execute("UPDATE transports SET status='in_transit',departed_at=?,updated_by=?,updated_at=? WHERE id=? AND status IN ('assigned','issued')", (now, _actor(), now, row['transport_id']))
+            c.execute("UPDATE wz_documents SET status='in_transport' WHERE id=? AND status='issued'", (row['wz_id'],))
         c.execute("INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)", (appointment_id,row["status"],target,reason,_actor(),now))
+        transport_id=row['transport_id']; wz_id=row['wz_id']
+    # Najpierw zapisujemy sam etap awizacji. Dzięki temu po odświeżeniu
+    # kierowca i panel główny widzą dokładnie ten sam stan.
+    D['sync_local_rows_to_supabase']('dispatch_appointments','id',[appointment_id])
+    if target == 'departed' and transport_id:
+        D['sync_local_rows_to_supabase']('transports','id',[transport_id])
+        if wz_id: D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
     return redirect(url_for("dispatch.appointments", day=request.form.get("day") or _now()[:10]))
 
 @bp.post("/appointments/<int:appointment_id>/move")
