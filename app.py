@@ -3316,7 +3316,7 @@ def home():
 
       <div class="dashboard-head">
         <div><h1>Pulpit</h1><div class="muted">Dzisiejszy obraz realizacji zamówień i dostaw.</div></div>
-        <form class="search-shell" action="{{ url_for('orders') }}"><input name="q" placeholder="Szukaj zamówień, produktów, klientów..."></form>
+        <form class="search-shell" action="{{ url_for('document_search') }}"><input name="q" placeholder="Szukaj: klient, WZ, transport, faktura..."></form>
         <a class="btn primary" href="{{ url_for('order_new') }}">＋ Nowe zamówienie</a>
       </div>
 
@@ -3351,6 +3351,120 @@ def home():
                                   status_delivery=status_delivery, status_signed=status_signed, status_done=status_done,
                                   status_invoice=status_invoice, status_total=status_total,
                                   status_divisor=status_divisor)
+
+
+@app.get("/documents/search")
+def document_search():
+    """Jedno miejsce do szybkiego odszukania pełnej historii klienta/dokumentu."""
+    maybe_pull_shared_from_supabase()
+    q = norm(request.args.get("q"))
+    needle = f"%{q.lower()}%"
+    orders_rows = []
+    wz_rows = []
+    transport_rows = []
+    invoice_rows = []
+
+    if q:
+        c = conn()
+        cur = c.cursor()
+        order_where = """
+            LOWER(COALESCE(o.order_no,'')) LIKE ? OR
+            LOWER(COALESCE(o.customer_name,'')) LIKE ? OR
+            LOWER(COALESCE(o.customer_phone,'')) LIKE ? OR
+            LOWER(COALESCE(o.customer_email,'')) LIKE ? OR
+            LOWER(COALESCE(o.customer_address,'')) LIKE ?
+        """
+        order_params = [needle] * 5
+        cur.execute(f"""
+            SELECT o.id,o.order_no,o.created_at,o.customer_name,o.customer_address,o.delivery_date
+            FROM orders o WHERE {order_where}
+            ORDER BY o.id DESC LIMIT 100
+        """, order_params)
+        orders_rows = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(f"""
+            SELECT w.id,w.wz_no,w.status,w.created_at,w.order_id,
+                   o.order_no,o.customer_name,
+                   t.id AS transport_id,t.transport_no,t.status AS transport_status
+            FROM wz_documents w
+            JOIN orders o ON o.id=w.order_id
+            LEFT JOIN transports t ON t.wz_id=w.id AND t.deleted_at IS NULL
+            WHERE w.deleted_at IS NULL AND (
+                LOWER(COALESCE(w.wz_no,'')) LIKE ? OR {order_where}
+            )
+            ORDER BY w.id DESC LIMIT 100
+        """, [needle] + order_params)
+        wz_rows = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(f"""
+            SELECT t.id,t.transport_no,t.status,t.created_at,
+                   w.id AS wz_id,w.wz_no,w.order_id,o.order_no,o.customer_name,
+                   d.name AS driver_name,v.registration_no
+            FROM transports t
+            JOIN wz_documents w ON w.id=t.wz_id
+            JOIN orders o ON o.id=w.order_id
+            LEFT JOIN drivers d ON d.id=t.driver_id
+            LEFT JOIN vehicles v ON v.id=t.vehicle_id
+            WHERE t.deleted_at IS NULL AND w.deleted_at IS NULL AND (
+                LOWER(COALESCE(t.transport_no,'')) LIKE ? OR
+                LOWER(COALESCE(d.name,'')) LIKE ? OR
+                LOWER(COALESCE(v.registration_no,'')) LIKE ? OR
+                LOWER(COALESCE(w.wz_no,'')) LIKE ? OR {order_where}
+            )
+            ORDER BY t.id DESC LIMIT 100
+        """, [needle, needle, needle, needle] + order_params)
+        transport_rows = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(f"""
+            SELECT i.id,i.invoice_no,i.issue_date,i.total_net,i.total_gross,i.order_id,
+                   o.order_no,o.customer_name
+            FROM invoices i
+            LEFT JOIN orders o ON o.id=i.order_id
+            WHERE LOWER(COALESCE(i.invoice_no,'')) LIKE ? OR
+                  LOWER(COALESCE(i.buyer_name,'')) LIKE ? OR {order_where}
+            ORDER BY i.id DESC LIMIT 100
+        """, [needle, needle] + order_params)
+        invoice_rows = [dict(row) for row in cur.fetchall()]
+        c.close()
+
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <h1>Wyszukiwanie dokumentów</h1>
+        <div class="muted">Wpisz nazwisko klienta, symbol WZ, numer transportu, numer faktury albo numer zamówienia.</div>
+        <form class="flex" style="margin-top:16px" method="get">
+          <input name="q" value="{{ q }}" autofocus placeholder="np. Kowalski, WZ/2026/00012, TR/2026/00003" style="min-width:320px;flex:1">
+          <button class="btn primary" type="submit">Szukaj</button>
+        </form>
+      </div>
+      {% if q %}
+        <div class="card"><h2>Zamówienia ({{ orders|length }})</h2>
+          {% if orders %}<table><thead><tr><th>Zamówienie</th><th>Klient</th><th>Adres dostawy</th><th>Termin</th></tr></thead><tbody>
+          {% for row in orders %}<tr><td><a href="{{ url_for('order_view',order_id=row.id) }}"><b>{{ row.order_no or ('ZAM-' ~ row.id) }}</b></a></td><td>{{ row.customer_name or '-' }}</td><td>{{ row.customer_address or '-' }}</td><td>{{ row.delivery_date or '-' }}</td></tr>{% endfor %}
+          </tbody></table>{% else %}<div class="muted">Brak zamówień.</div>{% endif %}
+        </div>
+        <div class="card"><h2>Podpisane / wystawione WZ ({{ wz_documents|length }})</h2>
+          {% if wz_documents %}<table><thead><tr><th>WZ</th><th>Klient</th><th>Stan</th><th>Transport</th><th>Zamówienie</th></tr></thead><tbody>
+          {% for row in wz_documents %}<tr><td><a href="{{ url_for('beton.wz_view',wz_id=row.id) }}"><b>{{ row.wz_no }}</b></a></td><td>{{ row.customer_name or '-' }}</td><td><span class="badge">{{ row.status }}</span></td><td>{% if row.transport_id %}<a href="{{ url_for('beton.transport_view',transport_id=row.transport_id) }}">{{ row.transport_no }}</a>{% else %}-{% endif %}</td><td><a href="{{ url_for('order_view',order_id=row.order_id) }}">{{ row.order_no or row.order_id }}</a></td></tr>{% endfor %}
+          </tbody></table>{% else %}<div class="muted">Brak dokumentów WZ.</div>{% endif %}
+        </div>
+        <div class="card"><h2>Transporty ({{ transports|length }})</h2>
+          {% if transports %}<table><thead><tr><th>Transport</th><th>Kierowca / auto</th><th>Stan</th><th>WZ</th><th>Klient</th></tr></thead><tbody>
+          {% for row in transports %}<tr><td><a href="{{ url_for('beton.transport_view',transport_id=row.id) }}"><b>{{ row.transport_no }}</b></a></td><td>{{ row.driver_name or '-' }}{% if row.registration_no %}<div class="muted small">{{ row.registration_no }}</div>{% endif %}</td><td><span class="badge">{{ row.status }}</span></td><td><a href="{{ url_for('beton.wz_view',wz_id=row.wz_id) }}">{{ row.wz_no }}</a></td><td><a href="{{ url_for('order_view',order_id=row.order_id) }}">{{ row.customer_name or row.order_no }}</a></td></tr>{% endfor %}
+          </tbody></table>{% else %}<div class="muted">Brak transportów.</div>{% endif %}
+        </div>
+        <div class="card"><h2>Faktury ({{ invoices|length }})</h2>
+          {% if invoices %}<table><thead><tr><th>Faktura</th><th>Klient</th><th>Data</th><th>Netto</th><th>Brutto</th><th>Zamówienie</th></tr></thead><tbody>
+          {% for row in invoices %}<tr><td><a href="{{ url_for('invoice_download_admin',invoice_id=row.id) }}" target="_blank"><b>{{ row.invoice_no }}</b></a></td><td>{{ row.customer_name or '-' }}</td><td>{{ row.issue_date }}</td><td>{{ '%.2f'|format(row.total_net or 0) }} zł</td><td>{{ '%.2f'|format(row.total_gross or 0) }} zł</td><td><a href="{{ url_for('order_view',order_id=row.order_id) }}">{{ row.order_no or row.order_id }}</a></td></tr>{% endfor %}
+          </tbody></table>{% else %}<div class="muted">Brak faktur.</div>{% endif %}
+        </div>
+      {% elif request.args %}<div class="card"><div class="muted">Wpisz frazę do wyszukania.</div></div>{% endif %}
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Wyszukiwanie dokumentów", base_url=BASE_URL, db_path=DB_PATH,
+                                  q=q, orders=orders_rows, wz_documents=wz_rows,
+                                  transports=transport_rows, invoices=invoice_rows)
 
 
 @app.get("/searches")
@@ -5709,6 +5823,15 @@ def order_view(order_id):
       ORDER BY w.id DESC
     """, (order_id,))
     wz_documents = [dict(r) for r in cur.fetchall()]
+    cur.execute("""
+      SELECT i.id,i.invoice_no,i.issue_date,i.total_net,i.total_gross,
+             COALESCE(m.paid,0) AS paid
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+      WHERE i.order_id=?
+      ORDER BY i.id DESC
+    """, (order_id,))
+    order_invoices = [dict(r) for r in cur.fetchall()]
     c.close()
 
     order_url = build_public_url(url_for("order_view", order_id=order_id))
@@ -5772,6 +5895,13 @@ def order_view(order_id):
         {% else %}
           <div class="muted">Nie ma jeszcze dokumentu WZ dla tego zamówienia.</div>
         {% endif %}
+        <div class="line"></div>
+        <h3>Faktury powiązane z zamówieniem</h3>
+        {% if order_invoices %}
+        <table><thead><tr><th>Faktura</th><th>Data</th><th>Netto</th><th>Brutto</th><th>Płatność</th><th>Dokument</th></tr></thead><tbody>
+          {% for inv in order_invoices %}<tr><td><b>{{ inv.invoice_no }}</b></td><td>{{ inv.issue_date }}</td><td>{{ "%.2f"|format(inv.total_net or 0) }} zł</td><td>{{ "%.2f"|format(inv.total_gross or 0) }} zł</td><td><span class="badge">{{ 'Opłacona' if inv.paid else 'Nieopłacona' }}</span></td><td><a class="btn" target="_blank" href="{{ url_for('invoice_download_admin',invoice_id=inv.id) }}">Pobierz fakturę</a></td></tr>{% endfor %}
+        </tbody></table>
+        {% else %}<div class="muted">Nie wystawiono jeszcze faktury dla tego zamówienia.</div>{% endif %}
       </div>
 
       <div class="row">
@@ -5892,7 +6022,7 @@ def order_view(order_id):
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, wz_documents=wz_documents, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+    return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, wz_documents=wz_documents, order_invoices=order_invoices, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 
 @app.post("/orders/<int:order_id>/confirmation/resend")
