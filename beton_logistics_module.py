@@ -483,6 +483,12 @@ def build_wz_form_pdf(w,items,courses,technology,company):
                 if 'WZForm' not in pdfmetrics.getRegisteredFontNames(): pdfmetrics.registerFont(TTFont('WZForm',path))
                 font=bold='WZForm'; break
             except Exception: pass
+    for path in (r'C:\Windows\Fonts\arialbd.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'):
+        if os.path.exists(path):
+            try:
+                if 'WZFormBold' not in pdfmetrics.getRegisteredFontNames(): pdfmetrics.registerFont(TTFont('WZFormBold',path))
+                bold='WZFormBold'; break
+            except Exception: pass
     out=io.BytesIO(); p=canvas.Canvas(out,pagesize=A4); W,H=A4
     left=10*mm; right=W-10*mm; width=right-left; top=H-10*mm
     p.setLineWidth(.6)
@@ -555,8 +561,20 @@ def build_wz_form_pdf(w,items,courses,technology,company):
     text(left+3*mm,tech_y-15*mm,'Włókna:',7,True); wrapped(left+38*mm,tech_y-15*mm,tech.get('fibres') or '—',75,7,max_lines=2)
     text(left+3*mm,tech_y-24*mm,'Inne dodatki:',7,True); wrapped(left+38*mm,tech_y-24*mm,tech.get('other_additions') or w.get('notes') or '—',75,7,max_lines=2)
     # Ostrzeżenie i podpisy
-    warning_h=22*mm; warning_y=notes_y-warning_h; rect(left,warning_y,width,warning_h)
-    wrapped(left+3*mm,notes_y-5*mm,'Dodanie wody lub innych składników na żądanie odbiorcy może zmienić właściwości mieszanki. Zdarzenie musi być odnotowane na dokumencie dostawy.',125,6.5,max_lines=3)
+    warning_h=32*mm; warning_y=notes_y-warning_h; rect(left,warning_y,width,warning_h)
+    wz_notes=(
+        'Uwagi: Mieszankę betonową należy układać, zagęszczać i pielęgnować zgodnie z PN-EN 206-1 '
+        'lub innymi normami związanymi. Dostawa następuje zgodnie z ogólnymi warunkami sprzedaży, '
+        'tzw. OWS mieszanki budowlanej naszej firmy. Prosimy o zwrócenie uwagi, iż w przypadku dodania '
+        'wody do mieszanki na żądanie odbiorcy gwarancja producenta ulega unieważnieniu. Właściwie '
+        'podpisana WZ stanowi potwierdzenie masy i zawartości wyprodukowanych oraz dostarczonych wyrobów. '
+        'Administratorem danych osobowych jest CONTROL Kamil Gidka (NIP: 657-260-20-16, '
+        'REGON: 260323983), więcej informacji na stronie producenta lub w siedzibie firmy.'
+    )
+    wrapped(left+3*mm,notes_y-4*mm,wz_notes,150,5.2,3.2*mm,max_lines=6)
+    centered(left+3*mm,warning_y+3*mm,width-6*mm,
+        'PO FAKTURĘ LUB PARAGON NALEŻY ZGŁOSIĆ DO BIURA BETONIARNI DO KOŃCA MIESIĄCA, W KTÓRYM ODBYŁA SIĘ SPRZEDAŻ.',
+        5.4,True)
     sig_y=warning_y-25*mm
     labels=('Operator betoniarni','Kierowca','Odbiorca / czytelny podpis')
     for idx,label in enumerate(labels):
