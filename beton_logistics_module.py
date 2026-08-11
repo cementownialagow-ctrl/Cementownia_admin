@@ -118,8 +118,10 @@ def register_beton_logistics(app,deps):
 
 def stamp(): return D['now_iso']()
 def actor(): return session.get('display_name') or session.get('username') or 'kierowca'
-TRANSPORT_STATUS_PL={'assigned':'Przypisany','issued':'Wydany','departed':'Wyjechał','in_transit':'W drodze','on_site':'Na miejscu','delivered':'Dostarczony','returned':'Powrót do bazy','closed':'Zakończony','cancelled':'Anulowany'}
+TRANSPORT_STATUS_PL={'assigned':'Oczekuje na zgodę administratora','issued':'Zezwolono na start','departed':'Wyjechał','in_transit':'W drodze','on_site':'Na miejscu','delivered':'Dostarczony','returned':'Powrót do bazy','closed':'Zakończony','cancelled':'Anulowany'}
 def transport_status_pl(value): return TRANSPORT_STATUS_PL.get(str(value or '').lower(),value or '—')
+WZ_STATUS_PL={'created':'Roboczy','issued':'Gotowy do transportu','in_transport':'W transporcie','ready_invoice':'Dostarczony — gotowy do faktury','invoiced':'Zafakturowany','returned':'Zakończony','cancelled':'Anulowany'}
+def wz_status_pl(value): return WZ_STATUS_PL.get(str(value or '').lower(),value or '—')
 def cloud_id(): return int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
 def next_no(c):
     year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM transports WHERE transport_no LIKE ?",(f'TR/{year}/%',)).fetchone()[0]+1
@@ -362,6 +364,8 @@ def wz_list():
           (SELECT t.transport_no FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL ORDER BY t.id DESC LIMIT 1) transport_no
           FROM wz_documents w JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id
           WHERE w.deleted_at IS NULL ORDER BY w.id DESC''').fetchall()
+        rows=[dict(row) for row in rows]
+        for row in rows: row['status']=wz_status_pl(row.get('status'))
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Dokumenty WZ</h1><a class="btn primary right" href="{{url_for('beton.wz_new')}}">+ Wystaw WZ</a></div><div class="card"><table><thead><tr><th>WZ</th><th>Klient</th><th>Miejsca</th><th>Status</th><th>Transport</th><th>Faktura</th></tr></thead><tbody>{% for x in rows %}<tr><td><a href="{{url_for('beton.wz_view',wz_id=x.id)}}"><b>{{x.wz_no}}</b></a><br><span class="muted">{{x.created_at}}</span></td><td>{{x.customer_name}}</td><td>{{x.issue_location}} → {{x.warehouse_location}}</td><td><span class="badge">{{x.status}}</span></td><td>{{x.transport_no or '—'}}</td><td>{{x.invoice_no or '—'}}</td></tr>{% else %}<tr><td colspan="6">Brak dokumentów WZ.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',rows=rows,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
 @bp.route('/wz/new',methods=['GET','POST'])
@@ -444,7 +448,7 @@ def wz_view(wz_id):
         <table><thead><tr><th>Produkt</th><th>Plan [m³]</th><th>Wydano [m³]</th></tr></thead><tbody>
           {% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_planned}}</td><td>{{x.qty_issued if x.qty_issued is not none else '—'}}</td></tr>{% endfor %}
         </tbody></table>
-        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status in ['issued','in_transport'] %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przydziel transport(y) — maks. 8 m³</a>{% endif %}{% if w.status=='issued' and not transport %}<form method="post" action="{{url_for('beton.wz_revert',wz_id=w.id)}}" onsubmit="return confirm('Cofnąć wydanie WZ i zwrócić materiały na magazyn?')"><button class="btn danger">Cofnij WZ</button></form>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Ostatni transport {{transport.transport_no}}</a>{% endif %}</div>
+        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Przygotuj transport</button></form>{% elif w.status in ['issued','in_transport'] %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Dodaj kolejny kurs</a>{% endif %}{% if w.status=='issued' and not transport %}<form method="post" action="{{url_for('beton.wz_revert',wz_id=w.id)}}" onsubmit="return confirm('Cofnąć wydanie WZ i zwrócić materiały na magazyn?')"><button class="btn danger">Cofnij WZ</button></form>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Ostatni transport {{transport.transport_no}}</a>{% endif %}</div>
       </div>
       <div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>
       <div class="card"><h2>Zdjęcia podpisanego WZ</h2>{% for p in photos %}<div class="flex" style="margin:8px 0"><span>{{p.created_at}}</span><a class="btn" href="{{url_for('beton.photo_download',photo_id=p.id)}}">Pobierz zdjęcie</a></div>{% else %}<span class="muted">Brak zdjęć.</span>{% endfor %}</div>
@@ -716,7 +720,9 @@ def wz_issue(wz_id):
     D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
     D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
     D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
-    return redirect(url_for('beton.wz_view',wz_id=wz_id))
+    # Po zatwierdzeniu WZ od razu przechodzimy do jedynego następnego kroku:
+    # wyboru kierowcy, auta i ilości kursu.
+    return redirect(url_for('beton.transport_new',wz_id=wz_id))
 
 @bp.post('/wz/<int:wz_id>/revert')
 def wz_revert(wz_id):
@@ -1020,14 +1026,39 @@ def transport_view(transport_id):
     with D['conn']() as c:
         x=c.execute('''SELECT t.*,w.wz_no,w.invoice_id,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name FROM transports t JOIN wz_documents w ON w.id=t.wz_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN orders o ON o.id=w.order_id LEFT JOIN drivers d ON d.id=t.driver_id LEFT JOIN vehicles v ON v.id=t.vehicle_id WHERE t.id=?''',(transport_id,)).fetchone()
         if not x:abort(404)
-        x=dict(x); x['status']=transport_status_pl(x.get('status'))
+        x=dict(x); x['status_code']=x.get('status'); x['status']=transport_status_pl(x.get('status'))
         items=c.execute('''SELECT ti.qty, COALESCE(p.name, w.sku) AS sku
             FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
             LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(transport_id,)).fetchall()
         adjustment=c.execute('SELECT * FROM transport_delivery_adjustments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
     detail_tpl='''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a><a class="btn" target="_blank" href="{{url_for('beton.transport_course_print',transport_id=x.id)}}">Drukuj WZ kursu</a></div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><table><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}} mÂł</b></td></tr>{% endfor %}</tbody></table></div><form method="post" action="{{url_for('beton.transport_adjustment_save',transport_id=x.id)}}" class="card"><h2>Dane konkretnej dostawy</h2><div class="grid3"><div><label><input type="checkbox" name="water_added" value="1" {{'checked' if adjustment and adjustment.water_added}}> Dodano wodÄ™ na ĹĽÄ…danie odbiorcy</label></div><div><label>IloĹ›Ä‡ wody</label><input type="number" step="0.01" name="water_qty" value="{{adjustment.water_qty if adjustment else ''}}"></div><div><label>Jednostka</label><select name="water_unit"><option>l</option><option>kg</option></select></div><div><label>Data i godzina</label><input type="datetime-local" name="event_at" value="{{(adjustment.event_at or '')[:16] if adjustment else ''}}"></div><div><label>Osoba odpowiedzialna</label><input name="responsible_person" value="{{adjustment.responsible_person or '' if adjustment else ''}}"></div><div><label>Dodano wĹ‚Ăłkna</label><input name="added_fibres" value="{{adjustment.added_fibres or '' if adjustment else ''}}"></div><div><label>Dodano chemiÄ™</label><input name="added_chemicals" value="{{adjustment.added_chemicals or '' if adjustment else ''}}"></div><div><label>Inne dodatki</label><input name="other_additions" value="{{adjustment.other_additions or '' if adjustment else ''}}"></div></div><label>Uwagi</label><textarea name="notes">{{adjustment.notes or '' if adjustment else ''}}</textarea><button class="btn primary">Zapisz dane dostawy</button></form>{% endblock %}'''
+    if x.get('status_code') in ('assigned','issued'):
+        ready_url=url_for('beton.transport_ready',transport_id=x['id'])
+        ready_button=f'''<form method="post" action="{ready_url}" style="display:inline"><button class="btn primary" type="submit">Zezwól kierowcy na rozpoczęcie</button></form>'''
+        detail_tpl=detail_tpl.replace('Drukuj WZ kursu</a>','Drukuj WZ kursu</a>'+ready_button,1)
     return render_template_string(detail_tpl,x=x,items=items,adjustment=adjustment,title=x['transport_no'],base_url=D['BASE_URL'],db_path=D['DB_PATH'])
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a>{% if x.invoice_id %}<a class="btn" href="{{url_for('invoice_download_admin',invoice_id=x.invoice_id)}}">Pobierz fakturę</a>{% endif %}</div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><div class="line"></div><table><thead><tr><th>Materiał / SKU</th><th>Ilość</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}}</b></td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',x=x,items=items,title=x['transport_no'],base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+
+@bp.post('/transports/<int:transport_id>/ready')
+def transport_ready(transport_id):
+    """Administrator przekazuje przypisany kurs kierowcy do rozpoczęcia."""
+    now=stamp(); appointment_id=None; wz_id=None
+    with D['conn']() as c:
+        transport=c.execute('SELECT id,wz_id,status FROM transports WHERE id=? AND deleted_at IS NULL',(transport_id,)).fetchone()
+        if not transport: abort(404)
+        if transport['status'] not in ('assigned','issued'):
+            return redirect(url_for('beton.transport_view',transport_id=transport_id))
+        appointment=c.execute('SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
+        if appointment:
+            appointment_id=int(appointment['id'])
+            c.execute("UPDATE dispatch_appointments SET status='ready_to_leave',updated_by=?,updated_at=? WHERE id=?",(actor(),now,appointment_id))
+            c.execute('INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)',(appointment_id,appointment['status'],'ready_to_leave','Transport przekazany kierowcy do rozpoczęcia',actor(),now))
+        c.execute("UPDATE transports SET status='issued',issued_at=COALESCE(issued_at,?),updated_by=?,updated_at=? WHERE id=?",(now,actor(),now,transport_id))
+        wz_id=int(transport['wz_id'])
+        c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'ready_for_driver','transport',transport_id,'{}',now))
+    D['sync_local_rows_to_supabase']('transports','id',[transport_id])
+    if appointment_id: D['sync_local_rows_to_supabase']('dispatch_appointments','id',[appointment_id])
+    return redirect(url_for('beton.transport_view',transport_id=transport_id))
 
 @bp.post('/transports/<int:transport_id>/delivery-data')
 def transport_adjustment_save(transport_id):
@@ -1076,7 +1107,7 @@ def driver_transports_api():
           FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE t.driver_id=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(driver_id,)).fetchall()
         result=[]
         for r in rows:
-            x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
+            x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['can_start']=x.get('status')=='issued' and x.get('plant_status')=='ready_to_leave'; x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
                 FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
                 LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(r['id'],))]; result.append(x)
     return jsonify(ok=True,transports=result)
@@ -1086,7 +1117,7 @@ def driver_transport_status_api(transport_id):
     driver_id=current_driver_id(); email=(g.client_user.get('email') or '').strip().lower(); data=request.get_json(silent=True) or {}; status=str(data.get('status',''))
     appointment_id_to_sync=None
     if not driver_id:return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
-    allowed={'closed','delivered','returned','problem'}
+    allowed={'in_transit','closed','delivered','returned','problem'}
     if status not in allowed:return jsonify(ok=False,error='Niedozwolony status'),400
     field={'issued':'issued_at','in_transit':'departed_at','delivered':'delivered_at','returned':'returned_at'}.get(status)
     with D['conn']() as c:
@@ -1094,7 +1125,7 @@ def driver_transport_status_api(transport_id):
           FROM transports t JOIN drivers d ON d.id=t.driver_id
           WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL''',(transport_id,driver_id)).fetchone()
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
-        transitions={'in_transit':{'closed','problem'},'closed':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'closed','delivered','returned'}}
+        transitions={'assigned':{'in_transit','problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','closed','problem'},'closed':{'delivered','returned','problem'},'delivered':{'returned','problem'},'problem':{'in_transit','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
         # Tylko kierowca ma obowiązkową przerwę między kolejnymi etapami.
         # Pracownik, dyspozytor i administrator zmieniają etap w panelu głównym bez tej blokady.
