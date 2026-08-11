@@ -5315,14 +5315,30 @@ def order_create():
     try:
         wz_id, wz_item_ids = create_wz_from_order(c, oid, destination=customer_address)
         c.commit()
-    except Exception:
+    except Exception as exc:
         c.rollback()
-        raise
+        app.logger.exception("Nie udało się utworzyć automatycznego WZ dla zamówienia %s", oid)
+        return render_template_string("""
+          <h1>Nie udało się utworzyć dokumentu WZ</h1>
+          <p>Zamówienie zostało zapisane, ale roboczy dokument WZ nie powstał.</p>
+          <p><strong>Szczegół techniczny:</strong> {{ error }}</p>
+          <p><a href="{{ url_for('order_view', order_id=order_id) }}">Wróć do zamówienia</a></p>
+        """, error=str(exc), order_id=oid), 500
     finally:
         c.close()
     if supabase_enabled():
-        sync_local_rows_to_supabase("wz_documents", "id", [wz_id])
-        sync_local_rows_to_supabase("wz_items", "id", wz_item_ids)
+        try:
+            sync_local_rows_to_supabase("wz_documents", "id", [wz_id])
+            sync_local_rows_to_supabase("wz_items", "id", wz_item_ids)
+        except Exception as exc:
+            app.logger.exception("Nie udało się zapisać automatycznego WZ %s w Supabase", wz_id)
+            return render_template_string("""
+              <h1>WZ nie zostało zapisane w chmurze</h1>
+              <p>Zamówienie i robocze WZ są zapisane lokalnie, lecz Supabase odrzucił zapis WZ.</p>
+              <p><strong>Szczegół techniczny:</strong> {{ error }}</p>
+              <p>Nie twórz ponownie tego samego zamówienia. Prześlij ten komunikat — wskaże brakującą kolumnę lub tabelę w Supabase.</p>
+              <p><a href="{{ url_for('beton.wz_view', wz_id=wz_id) }}">Otwórz utworzone WZ</a></p>
+            """, error=str(exc), wz_id=wz_id), 500
     return redirect(url_for("beton.wz_view", wz_id=wz_id))
 
 @app.get("/orders/<int:order_id>")
