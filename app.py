@@ -5892,6 +5892,7 @@ def order_new():
 
       <div class="card">
         <form method="post" action="{{ url_for('order_create') }}">
+          <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
           <div class="row">
             <div>
               <label class="muted small">Wybierz staĹ‚ego klienta (opcjonalnie)</label>
@@ -6038,11 +6039,32 @@ function fillCustomer(customerId){
         db_path=DB_PATH,
         products=products_rows,
         customers=customers_rows,
-        customers_json=json.dumps(customers_json, ensure_ascii=False)
+        customers_json=json.dumps(customers_json, ensure_ascii=False),
+        idempotency_key=str(uuid.uuid4())
     )
 
 @app.post("/orders/create")
 def order_create():
+    idempotency_key = norm(request.form.get("idempotency_key"))
+    try:
+        uuid.UUID(idempotency_key)
+    except (ValueError, TypeError, AttributeError):
+        return "Formularz zamówienia wygasł. Wróć i utwórz zamówienie ponownie.", 400
+
+    existing_order = _order_by_idempotency_key(idempotency_key)
+    if existing_order:
+        c = conn()
+        try:
+            wz = c.execute(
+                "SELECT id FROM wz_documents WHERE order_id=? ORDER BY id LIMIT 1",
+                (int(existing_order["id"]),),
+            ).fetchone()
+        finally:
+            c.close()
+        if wz:
+            return redirect(url_for("beton.wz_view", wz_id=int(wz["id"])))
+        return redirect(url_for("order_view", order_id=int(existing_order["id"])))
+
     customer_id = to_int(request.form.get("customer_id"), 0)
     customer_name = norm(request.form.get("customer_name"))
     if not customer_name:
@@ -6102,7 +6124,7 @@ def order_create():
 
     if supabase_enabled():
         try:
-            oid = remote_first_create_order(customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, note, items, delivery_date=delivery_date, delivery_time=delivery_time, delivery_method=delivery_method)
+            oid = remote_first_create_order(customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, note, items, idempotency_key=idempotency_key, delivery_date=delivery_date, delivery_time=delivery_time, delivery_method=delivery_method)
         except Exception as exc:
             app.logger.exception("Nie udało się zapisać zamówienia w Supabase")
             return render_template_string("""
@@ -6116,9 +6138,9 @@ def order_create():
         cur = c.cursor()
         created_at = now_iso()
         cur.execute("""
-          INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, delivery_date, delivery_time, delivery_method, status, note, created_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, delivery_date, delivery_time or None, delivery_method, "new", note, created_at))
+          INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, delivery_date, delivery_time, delivery_method, status, note, created_at, idempotency_key)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, delivery_date, delivery_time or None, delivery_method, "new", note, created_at, idempotency_key))
         oid = cur.lastrowid
 
         order_no = make_order_no(oid, created_at)
