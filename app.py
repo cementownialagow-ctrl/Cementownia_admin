@@ -39,7 +39,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
 from cash_flow_module import register_cash_flow
-from beton_logistics_module import register_beton_logistics
+from beton_logistics_module import register_beton_logistics, create_wz_from_order
 from dispatch_module import register_dispatch
 from operations_module import register_operations
 try:
@@ -2068,9 +2068,9 @@ def generate_order_invoice_pdf(order_row, items, meta):
     header_y = cell_baseline(y, row_h, pdf_font_bold, header_font)
     cpdf.drawCentredString(cell_center(col_x[0], col_x[1]), header_y, "L.p.")
     cpdf.drawCentredString(cell_center(col_x[1], col_x[2]), header_y, "Nazwa/SKU")
-    cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), header_y, "Ilość")
-    cpdf.drawCentredString(cell_center(col_x[3], col_x[4]), header_y, "Netto/szt")
-    cpdf.drawCentredString(cell_center(col_x[4], col_x[5]), header_y, "Brutto/szt")
+    cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), header_y, "Ilość [m³]")
+    cpdf.drawCentredString(cell_center(col_x[3], col_x[4]), header_y, "Netto/m³")
+    cpdf.drawCentredString(cell_center(col_x[4], col_x[5]), header_y, "Brutto/m³")
     cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, "Wartość netto")
     cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), header_y, "VAT")
     cpdf.line(table_left, y + 1, table_right, y + 1)
@@ -2117,7 +2117,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
         if common_name:
             label = common_name if common_name.lower() == model.lower() else f"{common_name} / {model}".strip(" /")
             cpdf.drawString(name_left, y - 8.7 * mm, fit_pdf_text(label, pdf_font, body_font, name_width))
-        cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), text_y, str(qty))
+        cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), text_y, f"{qty} m³")
         cpdf.drawRightString(col_x[4] - 1.5 * mm, text_y, f"{net:.2f}")
         cpdf.drawRightString(col_x[5] - 1.5 * mm, text_y, f"{gross:.2f}")
         cpdf.drawRightString(col_x[6] - 1.5 * mm, text_y, f"{line_net:.2f}")
@@ -5121,15 +5121,12 @@ def order_new():
 
           <div class="row" style="margin-top:10px;">
             <div>
-              <label class="muted small">Adres (na etykietÄ™)</label>
-              <textarea name="customer_address" placeholder="Ulica, kod, miasto, kraj"></textarea>
+              <label class="muted small">Adres dostawy</label>
+              <textarea name="customer_address" placeholder="Ulica, kod, miasto"></textarea>
             </div>
             <div>
               <label class="muted small">Email</label>
               <input name="customer_email">
-              <div style="height:10px;"></div>
-              <label class="muted small">Adres WysyĹ‚ki</label>
-              <input name="note">
             </div>
           </div>
 
@@ -5154,8 +5151,8 @@ def order_new():
                 </select>
               </div>
               <div>
-                <label class="muted small">IloĹ›Ä‡</label>
-                <input name="qty[]" value="1">
+                <label class="muted small">Ilość [m³]</label>
+                <input name="qty[]" type="number" min="0.01" step="0.01" value="1">
               </div>
               <div>
                 <label class="muted small">Produkt ręczny</label>
@@ -5236,7 +5233,9 @@ def order_create():
     customer_address = norm(request.form.get("customer_address"))
     customer_phone = norm(request.form.get("customer_phone"))
     customer_email = norm(request.form.get("customer_email"))
-    note = norm(request.form.get("note"))
+    # W betoniarni adres klienta jest jednocześnie adresem dostawy.
+    # Nie używamy osobnego adresu wysyłki ani etykiet kurierskich.
+    note = ""
 
     product_ids = request.form.getlist("product_id[]")
     manual_products = request.form.getlist("manual_product[]")
@@ -5245,7 +5244,7 @@ def order_create():
     items = []
     for index, (pid, q) in enumerate(zip(product_ids, qtys)):
         pid = to_int(pid, 0)
-        qty = to_int(q, 0)
+        qty = to_float(q, 0.0)
         if pid > 0 and qty > 0:
             items.append((pid, qty))
             continue
@@ -5309,7 +5308,22 @@ def order_create():
         normalize_temp_order_numbers()
     except Exception:
         pass
-    return redirect(url_for("order_view", order_id=oid))
+
+    # Każde nowe zamówienie betonu od razu dostaje roboczy dokument WZ.
+    # Pracownik potwierdza wydanie później już z poziomu tego dokumentu.
+    c = conn()
+    try:
+        wz_id, wz_item_ids = create_wz_from_order(c, oid, destination=customer_address)
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    if supabase_enabled():
+        sync_local_rows_to_supabase("wz_documents", "id", [wz_id])
+        sync_local_rows_to_supabase("wz_items", "id", wz_item_ids)
+    return redirect(url_for("beton.wz_view", wz_id=wz_id))
 
 @app.get("/orders/<int:order_id>")
 def order_view(order_id):
