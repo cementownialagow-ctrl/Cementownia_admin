@@ -98,7 +98,7 @@ def appointments():
         total_m3 = float(total_row["total_m3"] or 0)
         required_trips = max(1, math.ceil(total_m3 / 8))
         if required_trips > 1:
-            notice = f"Zamówienie ma {total_m3:g} m³. Wymaga co najmniej {required_trips} podjazdów po maksymalnie 8 m³. Dodaj kolejne awizacje dla pozostałej ilości."
+            notice = f"Zamówienie ma {total_m3:g} m³. Wymaga co najmniej {required_trips} podjazdów po maksymalnie 8 m³. Pierwszy kurs został dodany; pozostałą ilość rozdziel w dokumencie WZ, tworząc następny transport."
             return redirect(url_for("dispatch.appointments", day=day, capacity_notice=notice))
         return redirect(url_for("dispatch.appointments", day=day))
     with D["conn"]() as c:
