@@ -92,44 +92,9 @@ def analytics():
               AND substr(w.issued_at,1,10) BETWEEN ? AND ?
             GROUP BY substr(w.issued_at,1,10) ORDER BY day
         """,(start,end)).fetchall()
-        # Only completed transports are treated as completed courses in rankings.
-        driver_ranking=c.execute("""
-            SELECT d.name, COUNT(t.id) trips
-            FROM transports t JOIN drivers d ON d.id=t.driver_id
-            WHERE t.deleted_at IS NULL AND t.status='returned'
-              AND substr(COALESCE(t.returned_at,t.updated_at,t.created_at),1,10) BETWEEN ? AND ?
-            GROUP BY d.id,d.name ORDER BY trips DESC,d.name ASC
-        """,(start,end)).fetchall()
-        vehicle_stats=c.execute("""
-            SELECT v.registration_no,
-                   COALESCE(t.trips,0) trips,
-                   COALESCE(f.fuel_cost,0) fuel_cost,
-                   COALESCE(e.repair_cost,0) repair_cost,
-                   COALESCE(f.fuel_cost,0)+COALESCE(e.repair_cost,0) total_cost
-            FROM vehicles v
-            LEFT JOIN (
-              SELECT vehicle_id,COUNT(*) trips FROM transports
-              WHERE deleted_at IS NULL AND status='returned'
-                AND substr(COALESCE(returned_at,updated_at,created_at),1,10) BETWEEN ? AND ?
-              GROUP BY vehicle_id
-            ) t ON t.vehicle_id=v.id
-            LEFT JOIN (
-              SELECT vehicle_id,SUM(total_cost) fuel_cost FROM fuel_entries
-              WHERE deleted_at IS NULL AND entry_date BETWEEN ? AND ? GROUP BY vehicle_id
-            ) f ON f.vehicle_id=v.id
-            LEFT JOIN (
-              SELECT vehicle_id,SUM(gross_cost) repair_cost FROM vehicle_expenses
-              WHERE deleted_at IS NULL AND expense_date BETWEEN ? AND ? GROUP BY vehicle_id
-            ) e ON e.vehicle_id=v.id
-            WHERE v.deleted_at IS NULL
-            ORDER BY repair_cost DESC,total_cost DESC,v.registration_no ASC
-        """,(start,end,start,end,start,end)).fetchall()
     total=material+fuel+sum(costs.values())
     sold_m3=sum(float(x['qty'] or 0) for x in products)
-    total_trips=sum(int(x['trips'] or 0) for x in vehicle_stats)
-    fleet_cost=sum(float(x['total_cost'] or 0) for x in vehicle_stats)
-    avg_transport_cost=(fleet_cost/total_trips) if total_trips else 0
-    return render_template('analytics.html',start=start,end=end,period=kind,material=material,fuel=fuel,costs=costs,total=total,monthly=monthly,vehicles=vehicles,sales=sales,products=products,sales_daily=sales_daily,sold_m3=sold_m3,driver_ranking=driver_ranking,vehicle_stats=vehicle_stats,total_trips=total_trips,fleet_cost=fleet_cost,avg_transport_cost=avg_transport_cost)
+    return render_template('analytics.html',start=start,end=end,period=kind,material=material,fuel=fuel,costs=costs,total=total,monthly=monthly,vehicles=vehicles,sales=sales,products=products,sales_daily=sales_daily,sold_m3=sold_m3)
 
 @bp.get('/analytics/export.csv')
 def export_costs():
