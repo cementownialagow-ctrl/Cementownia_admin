@@ -220,6 +220,46 @@ def init_db():
     )
     """)
 
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS raw_materials(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        unit TEXT NOT NULL DEFAULT 'kg',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS product_recipes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        material_id INTEGER NOT NULL REFERENCES raw_materials(id) ON DELETE RESTRICT,
+        qty_per_unit REAL NOT NULL CHECK(qty_per_unit > 0),
+        created_at TEXT NOT NULL,
+        UNIQUE(product_id, material_id)
+    );
+    CREATE TABLE IF NOT EXISTS raw_material_stock(
+        material_id INTEGER PRIMARY KEY REFERENCES raw_materials(id) ON DELETE CASCADE,
+        qty REAL NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS raw_material_movements(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        material_id INTEGER NOT NULL REFERENCES raw_materials(id) ON DELETE RESTRICT,
+        wz_id INTEGER,
+        qty_delta REAL NOT NULL,
+        movement_type TEXT NOT NULL,
+        note TEXT,
+        reversed_movement_id INTEGER REFERENCES raw_material_movements(id),
+        created_by TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_material_wz_issue
+      ON raw_material_movements(wz_id,material_id,movement_type)
+      WHERE movement_type='wz_issue';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_material_wz_reversal
+      ON raw_material_movements(reversed_movement_id)
+      WHERE reversed_movement_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_product_recipes_product ON product_recipes(product_id);
+    CREATE INDEX IF NOT EXISTS idx_raw_material_movements_wz ON raw_material_movements(wz_id);
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS customers(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -938,6 +978,9 @@ SUPABASE_MIN_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_PULL_INTERV
 
 SUPABASE_SYNC_TABLES = [
     ("products", "id"),
+    ("raw_materials", "id"),
+    ("product_recipes", "id"),
+    ("raw_material_stock", "material_id"),
     # Nie sterujemy automatycznie stanem magazynowym, ale jeżeli zostanie
     # wpisany ręcznie, jego kopia również musi trafić do chmury.
     ("stock", "product_id"),
@@ -959,6 +1002,7 @@ SUPABASE_SYNC_TABLES = [
     ("vehicles", "id"),
     ("wz_documents", "id"),
     ("wz_items", "id"),
+    ("raw_material_movements", "id"),
     ("transports", "id"),
     ("transport_items", "id"),
     ("delivery_photos", "id"),
@@ -983,6 +1027,9 @@ SUPABASE_PULL_TABLES = [
     ("cash_flow_settings", "key"),
     ("customers", "id"),
     ("products", "id"),
+    ("raw_materials", "id"),
+    ("product_recipes", "id"),
+    ("raw_material_stock", "material_id"),
     ("stock", "product_id"),
     ("drivers", "id"),
     ("driver_accounts", "driver_id"),
@@ -997,6 +1044,7 @@ SUPABASE_PULL_TABLES = [
     ("vehicles", "id"),
     ("wz_documents", "id"),
     ("wz_items", "id"),
+    ("raw_material_movements", "id"),
     ("transports", "id"),
     ("transport_items", "id"),
     ("delivery_photos", "id"),
@@ -2985,6 +3033,7 @@ BASE = r"""
       <a class="{% if request.endpoint == 'order_new' %}active{% endif %}" href="{{ url_for('order_new') }}">Nowe zamówienie</a>
       <a href="{{ url_for('invoices') }}">Faktury</a>
       <a href="{{ url_for('beton.wz_list') }}">Dokumenty WZ</a>
+      <a class="{% if request.endpoint == 'raw_material_warehouse' %}active{% endif %}" href="{{ url_for('raw_material_warehouse') }}">Magazyn</a>
       <a href="{{ url_for('beton.transports') }}">Transporty</a>
       <a href="{{ url_for('dispatch.appointments') }}">Wydaj transport</a>
       <a href="{{ url_for('beton.drivers') }}">Kierowcy i pojazdy</a>
@@ -4650,7 +4699,6 @@ def products():
       <div class="card">
         <div class="flex">
           <h1 style="margin:0;">Produkty końcowe / receptury</h1>
-          <div class="right"></div>
         </div>
         <form method="get" class="grid3" style="margin-top:10px;">
           <input name="q" value="{{ q }}" placeholder="Szukaj: SKU / model / EAN / nazwa">
@@ -4685,6 +4733,7 @@ def products():
               <th>Cena netto / j.</th>
               <th>Cena brutto / j.</th>
               <th>Koszt całkowity / j.</th>
+              <th>Receptura</th>
             </tr>
           </thead>
           <tbody>
@@ -4696,10 +4745,11 @@ def products():
               <td>{{ "%.2f"|format(r["unit_net_price"] or 0) }} PLN</td>
               <td>{{ "%.2f"|format(r["unit_gross_price"] or 0) }} PLN</td>
               <td>{{ "%.2f"|format((r["unit_material_cost"] or 0) + (r["unit_production_cost"] or 0) + (r["unit_transport_cost"] or 0) + (r["unit_other_cost"] or 0)) }} PLN</td>
+              <td><a class="btn" href="{{ url_for('product_recipe', product_id=r['id']) }}">Edytuj recepturę</a></td>
             </tr>
             {% endfor %}
             {% if not rows %}
-              <tr><td colspan="5" class="muted">Brak produktĂłw. ZrĂłb import CSV.</td></tr>
+              <tr><td colspan="7" class="muted">Brak produktów. Zrób import CSV.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -4707,6 +4757,91 @@ def products():
     {% endblock %}
     """
     return render_template_string(tpl, title="Produkty", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q)
+
+@app.route("/products/<int:product_id>/recipe", methods=["GET", "POST"])
+def product_recipe(product_id):
+    c = conn()
+    product = c.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if not product:
+        c.close()
+        abort(404)
+    error = ""
+    if request.method == "POST":
+        material_name = norm(request.form.get("material_name"))
+        unit = norm(request.form.get("unit")) or "kg"
+        qty = to_float(request.form.get("qty_per_unit"), 0)
+        if not material_name or qty <= 0:
+            error = "Podaj nazwę surowca i ilość większą od zera."
+        else:
+            now = now_iso()
+            material = c.execute("SELECT id FROM raw_materials WHERE name=? COLLATE NOCASE", (material_name,)).fetchone()
+            if material:
+                c.execute("UPDATE raw_materials SET unit=? WHERE id=?", (unit, material["id"]))
+            else:
+                c.execute("INSERT INTO raw_materials(id,name,unit,created_at) VALUES(?,?,?,?)", (cloud_row_id(), material_name, unit, now))
+                material = c.execute("SELECT id FROM raw_materials WHERE name=? COLLATE NOCASE", (material_name,)).fetchone()
+            c.execute("INSERT OR IGNORE INTO raw_material_stock(material_id,qty) VALUES(?,0)", (material["id"],))
+            c.execute("""INSERT INTO product_recipes(id,product_id,material_id,qty_per_unit,created_at)
+                         VALUES(?,?,?,?,?) ON CONFLICT(product_id,material_id)
+                         DO UPDATE SET qty_per_unit=excluded.qty_per_unit""", (cloud_row_id(), product_id, material["id"], qty, now))
+            c.commit()
+            recipe_row = c.execute("SELECT id FROM product_recipes WHERE product_id=? AND material_id=?", (product_id, material["id"])).fetchone()
+            c.close()
+            sync_local_rows_to_supabase("raw_materials", "id", [material["id"]])
+            sync_local_rows_to_supabase("raw_material_stock", "material_id", [material["id"]])
+            sync_local_rows_to_supabase("product_recipes", "id", [recipe_row["id"]])
+            return redirect(url_for("product_recipe", product_id=product_id))
+    recipe = c.execute("""SELECT pr.id,rm.name,rm.unit,pr.qty_per_unit
+                          FROM product_recipes pr JOIN raw_materials rm ON rm.id=pr.material_id
+                          WHERE pr.product_id=? ORDER BY rm.name""", (product_id,)).fetchall()
+    c.close()
+    return render_template_string(r'''{% extends "base.html" %}{% block content %}
+      <div class="flex"><h1>Receptura: {{product.name or product.sku}}</h1><a class="btn right" href="{{url_for('products')}}">Wróć do produktów</a></div>
+      {% if error %}<div class="hint">{{error}}</div>{% endif %}
+      <div class="row">
+        <div class="card"><h2>Dodaj składnik</h2><form method="post"><label>Surowiec / półprodukt</label><input name="material_name" placeholder="np. piasek, cement B25" required><div class="row"><div><label>Zużycie na 1 {{product.unit or 'm3'}} produktu</label><input name="qty_per_unit" type="number" min="0.0001" step="0.0001" required></div><div><label>Jednostka surowca</label><select name="unit"><option>kg</option><option>t</option><option>m3</option><option>l</option><option>szt.</option></select></div></div><button class="btn primary" style="margin-top:12px">Dodaj / zaktualizuj składnik</button></form></div>
+        <div class="card"><h2>Skład na 1 {{product.unit or 'm3'}}</h2><table><thead><tr><th>Surowiec</th><th>Ilość</th><th></th></tr></thead><tbody>{% for x in recipe %}<tr><td><b>{{x.name}}</b></td><td>{{x.qty_per_unit}} {{x.unit}}</td><td><form method="post" action="{{url_for('product_recipe_item_delete',product_id=product.id,recipe_id=x.id)}}"><button class="btn danger">Usuń</button></form></td></tr>{% else %}<tr><td colspan="3" class="muted">Ten produkt nie ma jeszcze receptury.</td></tr>{% endfor %}</tbody></table></div>
+      </div>{% endblock %}''', product=product, recipe=recipe, error=error, title="Receptura", base_url=BASE_URL, db_path=DB_PATH)
+
+@app.post("/products/<int:product_id>/recipe/<int:recipe_id>/delete")
+def product_recipe_item_delete(product_id, recipe_id):
+    if supabase_enabled():
+        supabase_delete_rows("product_recipes", {"id": recipe_id})
+    with conn() as c:
+        c.execute("DELETE FROM product_recipes WHERE id=? AND product_id=?", (recipe_id, product_id))
+    return redirect(url_for("product_recipe", product_id=product_id))
+
+@app.get("/warehouse")
+def raw_material_warehouse():
+    with conn() as c:
+        rows = c.execute("""SELECT rm.id,rm.name,rm.unit,COALESCE(s.qty,0) qty,
+          (SELECT COUNT(*) FROM product_recipes pr WHERE pr.material_id=rm.id) recipe_count
+          FROM raw_materials rm LEFT JOIN raw_material_stock s ON s.material_id=rm.id ORDER BY rm.name""").fetchall()
+        movements = c.execute("""SELECT m.created_at,m.qty_delta,m.movement_type,m.note,rm.name,rm.unit,w.wz_no
+          FROM raw_material_movements m JOIN raw_materials rm ON rm.id=m.material_id
+          LEFT JOIN wz_documents w ON w.id=m.wz_id ORDER BY m.id DESC LIMIT 100""").fetchall()
+    return render_template_string(r'''{% extends "base.html" %}{% block content %}
+      <div class="flex"><h1>Magazyn surowców i półproduktów</h1><a class="btn right" href="{{url_for('products')}}">Ustawienia receptur</a></div>
+      <div class="card"><p class="muted">Pozycje powstają automatycznie po dodaniu ich do receptury produktu. Przyjęcie zwiększa stan; wydanie WZ rozchoduje składniki według receptury.</p><table><thead><tr><th>Surowiec</th><th>Stan</th><th>Receptury</th><th>Dodaj na stan</th></tr></thead><tbody>{% for x in rows %}<tr><td><b>{{x.name}}</b></td><td><span class="badge">{{'%.4f'|format(x.qty)|float}} {{x.unit}}</span></td><td>{{x.recipe_count}}</td><td><form method="post" action="{{url_for('raw_material_stock_add',material_id=x.id)}}" class="flex"><input name="qty" type="number" min="0.0001" step="0.0001" placeholder="Ilość" required style="max-width:150px"><button class="btn ok">Dodaj</button></form></td></tr>{% else %}<tr><td colspan="4" class="muted">Dodaj pierwszy składnik w recepturze produktu.</td></tr>{% endfor %}</tbody></table></div>
+      <div class="card"><h2>Ostatnie ruchy</h2><table><thead><tr><th>Data</th><th>Surowiec</th><th>Ruch</th><th>WZ / opis</th></tr></thead><tbody>{% for x in movements %}<tr><td>{{x.created_at}}</td><td>{{x.name}}</td><td><b>{{'+' if x.qty_delta>0 else ''}}{{x.qty_delta}} {{x.unit}}</b></td><td>{{x.wz_no or x.note or 'Korekta ręczna'}}</td></tr>{% else %}<tr><td colspan="4" class="muted">Brak ruchów magazynowych.</td></tr>{% endfor %}</tbody></table></div>
+    {% endblock %}''', rows=rows, movements=movements, title="Magazyn", base_url=BASE_URL, db_path=DB_PATH)
+
+@app.post("/warehouse/<int:material_id>/add")
+def raw_material_stock_add(material_id):
+    qty = to_float(request.form.get("qty"), 0)
+    if qty <= 0:
+        return "Ilość musi być większa od zera.", 400
+    with conn() as c:
+        material = c.execute("SELECT id FROM raw_materials WHERE id=?", (material_id,)).fetchone()
+        if not material:
+            abort(404)
+        c.execute("INSERT OR IGNORE INTO raw_material_stock(material_id,qty) VALUES(?,0)", (material_id,))
+        c.execute("UPDATE raw_material_stock SET qty=qty+? WHERE material_id=?", (qty, material_id))
+        movement_id = cloud_row_id()
+        c.execute("INSERT INTO raw_material_movements(id,material_id,qty_delta,movement_type,note,created_by,created_at) VALUES(?,?,?,'receipt','Przyjęcie ręczne',?,?)", (movement_id, material_id, qty, session.get('username') or 'admin', now_iso()))
+    sync_local_rows_to_supabase("raw_material_stock", "material_id", [material_id])
+    sync_local_rows_to_supabase("raw_material_movements", "id", [movement_id])
+    return redirect(url_for("raw_material_warehouse"))
 
 @app.post("/products/import")
 def products_import():

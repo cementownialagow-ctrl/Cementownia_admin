@@ -111,6 +111,47 @@ def next_wz_no(c):
     year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM wz_documents WHERE wz_no LIKE ?",(f'WZ/{year}/%',)).fetchone()[0]+1
     return f'WZ/{year}/{n:05d}'
 
+def issue_recipe_materials(c, wz_id, issued_by, issued_at):
+    """Book one idempotent raw-material issue for a WZ."""
+    already=c.execute("SELECT 1 FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue' LIMIT 1",(wz_id,)).fetchone()
+    if already:
+        raise ValueError('Materiały dla tego WZ zostały już rozchodowane.')
+    missing=c.execute('''SELECT COALESCE(p.name,p.sku) product
+      FROM wz_items wi JOIN products p ON p.id=wi.product_id
+      WHERE wi.wz_id=? AND NOT EXISTS(SELECT 1 FROM product_recipes pr WHERE pr.product_id=wi.product_id)
+      LIMIT 1''',(wz_id,)).fetchone()
+    if missing:
+        raise ValueError(f"Produkt {missing['product']} nie ma receptury. Uzupełnij ją w Ustawienia → Produkty.")
+    requirements=c.execute('''SELECT rm.id material_id,rm.name,rm.unit,
+      SUM(pr.qty_per_unit*COALESCE(wi.qty_issued,wi.qty_planned)) required_qty,
+      COALESCE(s.qty,0) stock_qty
+      FROM wz_items wi JOIN product_recipes pr ON pr.product_id=wi.product_id
+      JOIN raw_materials rm ON rm.id=pr.material_id
+      LEFT JOIN raw_material_stock s ON s.material_id=rm.id
+      WHERE wi.wz_id=? GROUP BY rm.id,rm.name,rm.unit,s.qty ORDER BY rm.name''',(wz_id,)).fetchall()
+    shortages=[f"{x['name']}: potrzeba {x['required_qty']:.4f} {x['unit']}, stan {x['stock_qty']:.4f} {x['unit']}" for x in requirements if float(x['stock_qty'])+1e-9<float(x['required_qty'])]
+    if shortages:
+        raise ValueError('Brak materiału na magazynie: '+'; '.join(shortages))
+    for item in requirements:
+        qty=float(item['required_qty'])
+        c.execute('UPDATE raw_material_stock SET qty=qty-? WHERE material_id=?',(qty,item['material_id']))
+        c.execute('''INSERT INTO raw_material_movements(id,material_id,wz_id,qty_delta,movement_type,note,created_by,created_at)
+          VALUES(?,?,?,?,'wz_issue','Rozchód według receptury',?,?)''',(cloud_id(),item['material_id'],wz_id,-qty,issued_by,issued_at))
+
+def reverse_recipe_materials(c, wz_id, reversed_by, reversed_at):
+    """Reverse the exact stored WZ movements, independent of later recipe edits."""
+    movements=c.execute('''SELECT m.* FROM raw_material_movements m
+      WHERE m.wz_id=? AND m.movement_type='wz_issue'
+      AND NOT EXISTS(SELECT 1 FROM raw_material_movements r WHERE r.reversed_movement_id=m.id)
+      ORDER BY m.id''',(wz_id,)).fetchall()
+    for movement in movements:
+        qty=-float(movement['qty_delta'])
+        c.execute('INSERT OR IGNORE INTO raw_material_stock(material_id,qty) VALUES(?,0)',(movement['material_id'],))
+        c.execute('UPDATE raw_material_stock SET qty=qty+? WHERE material_id=?',(qty,movement['material_id']))
+        c.execute('''INSERT INTO raw_material_movements(id,material_id,wz_id,qty_delta,movement_type,note,reversed_movement_id,created_by,created_at)
+          VALUES(?,?,?,?,?,'Cofnięcie wydania WZ',?,?,?)''',(cloud_id(),movement['material_id'],wz_id,qty,'wz_reversal',movement['id'],reversed_by,reversed_at))
+    return len(movements)
+
 
 def create_wz_from_order(c, order_id, destination='', issue_location='Beton Łagów', warehouse_location='Magazyn główny', created_by=None):
     """Create the initial WZ together with a newly entered concrete order."""
@@ -315,7 +356,7 @@ def wz_view(wz_id):
         <table><thead><tr><th>Produkt</th><th>Plan [m³]</th><th>Wydano [m³]</th></tr></thead><tbody>
           {% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_planned}}</td><td>{{x.qty_issued if x.qty_issued is not none else '—'}}</td></tr>{% endfor %}
         </tbody></table>
-        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status in ['issued','in_transport'] %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przydziel transport(y) — maks. 8 m³</a>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Ostatni transport {{transport.transport_no}}</a>{% endif %}</div>
+        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status in ['issued','in_transport'] %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przydziel transport(y) — maks. 8 m³</a>{% endif %}{% if w.status=='issued' and not transport %}<form method="post" action="{{url_for('beton.wz_revert',wz_id=w.id)}}" onsubmit="return confirm('Cofnąć wydanie WZ i zwrócić materiały na magazyn?')"><button class="btn danger">Cofnij WZ</button></form>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Ostatni transport {{transport.transport_no}}</a>{% endif %}</div>
       </div>
       <div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>
       <div class="card"><h2>Zdjęcia podpisanego WZ</h2>{% for p in photos %}<div class="flex" style="margin:8px 0"><span>{{p.created_at}}</span><a class="btn" href="{{url_for('beton.photo_download',photo_id=p.id)}}">Pobierz zdjęcie</a></div>{% else %}<span class="muted">Brak zdjęć.</span>{% endfor %}</div>
@@ -345,6 +386,9 @@ def wz_delete(wz_id):
             abort(404)
         if wz['invoice_id']:
             return 'Najpierw usuń powiązaną fakturę VAT, a następnie WZ.', 409
+        reverse_recipe_materials(c, wz_id, actor(), s)
+        material_ids = [x['material_id'] for x in c.execute('SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=?',(wz_id,)).fetchall()]
+        movement_ids = [x['id'] for x in c.execute('SELECT id FROM raw_material_movements WHERE wz_id=?',(wz_id,)).fetchall()]
         transport_ids = [int(row['id']) for row in c.execute(
             'SELECT id FROM transports WHERE wz_id=? AND deleted_at IS NULL', (wz_id,)
         ).fetchall()]
@@ -358,6 +402,8 @@ def wz_delete(wz_id):
     D['sync_local_rows_to_supabase']('wz_documents', 'id', [wz_id])
     if transport_ids:
         D['sync_local_rows_to_supabase']('transports', 'id', transport_ids)
+    D['sync_local_rows_to_supabase']('raw_material_stock', 'material_id', material_ids)
+    D['sync_local_rows_to_supabase']('raw_material_movements', 'id', movement_ids)
     return redirect(url_for('beton.wz_list'))
 
 @bp.get('/wz/<int:wz_id>/print')
@@ -385,12 +431,43 @@ def wz_issue(wz_id):
     with D['conn']() as c:
         w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status='created'",(wz_id,)).fetchone()
         if not w:abort(409)
-        c.execute('UPDATE wz_items SET qty_issued=qty_planned WHERE wz_id=?',(wz_id,))
-        c.execute("UPDATE wz_documents SET status='issued',issued_by=?,issued_at=? WHERE id=?",(actor(),s,wz_id))
+        try:
+            c.execute('UPDATE wz_items SET qty_issued=qty_planned WHERE wz_id=?',(wz_id,))
+            issue_recipe_materials(c,wz_id,actor(),s)
+            c.execute("UPDATE wz_documents SET status='issued',issued_by=?,issued_at=? WHERE id=?",(actor(),s,wz_id))
+        except ValueError as exc:
+            c.rollback()
+            return str(exc),409
     D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
     with D['conn']() as c:
         item_ids=[x['id'] for x in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
+        material_ids=[x['material_id'] for x in c.execute("SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue'",(wz_id,)).fetchall()]
+        movement_ids=[x['id'] for x in c.execute("SELECT id FROM raw_material_movements WHERE wz_id=?",(wz_id,)).fetchall()]
     D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
+    D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
+    D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
+    return redirect(url_for('beton.wz_view',wz_id=wz_id))
+
+@bp.post('/wz/<int:wz_id>/revert')
+def wz_revert(wz_id):
+    s=stamp()
+    with D['conn']() as c:
+        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status='issued' AND deleted_at IS NULL",(wz_id,)).fetchone()
+        if not w:abort(409)
+        if w['invoice_id'] or c.execute('SELECT 1 FROM transports WHERE wz_id=? AND deleted_at IS NULL LIMIT 1',(wz_id,)).fetchone():
+            return 'Nie można cofnąć WZ powiązanego z transportem lub fakturą.',409
+        reverse_recipe_materials(c,wz_id,actor(),s)
+        c.execute('UPDATE wz_items SET qty_issued=NULL WHERE wz_id=?',(wz_id,))
+        c.execute("UPDATE wz_documents SET status='created',issued_by=NULL,issued_at=NULL WHERE id=?",(wz_id,))
+        c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'revert_issue','wz_document',wz_id,'{}',s))
+    D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
+    with D['conn']() as c:
+        item_ids=[x['id'] for x in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
+        material_ids=[x['material_id'] for x in c.execute('SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=?',(wz_id,)).fetchall()]
+        movement_ids=[x['id'] for x in c.execute('SELECT id FROM raw_material_movements WHERE wz_id=?',(wz_id,)).fetchall()]
+    D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
+    D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
+    D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
     return redirect(url_for('beton.wz_view',wz_id=wz_id))
 
 @bp.post('/wz/<int:wz_id>/ready')
