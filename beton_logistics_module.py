@@ -505,7 +505,7 @@ def wz_delete(wz_id):
     D['sync_local_rows_to_supabase']('raw_material_movements', 'id', movement_ids)
     return redirect(url_for('beton.wz_list'))
 
-def build_wz_form_pdf(w,items,courses,technology,company):
+def build_wz_form_pdf(w,items,courses,technology,company,adjustment=None):
     """Jednostronicowy WZ w układzie formularza betoniarni."""
     font='Helvetica'; bold='Helvetica-Bold'
     for path in (r'C:\Windows\Fonts\arial.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
@@ -587,10 +587,15 @@ def build_wz_form_pdf(w,items,courses,technology,company):
         if column: p.line(x,tech_y,x,people_y-8*mm)
         labelled(x+3*mm,y,label+':',value or '—',8)
     # Informacje o dodatkach i uwagi
-    notes_h=35*mm; notes_y=tech_y-notes_h; rect(left,notes_y,width,notes_h)
+    notes_h=43*mm; notes_y=tech_y-notes_h; rect(left,notes_y,width,notes_h)
     text(left+3*mm,tech_y-6*mm,'Domieszki / chemia:',7,True); wrapped(left+38*mm,tech_y-6*mm,tech.get('admixtures') or '—',75,7,max_lines=2)
     text(left+3*mm,tech_y-15*mm,'Włókna:',7,True); wrapped(left+38*mm,tech_y-15*mm,tech.get('fibres') or '—',75,7,max_lines=2)
     text(left+3*mm,tech_y-24*mm,'Inne dodatki:',7,True); wrapped(left+38*mm,tech_y-24*mm,tech.get('other_additions') or w.get('notes') or '—',75,7,max_lines=2)
+    if adjustment and adjustment.get('water_added'):
+        water_info='DODANO WODĘ NA ŻĄDANIE ODBIORCY: {} {} · {} · osoba odpowiedzialna: {}'.format(
+            adjustment.get('water_qty') or '—',adjustment.get('water_unit') or 'l',
+            adjustment.get('event_at') or '—',adjustment.get('responsible_person') or adjustment.get('created_by') or '—')
+        wrapped(left+3*mm,tech_y-34*mm,water_info,145,6.5,3.2*mm,max_lines=2)
     # Ostrzeżenie i podpisy
     warning_h=32*mm; warning_y=notes_y-warning_h; rect(left,warning_y,width,warning_h)
     wz_notes=(
@@ -1010,7 +1015,7 @@ def transport_course_print(transport_id):
     else:
         wz_data['wz_no']=transport['course_wz_no']
         print_items=[{'sku':x['product'],'qty_planned':x['qty'],'qty_issued':x['qty']} for x in items]
-    pdf_buffer=build_wz_form_pdf(wz_data,print_items,[transport],technology,company)
+    pdf_buffer=build_wz_form_pdf(wz_data,print_items,[transport],technology,company,dict(adjustment) if adjustment else None)
     filename=re.sub(r'[^A-Za-z0-9_.-]+','_',wz_data['wz_no'])+'.pdf'
     return send_file(pdf_buffer,mimetype='application/pdf',as_attachment=False,download_name=filename)
     course_tpl=course_tpl.replace('</html>',extra)
@@ -1032,6 +1037,7 @@ def transport_view(transport_id):
             LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(transport_id,)).fetchall()
         adjustment=c.execute('SELECT * FROM transport_delivery_adjustments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
     detail_tpl='''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a><a class="btn" target="_blank" href="{{url_for('beton.transport_course_print',transport_id=x.id)}}">Drukuj WZ kursu</a></div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><table><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}} mÂł</b></td></tr>{% endfor %}</tbody></table></div><form method="post" action="{{url_for('beton.transport_adjustment_save',transport_id=x.id)}}" class="card"><h2>Dane konkretnej dostawy</h2><div class="grid3"><div><label><input type="checkbox" name="water_added" value="1" {{'checked' if adjustment and adjustment.water_added}}> Dodano wodÄ™ na ĹĽÄ…danie odbiorcy</label></div><div><label>IloĹ›Ä‡ wody</label><input type="number" step="0.01" name="water_qty" value="{{adjustment.water_qty if adjustment else ''}}"></div><div><label>Jednostka</label><select name="water_unit"><option>l</option><option>kg</option></select></div><div><label>Data i godzina</label><input type="datetime-local" name="event_at" value="{{(adjustment.event_at or '')[:16] if adjustment else ''}}"></div><div><label>Osoba odpowiedzialna</label><input name="responsible_person" value="{{adjustment.responsible_person or '' if adjustment else ''}}"></div><div><label>Dodano wĹ‚Ăłkna</label><input name="added_fibres" value="{{adjustment.added_fibres or '' if adjustment else ''}}"></div><div><label>Dodano chemiÄ™</label><input name="added_chemicals" value="{{adjustment.added_chemicals or '' if adjustment else ''}}"></div><div><label>Inne dodatki</label><input name="other_additions" value="{{adjustment.other_additions or '' if adjustment else ''}}"></div></div><label>Uwagi</label><textarea name="notes">{{adjustment.notes or '' if adjustment else ''}}</textarea><button class="btn primary">Zapisz dane dostawy</button></form>{% endblock %}'''
+    detail_tpl=detail_tpl.replace('mÂł','m³')
     if x.get('status_code') in ('assigned','issued'):
         ready_url=url_for('beton.transport_ready',transport_id=x['id'])
         ready_button=f'''<form method="post" action="{ready_url}" style="display:inline"><button class="btn primary" type="submit">Zezwól kierowcy na rozpoczęcie</button></form>'''
