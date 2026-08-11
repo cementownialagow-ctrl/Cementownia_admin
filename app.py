@@ -1653,6 +1653,13 @@ def sync_local_rows_to_supabase(table: str, conflict_col: str, ids: list):
     cur.execute(f"SELECT * FROM {table} WHERE {conflict_col} IN ({ph})", tuple(ids))
     rows = [dict(r) for r in cur.fetchall()]
     c.close()
+    # SQLite przechowuje wartości logiczne jako 0/1, natomiast PostgREST
+    # wymaga prawdziwego JSON boolean. Bez konwersji zapis surowca był
+    # wykonany lokalnie, lecz synchronizacja kończyła odpowiedź błędem 500.
+    if table == "raw_materials":
+        for row in rows:
+            if "active" in row and row["active"] is not None:
+                row["active"] = bool(row["active"])
     if rows:
         supabase_upsert_rows(table, rows, conflict_col)
     return len(rows)
@@ -4983,9 +4990,17 @@ def product_recipe(product_id):
             c.commit()
             recipe_row = c.execute("SELECT id FROM product_recipes WHERE product_id=? AND material_id=?", (product_id, material["id"])).fetchone()
             c.close()
-            sync_local_rows_to_supabase("raw_materials", "id", [material["id"]])
-            sync_local_rows_to_supabase("raw_material_stock", "material_id", [material["id"]])
-            sync_local_rows_to_supabase("product_recipes", "id", [recipe_row["id"]])
+            # Zapis w SQLite jest już zatwierdzony. Awaria pojedynczego wywołania
+            # Supabase nie może po poprawnym zapisie pokazywać użytkownikowi 500.
+            for sync_table, sync_key, sync_ids in (
+                ("raw_materials", "id", [material["id"]]),
+                ("raw_material_stock", "material_id", [material["id"]]),
+                ("product_recipes", "id", [recipe_row["id"]]),
+            ):
+                try:
+                    sync_local_rows_to_supabase(sync_table, sync_key, sync_ids)
+                except Exception:
+                    app.logger.exception("Nie udało się zsynchronizować %s po zapisie receptury", sync_table)
             return redirect(url_for("product_recipe", product_id=product_id))
     recipe = c.execute("""SELECT pr.id,rm.name,rm.unit,pr.qty_per_unit
                           FROM product_recipes pr JOIN raw_materials rm ON rm.id=pr.material_id
