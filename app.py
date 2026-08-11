@@ -3143,11 +3143,9 @@ BASE = r"""
           <a href="{{ url_for('customers') }}">Klienci</a>
           <a href="{{ url_for('pricing') }}">Cennik</a>
           <a href="{{ url_for('company') }}">Dane mojej firmy</a>
-          <a href="{{ url_for('cash_flow') }}">Cash flow</a>
           {% if session.get('role') == 'admin' %}<a href="{{ url_for('admin_users') }}">Użytkownicy</a>{% endif %}
           <a href="{{ url_for('admin_audit') }}">Dziennik zmian</a>
           {% if session.get('role') == 'admin' %}<a href="{{ url_for('admin_test_data') }}">Dane testowe</a>{% endif %}
-          <a href="{{ url_for('email_test') }}">Test maili</a>
         </div>
       </div>
       <a href="{{ url_for('logout') }}">Wyloguj</a>
@@ -3539,6 +3537,14 @@ def home():
       GROUP BY rm.id,rm.name,rm.unit,s.qty
       HAVING COALESCE(s.qty,0)<=MAX(pr.qty_per_unit)*5
       ORDER BY coverage ASC,rm.name LIMIT 8''').fetchall()]
+    overdue_row = cur.execute("""SELECT COUNT(*) AS invoice_count,
+        COALESCE(SUM(COALESCE(i.total_gross,0)),0) AS total_gross
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+      WHERE COALESCE(m.paid,0)=0
+        AND date(COALESCE(NULLIF(i.payment_to,''),i.issue_date)) < date(?)""", (today_iso,)).fetchone()
+    overdue_invoice_count = int(overdue_row["invoice_count"] or 0)
+    overdue_invoice_total = float(overdue_row["total_gross"] or 0)
     c.close()
 
     tpl = r"""
@@ -3558,6 +3564,10 @@ def home():
         <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
         <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>W realizacji</span><b>{{ n_orders_current }}</b></div></div>
         <a class="metric" style="--soft:#fff5e5;--tone:#c57a10;text-decoration:none;color:inherit" href="{{ url_for('orders', tab='today') }}"><div class="icon">▦</div><div><span>Pozostało do realizacji dzisiaj</span><b>{{ today_remaining }}</b><small>Zobacz dzisiejsze wydania</small></div></a>
+      </div>
+
+      <div class="metrics" style="grid-template-columns:minmax(260px,1fr);max-width:360px">
+        <a class="metric" style="--soft:#fff0f2;--tone:#c7354c;text-decoration:none;color:inherit" href="{{ url_for('invoices', filter='overdue') }}"><div class="icon">!</div><div><span>Zaległe płatności</span><b>{{ overdue_invoice_count }}</b><small>{{ "%.2f"|format(overdue_invoice_total) }} PLN po terminie</small></div></a>
       </div>
 
       <div class="dash-grid">
@@ -3586,7 +3596,8 @@ def home():
                                   recent_orders=recent_orders, status_new=status_new, status_assigned=status_assigned,
                                   status_delivery=status_delivery, status_signed=status_signed, status_done=status_done,
                                   status_invoice=status_invoice, status_total=status_total,
-                                  status_divisor=status_divisor,low_raw_materials=low_raw_materials)
+                                  status_divisor=status_divisor,low_raw_materials=low_raw_materials,
+                                  overdue_invoice_count=overdue_invoice_count,overdue_invoice_total=overdue_invoice_total)
 
 
 @app.get("/documents/search")
@@ -8048,20 +8059,23 @@ def api_client_invoices():
 def invoices():
     maybe_pull_shared_from_supabase()
     q = norm(request.args.get("q"))
+    overdue_only = norm(request.args.get("filter")).lower() == "overdue"
     c = conn()
     cur = c.cursor()
     params = []
-    where = ""
+    clauses = []
     if q:
         like = f"%{q.lower()}%"
-        where = """
-          WHERE LOWER(COALESCE(i.invoice_no,'')) LIKE ?
+        clauses.append("""(LOWER(COALESCE(i.invoice_no,'')) LIKE ?
              OR LOWER(COALESCE(i.buyer_name,'')) LIKE ?
              OR LOWER(COALESCE(o.customer_name,'')) LIKE ?
              OR LOWER(COALESCE(o.order_no,'')) LIKE ?
-             OR LOWER(COALESCE(o.note,'')) LIKE ?
-        """
+             OR LOWER(COALESCE(o.note,'')) LIKE ?)""")
         params = [like, like, like, like, like]
+    if overdue_only:
+        clauses.append("COALESCE(m.paid,0)=0 AND date(COALESCE(NULLIF(i.payment_to,''),i.issue_date)) < date(?)")
+        params.append(app_now().date().isoformat())
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
 
     cur.execute(f"""
       SELECT
@@ -8096,6 +8110,9 @@ def invoices():
     current_key = None
     current = None
     for inv in rows:
+        due_date = norm(inv.get("payment_to")) or norm(inv.get("issue_date"))
+        inv["due_date"] = due_date
+        inv["overdue"] = bool(not int(inv.get("paid") or 0) and due_date and due_date < app_now().date().isoformat())
         customer_name = inv.get("buyer_name") or inv.get("order_customer_name") or "Bez klienta"
         key = customer_name.strip().lower()
         if key != current_key:
@@ -8132,9 +8149,11 @@ def invoices():
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">Faktury</h1>
+          <h1 style="margin:0;">{{ 'Zaległe faktury' if overdue_only else 'Faktury' }}</h1>
+          {% if overdue_only %}<a class="btn right" href="{{ url_for('invoices') }}">Pokaż wszystkie faktury</a>{% endif %}
         </div>
         <form method="get" class="flex" style="margin-top:12px;">
+          {% if overdue_only %}<input type="hidden" name="filter" value="overdue">{% endif %}
           <input name="q" value="{{ q }}" placeholder="Szukaj: klient, numer faktury, numer zamówienia, notatka">
           <button class="btn primary" type="submit">Szukaj</button>
           <a class="btn" href="{{ url_for('invoices') }}">Wyczyść</a>
@@ -8143,7 +8162,7 @@ def invoices():
 
       {% for g in groups %}
         <div class="card">
-          <details {% if q %}open{% endif %}>
+          <details {% if q or overdue_only %}open{% endif %}>
             <summary class="flex" style="cursor:pointer; align-items:center;">
               <h2 style="margin:0;">{{ g.customer_name }}</h2>
               <span class="badge">{{ g.invoices|length }} faktur</span>
@@ -8153,7 +8172,7 @@ def invoices():
             </summary>
 
             {% for m in g.months %}
-              <details style="margin-top:10px;" {% if q %}open{% endif %}>
+              <details style="margin-top:10px;" {% if q or overdue_only %}open{% endif %}>
                 <summary class="flex" style="cursor:pointer; align-items:center;">
                   <b>{{ m.label }}</b>
                   <span class="badge">{{ m.invoices|length }} faktur</span>
@@ -8177,7 +8196,7 @@ def invoices():
                     {% for inv in m.invoices %}
                       <tr>
                         <td><b>{{ inv.invoice_no }}</b></td>
-                        <td>{{ inv.issue_date }}</td>
+                        <td>{{ inv.issue_date }}{% if inv.overdue %}<div class="badge danger" style="margin-top:5px">Termin: {{ inv.due_date }}</div>{% endif %}</td>
                         <td>{{ inv.order_display }}</td>
                         <td>{{ "%.2f"|format(inv.total_net) }}</td>
                         <td>{{ "%.2f"|format(inv.total_gross) }}</td>
@@ -8257,7 +8276,7 @@ def invoices():
       {% endif %}
     {% endblock %}
     """
-    return render_template_string(tpl, title="Faktury", base_url=BASE_URL, db_path=DB_PATH, groups=groups, q=q)
+    return render_template_string(tpl, title="Zaległe faktury" if overdue_only else "Faktury", base_url=BASE_URL, db_path=DB_PATH, groups=groups, q=q, overdue_only=overdue_only)
 
 
 def load_invoice_with_meta(invoice_id: int):
