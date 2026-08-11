@@ -506,6 +506,7 @@ def build_wz_form_pdf(w,items,courses,technology,company):
     date_value=issued[:10]; time_value=issued[11:16]
     first_course=dict(courses[0]) if courses else {}
     tech=technology[0] if technology else {}
+    delivery_method='ODBIÓR WŁASNY' if str(w.get('delivery_method') or '').lower()=='pickup' else 'DOSTAWA'
     total_qty=sum(float(i['qty_issued'] if i['qty_issued'] is not None else i['qty_planned']) for i in items)
     product=', '.join(str(i['sku']) for i in items)
     # Nagłówek
@@ -538,7 +539,7 @@ def build_wz_form_pdf(w,items,courses,technology,company):
     text(left+half,info_y-8*mm,'Towar zgodnie z dyspozycją',10,True)
     text(left+half,info_y-19*mm,'Na odpowiedzialność kierowcy:',8)
     p.line(left+half+48*mm,info_y-20*mm,right-5*mm,info_y-20*mm)
-    text(left+half,info_y-29*mm,'ODBIÓR WŁASNY / DOSTAWA',10,True)
+    text(left+half,info_y-29*mm,delivery_method,12,True)
     # Specyfikacja techniczna
     tech_h=49*mm; tech_y=people_y-tech_h; rect(left,tech_y,width,tech_h)
     centered(left,people_y-6*mm,width,'Specyfikacja techniczna wskazana przez zamawiającego',10,True)
@@ -565,7 +566,7 @@ def build_wz_form_pdf(w,items,courses,technology,company):
 @bp.get('/wz/<int:wz_id>/print')
 def wz_print(wz_id):
     with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.customer_phone,o.customer_email,o.note AS order_delivery_address,
+        w=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.customer_phone,o.customer_email,o.delivery_method,o.note AS order_delivery_address,
             COALESCE(c.nip,'') customer_nip,
             COALESCE(NULLIF(w.destination,''), o.customer_address) AS destination
             FROM wz_documents w JOIN orders o ON o.id=w.order_id LEFT JOIN customers c ON c.id=o.customer_id
@@ -923,7 +924,7 @@ def transport_course_print(transport_id):
         for row in c.execute('SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=(SELECT wz_id FROM transports WHERE id=?) ORDER BY id',(transport_id,)).fetchall():
             try: technology.append(json.loads(row['snapshot_json']))
             except Exception: pass
-        wz_data=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.customer_phone,o.customer_email,o.note AS order_delivery_address,COALESCE(cu.nip,'') customer_nip,COALESCE(NULLIF(t.destination,''),NULLIF(w.destination,''),o.customer_address) destination FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN customers cu ON cu.id=o.customer_id WHERE t.id=?''',(transport_id,)).fetchone()
+        wz_data=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.customer_phone,o.customer_email,o.delivery_method,o.note AS order_delivery_address,COALESCE(cu.nip,'') customer_nip,COALESCE(NULLIF(t.destination,''),NULLIF(w.destination,''),o.customer_address) destination FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN customers cu ON cu.id=o.customer_id WHERE t.id=?''',(transport_id,)).fetchone()
         wz_data=dict(wz_data)
         company=c.execute('SELECT * FROM company_profile WHERE id=1').fetchone(); company=dict(company) if company else {}
     course_tpl='''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{t.course_wz_no}}</title><style>body{font:14px Arial;max-width:900px;margin:35px auto;color:#111}table{border-collapse:collapse;width:100%;margin:22px 0}td,th{border:1px solid #222;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:25px}.sign{margin-top:60px;border-top:1px solid #111;padding-top:8px;width:40%;text-align:center}.full-wz{page-break-before:always;padding-top:20px}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>WZ kursu {{t.course_wz_no}}</h1><p>Kurs: <b>{{t.transport_no}}</b> · dokument główny: <b>{{t.wz_no}}</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}<br><br><b>Adres dostawy</b><br>{{t.destination or '—'}}</div><div><b>Kierowca / auto</b><br>{{t.driver_name}} · {{t.registration_no}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość kursu [m³]</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis odbiorcy dla kursu</div>{% if t.is_final_course %}<section class="full-wz"><h1>Wydanie zewnętrzne {{t.wz_no}}</h1><p><b>Pełna WZ zbiorcza — dołączona do ostatniego kursu.</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}</div><div><b>Adres dostawy</b><br>{{t.destination or '—'}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Łączna ilość [m³]</th></tr></thead><tbody>{% for i in full_items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis i pieczęć odbiorcy — pełna WZ</div></section>{% endif %}</html>'''
