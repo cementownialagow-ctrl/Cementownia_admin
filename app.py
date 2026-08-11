@@ -255,7 +255,7 @@ def init_db():
         order_id INTEGER NOT NULL,
         product_id INTEGER NOT NULL,
         sku TEXT NOT NULL,
-        qty INTEGER NOT NULL,
+        qty REAL NOT NULL,
         created_at TEXT NOT NULL,
         FOREIGN KEY(order_id) REFERENCES orders(id),
         FOREIGN KEY(product_id) REFERENCES products(id)
@@ -1637,7 +1637,41 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
             cur.execute("SELECT sku FROM products WHERE id=?", (pid,))
             p = cur.fetchone()
             if not p:
-                raise ValueError(f"Nie istnieje produkt ID {pid}")
+                # Formularz może już widzieć świeżo dodany produkt z Supabase,
+                # zanim kopia lokalna Rendera zostanie odświeżona. W takim
+                # przypadku pobieramy wyłącznie tę pozycję, zamiast odrzucać
+                # prawidłowe zamówienie.
+                remote_rows = supabase_request(
+                    "/rest/v1/products",
+                    method="GET",
+                    params={"select": "*", "id": f"eq.{pid}", "limit": 1},
+                ) or []
+                remote_product = remote_rows[0] if isinstance(remote_rows, list) and remote_rows else None
+                if not remote_product:
+                    raise ValueError(f"Nie istnieje produkt ID {pid} w Supabase")
+                cur.execute(
+                    """INSERT INTO products(id,sku,model,ean,name,unit,unit_net_price,unit_gross_price,
+                       unit_material_cost,unit_production_cost,unit_transport_cost,unit_other_cost,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(id) DO UPDATE SET sku=excluded.sku,model=excluded.model,ean=excluded.ean,
+                       name=excluded.name,unit=excluded.unit,unit_net_price=excluded.unit_net_price,
+                       unit_gross_price=excluded.unit_gross_price,unit_material_cost=excluded.unit_material_cost,
+                       unit_production_cost=excluded.unit_production_cost,unit_transport_cost=excluded.unit_transport_cost,
+                       unit_other_cost=excluded.unit_other_cost,created_at=excluded.created_at""",
+                    (
+                        int(remote_product["id"]), remote_product["sku"], remote_product.get("model"),
+                        remote_product.get("ean"), remote_product.get("name"), remote_product.get("unit") or "m3",
+                        to_float(remote_product.get("unit_net_price"), 0.0),
+                        to_float(remote_product.get("unit_gross_price"), 0.0),
+                        to_float(remote_product.get("unit_material_cost"), 0.0),
+                        to_float(remote_product.get("unit_production_cost"), 0.0),
+                        to_float(remote_product.get("unit_transport_cost"), 0.0),
+                        to_float(remote_product.get("unit_other_cost"), 0.0),
+                        remote_product.get("created_at") or now_iso(),
+                    ),
+                )
+                cur.execute("SELECT sku FROM products WHERE id=?", (pid,))
+                p = cur.fetchone()
             item_id = cloud_row_id()
             created_item = supabase_insert_row("order_items", {
                 "id": item_id,
@@ -1856,9 +1890,9 @@ def generate_sales_invoice(order_row, items):
     cpdf.setFont(pdf_font_bold, 9)
     cpdf.drawString(15 * mm, y, "SKU")
     cpdf.drawString(45 * mm, y, "Model")
-    cpdf.drawString(95 * mm, y, "IloĹ›Ä‡")
-    cpdf.drawString(112 * mm, y, "Netto/szt")
-    cpdf.drawString(140 * mm, y, "Brutto/szt")
+    cpdf.drawString(95 * mm, y, "Ilość [m³]")
+    cpdf.drawString(112 * mm, y, "Netto/m³")
+    cpdf.drawString(140 * mm, y, "Brutto/m³")
     cpdf.drawString(170 * mm, y, "WartoĹ›Ä‡ brutto")
     y -= 5 * mm
 
@@ -1871,7 +1905,7 @@ def generate_sales_invoice(order_row, items):
         pr = pricing_map.get(model)
         net = float(pr["net_price"]) if pr else 0.0
         gross = float(pr["gross_price"]) if pr else 0.0
-        qty = int(it["qty"])
+        qty = to_float(it["qty"], 0.0)
         line_net = net * qty
         line_gross = gross * qty
         total_net += line_net
@@ -1879,7 +1913,7 @@ def generate_sales_invoice(order_row, items):
 
         cpdf.drawString(15 * mm, y, it["sku"])
         cpdf.drawString(45 * mm, y, (model or "-")[:24])
-        cpdf.drawRightString(108 * mm, y, str(qty))
+        cpdf.drawRightString(108 * mm, y, f"{qty:g} m³")
         cpdf.drawRightString(136 * mm, y, f"{net:.2f}")
         cpdf.drawRightString(164 * mm, y, f"{gross:.2f}")
         cpdf.drawRightString(195 * mm, y, f"{line_gross:.2f}")
@@ -2111,8 +2145,9 @@ def generate_order_invoice_pdf(order_row, items, meta):
         common_name = name or model
         pr = pricing_map.get(model) or pricing_map.get(sku)
         net_dec = money_dec(pr["net_price"] if pr else it.get("net_price"))
-        qty = int(it["qty"])
-        line_net_dec = (net_dec * Decimal(qty)).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        qty_dec = Decimal(str(to_float(it["qty"], 0.0)))
+        qty = float(qty_dec)
+        line_net_dec = (net_dec * qty_dec).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         if discount_pct > 0:
             line_net_dec = (line_net_dec * (Decimal("100.0") - Decimal(str(discount_pct))) / Decimal("100.0")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         unit_gross_dec = gross_from_net_23(net_dec)
@@ -2134,7 +2169,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
         if common_name:
             label = common_name if common_name.lower() == model.lower() else f"{common_name} / {model}".strip(" /")
             cpdf.drawString(name_left, y - 8.7 * mm, fit_pdf_text(label, pdf_font, body_font, name_width))
-        cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), text_y, f"{qty} m³")
+        cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), text_y, f"{qty:g} m³")
         cpdf.drawRightString(col_x[4] - 1.5 * mm, text_y, f"{net:.2f}")
         cpdf.drawRightString(col_x[5] - 1.5 * mm, text_y, f"{gross:.2f}")
         cpdf.drawRightString(col_x[6] - 1.5 * mm, text_y, f"{line_net:.2f}")
@@ -2423,8 +2458,8 @@ def sync_invoice_meta_to_supabase(invoice_id: int):
 def prepare_invoice_items(order_items: list[dict], form):
     prepared = []
     for it in order_items:
-        remaining_qty = int(it.get("remaining_qty") if it.get("remaining_qty") is not None else it.get("qty") or 0)
-        qty = to_int(form.get(f"invoice_qty_{it['id']}"), 0)
+        remaining_qty = to_float(it.get("remaining_qty") if it.get("remaining_qty") is not None else it.get("qty"), 0.0)
+        qty = to_float(form.get(f"invoice_qty_{it['id']}"), 0.0)
         if qty <= 0:
             continue
         qty = min(qty, remaining_qty)
@@ -2435,10 +2470,10 @@ def prepare_invoice_items(order_items: list[dict], form):
         row["source_order_id"] = int(it.get("order_id") or it.get("source_order_id") or 0)
         row["source_order_no"] = it.get("source_order_no") or ""
         row["source_order_note"] = it.get("source_order_note") or ""
-        row["ordered_qty"] = int(it.get("qty") or 0)
-        row["invoiced_qty_before"] = int(it.get("invoiced_qty") or 0)
+        row["ordered_qty"] = to_float(it.get("qty"), 0.0)
+        row["invoiced_qty_before"] = to_float(it.get("invoiced_qty"), 0.0)
         row["qty"] = qty
-        line_net = money_dec(row.get("net_price")) * Decimal(qty)
+        line_net = money_dec(row.get("net_price")) * Decimal(str(qty))
         line_net = line_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         line_vat = vat23_from_net(line_net)
         line_gross = (line_net + line_vat).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
@@ -2702,18 +2737,18 @@ def invoice_edit_items(invoice_id: int, invoice_row: dict):
 def prepare_invoice_edit_items(edit_items: list[dict], form):
     prepared = []
     for it in edit_items:
-        max_qty = int(it.get("remaining_qty") or 0)
-        qty = to_int(form.get(f"invoice_qty_{it['id']}"), 0)
+        max_qty = to_float(it.get("remaining_qty"), 0.0)
+        qty = to_float(form.get(f"invoice_qty_{it['id']}"), 0.0)
         qty = max(0, min(qty, max_qty))
         if qty <= 0:
             continue
         row = dict(it)
         row["order_item_id"] = int(it.get("id") or it.get("order_item_id") or 0)
         row["source_order_id"] = int(it.get("order_id") or it.get("source_order_id") or 0)
-        row["ordered_qty"] = int(it.get("ordered_qty") or it.get("qty") or 0)
-        row["invoiced_qty_before"] = int(it.get("invoiced_other_qty") or 0)
+        row["ordered_qty"] = to_float(it.get("ordered_qty") or it.get("qty"), 0.0)
+        row["invoiced_qty_before"] = to_float(it.get("invoiced_other_qty"), 0.0)
         row["qty"] = qty
-        line_net = money_dec(row.get("net_price")) * Decimal(qty)
+        line_net = money_dec(row.get("net_price")) * Decimal(str(qty))
         line_net = line_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         line_vat = vat23_from_net(line_net)
         line_gross = (line_net + line_vat).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
@@ -5690,7 +5725,7 @@ def order_confirmation_resend(order_id):
 @app.post("/orders/<int:order_id>/items/add")
 def order_item_add(order_id):
     product_id = to_int(request.form.get("product_id"), 0)
-    qty = to_int(request.form.get("qty"), 0)
+    qty = to_float(request.form.get("qty"), 0.0)
     if product_id <= 0 or qty <= 0:
         return "NieprawidĹ‚owy produkt lub iloĹ›Ä‡", 400
 
@@ -5737,7 +5772,7 @@ def order_item_add(order_id):
 
 @app.post("/orders/<int:order_id>/items/<int:item_id>/update")
 def order_item_update(order_id, item_id):
-    qty = to_int(request.form.get("qty"), 0)
+    qty = to_float(request.form.get("qty"), 0.0)
     if qty <= 0:
         return "IloĹ›Ä‡ musi byÄ‡ > 0", 400
     c = conn()
@@ -6088,8 +6123,8 @@ def order_invoice(order_id):
         invoice_items = prepare_invoice_items(items, request.form)
         wz_mismatch = False
         if wz_id:
-            selected = {int(x.get("order_item_id") or x.get("id") or 0): int(x.get("qty") or 0) for x in invoice_items}
-            expected = {int(item_id): int(qty) for item_id, qty in wz_qty.items()}
+            selected = {int(x.get("order_item_id") or x.get("id") or 0): to_float(x.get("qty"), 0.0) for x in invoice_items}
+            expected = {int(item_id): to_float(qty, 0.0) for item_id, qty in wz_qty.items()}
             wz_mismatch = selected != expected
         existing_invoice_id = invoice_no_exists(data["invoice_no"])
         if existing_invoice_id:
