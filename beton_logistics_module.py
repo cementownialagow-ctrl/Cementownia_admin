@@ -171,7 +171,9 @@ def snapshot_wz_technology(c, wz_id, created_by, created_at):
 def issue_recipe_materials(c, wz_id, issued_by, issued_at):
     """Book one idempotent raw-material issue for a WZ."""
     if c.execute("SELECT 1 FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue' LIMIT 1",(wz_id,)).fetchone():
-        raise ValueError('Materiały dla tego WZ zostały już rozchodowane.')
+        # Bezpieczne ponowienie po zerwanym przekierowaniu lub synchronizacji.
+        # Stan magazynu został już pomniejszony, więc niczego nie księgujemy drugi raz.
+        return
     # Snapshot oglądany na roboczym WZ jest tylko podglądem. Wydanie zawsze
     # zamraża recepturę ponownie, według wersji obowiązującej w tej chwili.
     c.execute('DELETE FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,))
@@ -734,8 +736,12 @@ def wz_print(wz_id):
 def wz_issue(wz_id):
     s=stamp()
     with D['conn']() as c:
-        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status='created'",(wz_id,)).fetchone()
-        if not w:abort(409)
+        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND deleted_at IS NULL",(wz_id,)).fetchone()
+        if not w:abort(404)
+        if w['status'] in ('issued','in_transport'):
+            return redirect(url_for('beton.transport_new',wz_id=wz_id))
+        if w['status']!='created':
+            return 'Tego dokumentu WZ nie można już przygotować do transportu.',409
         try:
             c.execute('UPDATE wz_items SET qty_issued=qty_planned WHERE wz_id=?',(wz_id,))
             issue_recipe_materials(c,wz_id,actor(),s)
@@ -743,16 +749,19 @@ def wz_issue(wz_id):
         except ValueError as exc:
             c.rollback()
             return str(exc),409
-    D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
     with D['conn']() as c:
         item_ids=[x['id'] for x in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
         snapshot_ids=[x['id'] for x in c.execute('SELECT id FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,)).fetchall()]
         material_ids=[x['material_id'] for x in c.execute("SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue'",(wz_id,)).fetchall()]
         movement_ids=[x['id'] for x in c.execute("SELECT id FROM raw_material_movements WHERE wz_id=?",(wz_id,)).fetchall()]
-    D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
-    D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
-    D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
-    D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
+    try:
+        D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
+        D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
+        D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
+        D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
+        D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
+    except Exception:
+        current_app.logger.exception('Nie udało się zsynchronizować wydania WZ %s; operacja lokalna została zachowana',wz_id)
     # Po zatwierdzeniu WZ od razu przechodzimy do jedynego następnego kroku:
     # wyboru kierowcy, auta i ilości kursu.
     return redirect(url_for('beton.transport_new',wz_id=wz_id))
