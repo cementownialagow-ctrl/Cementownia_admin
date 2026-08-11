@@ -2194,7 +2194,9 @@ def generate_order_invoice_pdf(order_row, items, meta):
     table_right = 198 * mm
     row_h = 12 * mm
     # L.p. | Nazwa/SKU | Ilo?? | Netto/szt | Brutto/szt | Wart. netto | VAT
-    col_x = [12 * mm, 20 * mm, 100 * mm, 113 * mm, 136 * mm, 159 * mm, 182 * mm, 198 * mm]
+    # Więcej miejsca na "Ilość [m³]"; poprzednie 13 mm powodowało
+    # nachodzenie nagłówka na kolumnę ceny netto.
+    col_x = [12 * mm, 20 * mm, 94 * mm, 114 * mm, 136 * mm, 158 * mm, 182 * mm, 198 * mm]
 
     def cell_center(x1, x2):
         return (x1 + x2) / 2.0
@@ -6053,6 +6055,11 @@ def order_create():
         try:
             sync_local_rows_to_supabase("wz_documents", "id", [wz_id])
             sync_local_rows_to_supabase("wz_items", "id", wz_item_ids)
+            with conn() as snapshot_conn:
+                wz_snapshot_ids = [row["id"] for row in snapshot_conn.execute(
+                    "SELECT id FROM wz_technology_snapshots WHERE wz_id=?", (wz_id,)
+                ).fetchall()]
+            sync_local_rows_to_supabase("wz_technology_snapshots", "id", wz_snapshot_ids)
         except Exception as exc:
             app.logger.exception("Nie udało się zapisać automatycznego WZ %s w Supabase", wz_id)
             return render_template_string("""
