@@ -736,6 +736,25 @@ def transport_course_print(transport_id):
         items=c.execute('''SELECT COALESCE(p.name,wi.sku) product,ti.qty
             FROM transport_items ti JOIN wz_items wi ON wi.id=ti.wz_item_id
             LEFT JOIN products p ON p.id=wi.product_id WHERE ti.transport_id=? ORDER BY ti.id''',(transport_id,)).fetchall()
+        course_ids=[int(x['id']) for x in c.execute('SELECT id FROM transports WHERE wz_id=(SELECT wz_id FROM transports WHERE id=?) AND deleted_at IS NULL ORDER BY created_at,id',(transport_id,)).fetchall()]
+        course_index=course_ids.index(int(transport_id))
+        def course_suffix(index):
+            value=index+1; result=''
+            while value:
+                value,remainder=divmod(value-1,26); result=chr(65+remainder)+result
+            return result
+        transport=dict(transport)
+        transport['course_wz_no']=f"{transport['wz_no']}/{course_suffix(course_index)}"
+        completed_ids=course_ids[:course_index+1]
+        placeholders=','.join('?' for _ in completed_ids)
+        cumulative=float(c.execute(f'SELECT COALESCE(SUM(qty),0) FROM transport_items WHERE transport_id IN ({placeholders})',completed_ids).fetchone()[0] or 0)
+        full_items=c.execute('''SELECT COALESCE(p.name,wi.sku) product,COALESCE(wi.qty_issued,wi.qty_planned) qty
+            FROM wz_items wi LEFT JOIN products p ON p.id=wi.product_id
+            WHERE wi.wz_id=(SELECT wz_id FROM transports WHERE id=?) ORDER BY wi.id''',(transport_id,)).fetchall()
+        full_total=sum(float(x['qty'] or 0) for x in full_items)
+        transport['is_final_course']=cumulative+0.00001>=full_total
+    course_tpl='''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{t.course_wz_no}}</title><style>body{font:14px Arial;max-width:900px;margin:35px auto;color:#111}table{border-collapse:collapse;width:100%;margin:22px 0}td,th{border:1px solid #222;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:25px}.sign{margin-top:60px;border-top:1px solid #111;padding-top:8px;width:40%;text-align:center}.full-wz{page-break-before:always;padding-top:20px}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>WZ kursu {{t.course_wz_no}}</h1><p>Kurs: <b>{{t.transport_no}}</b> · dokument główny: <b>{{t.wz_no}}</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}<br><br><b>Adres dostawy</b><br>{{t.destination or '—'}}</div><div><b>Kierowca / auto</b><br>{{t.driver_name}} · {{t.registration_no}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość kursu [m³]</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis odbiorcy dla kursu</div>{% if t.is_final_course %}<section class="full-wz"><h1>Wydanie zewnętrzne {{t.wz_no}}</h1><p><b>Pełna WZ zbiorcza — dołączona do ostatniego kursu.</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}</div><div><b>Adres dostawy</b><br>{{t.destination or '—'}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Łączna ilość [m³]</th></tr></thead><tbody>{% for i in full_items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis i pieczęć odbiorcy — pełna WZ</div></section>{% endif %}</html>'''
+    return render_template_string(course_tpl,t=transport,items=items,full_items=full_items)
     return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>WZ kursu {{t.transport_no}}</title><style>body{font:14px Arial;max-width:900px;margin:35px auto}table{border-collapse:collapse;width:100%;margin:22px 0}td,th{border:1px solid #222;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:25px}.sign{margin-top:60px;border-top:1px solid #111;padding-top:8px;width:40%;text-align:center}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>WZ cząstkowa / kurs {{t.transport_no}}</h1><p>Dokument do WZ zbiorczej: <b>{{t.wz_no}}</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}<br><br><b>Adres dostawy</b><br>{{t.destination or '—'}}</div><div><b>Kierowca / auto</b><br>{{t.driver_name}} · {{t.registration_no}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość [m³]</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis odbiorcy dla kursu</div></html>''',t=transport,items=items)
 
 @bp.get('/transports/<int:transport_id>')
