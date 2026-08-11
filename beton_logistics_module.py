@@ -111,6 +111,36 @@ def next_wz_no(c):
     year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM wz_documents WHERE wz_no LIKE ?",(f'WZ/{year}/%',)).fetchone()[0]+1
     return f'WZ/{year}/{n:05d}'
 
+
+def create_wz_from_order(c, order_id, destination='', issue_location='Beton Łagów', warehouse_location='Magazyn główny', created_by=None):
+    """Create the initial WZ together with a newly entered concrete order."""
+    order=c.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+    if not order:
+        raise ValueError('Nie znaleziono zamówienia do wystawienia WZ.')
+    items=c.execute('SELECT * FROM order_items WHERE order_id=? ORDER BY id',(order_id,)).fetchall()
+    if not items:
+        raise ValueError('Nie można wystawić WZ bez pozycji zamówienia.')
+    created_at=stamp()
+    wz_id=cloud_id()
+    final_destination=(destination or order['customer_address'] or '').strip()
+    c.execute('''INSERT INTO wz_documents(id,wz_no,order_id,issue_location,warehouse_location,destination,status,created_by,created_at,notes)
+        VALUES(?,?,?,?,?,?,'created',?,?,?)''',(
+            wz_id,next_wz_no(c),order_id,issue_location,warehouse_location,final_destination,
+            created_by or actor(),created_at,''
+        ))
+    wz_item_ids=[]
+    for item in items:
+        qty=float(item['qty'] or 0)
+        if qty<=0:
+            continue
+        wz_item_id=cloud_id()
+        c.execute('''INSERT INTO wz_items(id,wz_id,order_item_id,product_id,sku,qty_planned,created_at)
+            VALUES(?,?,?,?,?,?,?)''',(wz_item_id,wz_id,item['id'],item['product_id'],item['sku'],qty,created_at))
+        wz_item_ids.append(wz_item_id)
+    if not wz_item_ids:
+        raise ValueError('WZ musi zawierać co najmniej jedną pozycję.')
+    return wz_id,wz_item_ids
+
 def driver_auth_email(username):
     value=unicodedata.normalize('NFD',(username or '').strip().lower())
     value=''.join(ch for ch in value if unicodedata.category(ch)!='Mn')
@@ -285,7 +315,7 @@ def wz_view(wz_id):
         <table><thead><tr><th>Produkt</th><th>Plan [m³]</th><th>Wydano [m³]</th></tr></thead><tbody>
           {% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_planned}}</td><td>{{x.qty_issued if x.qty_issued is not none else '—'}}</td></tr>{% endfor %}
         </tbody></table>
-        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status=='issued' and not transport %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przypisz kierowcę i auto</a>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Transport {{transport.transport_no}}</a>{% endif %}</div>
+        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Potwierdź wydanie w {{w.warehouse_location}}</button></form>{% elif w.status in ['issued','in_transport'] %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Przydziel transport(y) — maks. 8 m³</a>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Ostatni transport {{transport.transport_no}}</a>{% endif %}</div>
       </div>
       <div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>
       <div class="card"><h2>Zdjęcia podpisanego WZ</h2>{% for p in photos %}<div class="flex" style="margin:8px 0"><span>{{p.created_at}}</span><a class="btn" href="{{url_for('beton.photo_download',photo_id=p.id)}}">Pobierz zdjęcie</a></div>{% else %}<span class="muted">Brak zdjęć.</span>{% endfor %}</div>
@@ -352,6 +382,10 @@ def wz_issue(wz_id):
         if not w:abort(409)
         c.execute('UPDATE wz_items SET qty_issued=qty_planned WHERE wz_id=?',(wz_id,))
         c.execute("UPDATE wz_documents SET status='issued',issued_by=?,issued_at=? WHERE id=?",(actor(),s,wz_id))
+    D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
+    with D['conn']() as c:
+        item_ids=[x['id'] for x in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
+    D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
     return redirect(url_for('beton.wz_view',wz_id=wz_id))
 
 @bp.post('/wz/<int:wz_id>/ready')
@@ -475,26 +509,43 @@ def transports():
 def transport_new():
     wz_id=int(request.values.get('wz_id') or 0)
     with D['conn']() as c:
-        wz_rows=c.execute("""SELECT w.id,w.wz_no,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.status='issued' AND w.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL) ORDER BY w.id DESC""").fetchall()
+        wz_rows=c.execute("""SELECT w.id,w.wz_no,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.status IN ('issued','in_transport') AND w.deleted_at IS NULL ORDER BY w.id DESC""").fetchall()
         ds=c.execute('SELECT * FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name').fetchall(); vs=c.execute('SELECT * FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no').fetchall()
-        wz=c.execute("SELECT w.*,o.customer_name,o.note AS order_delivery_address,o.customer_address FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status='issued'",(wz_id,)).fetchone() if wz_id else None
-        wz_items=c.execute('SELECT * FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall() if wz else []
+        wz=c.execute("SELECT w.*,o.customer_name,o.note AS order_delivery_address,o.customer_address FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status IN ('issued','in_transport')",(wz_id,)).fetchone() if wz_id else None
+        wz_items=[dict(row) for row in c.execute('''SELECT wi.*,COALESCE((SELECT SUM(ti.qty) FROM transport_items ti
+              JOIN transports t ON t.id=ti.transport_id WHERE ti.wz_item_id=wi.id AND t.deleted_at IS NULL),0) AS assigned_qty
+              FROM wz_items wi WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()] if wz else []
         if wz:
             wz=dict(wz)
             wz['destination']=(wz.get('destination') or wz.get('order_delivery_address') or wz.get('customer_address') or '').strip()
+        capacity=8.0
+        allocation_plan=[]
+        capacity_left=capacity
+        for item in wz_items:
+            issued=float(item['qty_issued'] if item['qty_issued'] is not None else item['qty_planned'] or 0)
+            remaining=max(0.0,issued-float(item.get('assigned_qty') or 0))
+            item['remaining_qty']=remaining
+            if remaining>0 and capacity_left>0:
+                qty=min(remaining,capacity_left)
+                allocation_plan.append((item,qty))
+                capacity_left-=qty
+        allocation_by_item={int(item['id']):qty for item,qty in allocation_plan}
+        remaining_total=sum(float(item['remaining_qty']) for item in wz_items)
         if request.method=='POST':
             if not wz:abort(400)
             if not ds or not vs:raise ValueError('Najpierw dodaj kierowcę i pojazd')
+            if not allocation_plan:
+                return 'Cała ilość z WZ jest już przydzielona do transportów.',409
             destination=request.form.get('destination','').strip() or (wz['destination'] or '').strip() or (wz['order_delivery_address'] or '').strip() or (wz['customer_address'] or '').strip()
             s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],destination,actor(),actor(),s,s));
-            for item in wz_items:c.execute('INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)',(cloud_id(),tid,item['id'],item['qty_issued'] or item['qty_planned'],s))
+            for item,qty in allocation_plan:c.execute('INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)',(cloud_id(),tid,item['id'],qty,s))
             c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'create','transport',tid,'{}',s))
             c.commit()
             D['sync_local_rows_to_supabase']('transports','id',[tid])
             transport_item_ids=[x['id'] for x in c.execute('SELECT id FROM transport_items WHERE transport_id=?',(tid,)).fetchall()]
             D['sync_local_rows_to_supabase']('transport_items','id',transport_item_ids)
-            return redirect(url_for('beton.transport_view',transport_id=tid))
-    return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Transport z dokumentu WZ</h1><div class="card"><form method="get"><label>Wydane WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div></div><label>Miejsce dostawy</label><input name="destination" value="{{wz.destination or ''}}"><table><thead><tr><th>Materiał</th><th>Ilość wydana</th></tr></thead><tbody>{% for x in wz_items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued or x.qty_planned}}</td></tr>{% endfor %}</tbody></table><button class="btn primary">Utwórz i przypisz transport</button></form>{% endif %}{% endblock %}''',wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+            return redirect(url_for('beton.transport_new',wz_id=wz_id,created=1))
+    return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Przydziel transporty z dokumentu WZ</h1><div class="card"><form method="get"><label>Wydane WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>{% if request.args.get('created') %}<div class="notice">Transport został przydzielony. Jeśli pozostała ilość, przydziel kolejny kurs.</div>{% endif %}{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div></div><label>Adres dostawy</label><input name="destination" value="{{wz.destination or ''}}" required><p class="muted">Gruszka zabiera maksymalnie 8 m³. System sam przygotuje najbliższy kurs, a następnie pokaże pozostałą ilość do przydzielenia.</p><table><thead><tr><th>Produkt</th><th>WZ [m³]</th><th>Już przydzielono [m³]</th><th>Ten transport [m³]</th></tr></thead><tbody>{% for x in wz_items %}{% set planned=x.qty_issued if x.qty_issued is not none else x.qty_planned %}<tr><td>{{x.sku}}</td><td>{{planned}}</td><td>{{x.assigned_qty}}</td><td>{{allocation_by_item.get(x.id, '—')}}</td></tr>{% endfor %}</tbody></table><p><b>Pozostało do rozdzielenia: {{remaining_total}} m³.</b> Ten kurs: <b>{{capacity - capacity_left}} m³</b>.</p>{% if allocation_plan %}<button class="btn primary">Utwórz i przypisz transport (maks. 8 m³)</button>{% else %}<span class="badge">Cała ilość została już przydzielona do transportów.</span>{% endif %}</form>{% endif %}{% endblock %}''',wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,allocation_plan=allocation_plan,allocation_by_item=allocation_by_item,remaining_total=remaining_total,capacity=capacity,capacity_left=capacity_left,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
 @bp.get('/transports/<int:transport_id>')
 def transport_view(transport_id):
