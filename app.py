@@ -3114,6 +3114,9 @@ BASE = r"""
     table{width:100%;border-collapse:separate;border-spacing:0;min-width:660px}th,td{border-bottom:1px solid #edf0f5;padding:12px 11px;text-align:left;vertical-align:middle}th{background:#f8f9fc;color:#64718a;font-size:11px;text-transform:uppercase;letter-spacing:.45px;font-weight:750}thead th:first-child{border-radius:12px 0 0 12px}thead th:last-child{border-radius:0 12px 12px 0}tbody tr{transition:.15s}tbody tr:hover{background:#fafbff}
     .badge{display:inline-block;padding:5px 10px;border-radius:999px;border:1px solid #dfe4ef;background:#f8faff;color:#526079;font-size:11px;font-weight:700}.st-confirmed,.badge-paid{background:#e8f9f3!important;color:#16835f!important;border-color:#c9efe2!important}.st-unconfirmed{background:#fff1f2!important;color:#be3b50!important;border-color:#ffd7dc!important}.st-delivery{background:#edf3ff!important;color:#4166d3!important;border-color:#d9e4ff!important}.st-issued{background:#f0f2f6!important;color:#667085!important}
     .flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.right{margin-left:auto}.small{font-size:12px}.grid3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:16px}.line{height:1px;background:#edf0f5;margin:16px 0}.hint{background:#fff9e9;border:1px solid #f8e6ae;padding:12px 14px;border-radius:14px;color:#7e641b;font-size:13px}.kpi{display:flex;gap:10px;flex-wrap:wrap}.kpi .pill{background:#f4f7ff;border:1px solid #e1e8fb;padding:8px 11px;border-radius:999px;color:#516582;font-size:12px}.items-row{display:grid;grid-template-columns:2fr 120px 120px 120px;gap:10px;align-items:center}
+    .nav a.nav-invoices:before{content:"\1F4C4";font-family:"Segoe UI Emoji","Apple Color Emoji",sans-serif}
+    .nav a.nav-wz:before{content:"\1F4CB";font-family:"Segoe UI Emoji","Apple Color Emoji",sans-serif}
+    .nav a.nav-transports:before{content:"\1F69A";font-family:"Segoe UI Emoji","Apple Color Emoji",sans-serif}
     @media(max-width:980px){.top{transform:translateX(-110%);transition:.25s}.top.open{transform:translateX(0)}.mobile-toggle{display:grid;place-items:center;position:fixed;right:14px;bottom:14px;z-index:1200;width:52px;height:52px;border:0;border-radius:17px;background:var(--navy);color:#fff;font-size:22px;box-shadow:0 12px 28px rgba(12,28,58,.28)}.wrap{margin-left:0;padding:18px 14px 80px}.row,.grid3{grid-template-columns:1fr}.items-row{grid-template-columns:1fr 1fr}}
     @media(max-width:560px){.card{padding:15px;border-radius:18px}.items-row{grid-template-columns:1fr}.flex>.right{margin-left:0}h1{font-size:22px}}
   </style>
@@ -3126,10 +3129,10 @@ BASE = r"""
       <a class="{% if request.endpoint == 'home' %}active{% endif %}" href="{{ url_for('home') }}">Pulpit</a>
       <a class="{% if request.endpoint in ['orders','order_view'] %}active{% endif %}" href="{{ url_for('orders') }}">Zamówienia</a>
       <a class="{% if request.endpoint == 'order_new' %}active{% endif %}" href="{{ url_for('order_new') }}">Nowe zamówienie</a>
-      <a href="{{ url_for('invoices') }}">Faktury</a>
-      <a href="{{ url_for('beton.wz_list') }}">Dokumenty WZ</a>
+      <a class="nav-invoices" href="{{ url_for('invoices') }}">Faktury</a>
+      <a class="nav-wz" href="{{ url_for('beton.wz_list') }}">Dokumenty WZ</a>
       <a class="{% if request.endpoint == 'raw_material_warehouse' %}active{% endif %}" href="{{ url_for('raw_material_warehouse') }}">Magazyn</a>
-      <a href="{{ url_for('beton.transports') }}">Transporty</a>
+      <a class="nav-transports" href="{{ url_for('beton.transports') }}">Transporty</a>
       <a href="{{ url_for('dispatch.appointments') }}">Wydaj transport</a>
       <a href="{{ url_for('beton.drivers') }}">Kierowcy i pojazdy</a>
       <a href="{{ url_for('ops.operations') }}">Koszty i zużycie</a>
