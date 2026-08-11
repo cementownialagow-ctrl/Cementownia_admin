@@ -3284,7 +3284,7 @@ def home():
             return "Wydane"
         return "Nieprzydzielone"
 
-    all_orders = [dict(row) for row in cur.execute("SELECT id FROM orders WHERE lower(COALESCE(status,'')) <> 'cancelled'").fetchall()]
+    all_orders = [dict(row) for row in cur.execute("SELECT id,delivery_date FROM orders WHERE lower(COALESCE(status,'')) <> 'cancelled'").fetchall()]
     for order in recent_orders:
         order["delivery_status"] = dashboard_delivery_status(order["id"])
     dashboard_counts = {}
@@ -3297,6 +3297,12 @@ def home():
     status_signed = dashboard_counts.get("WZ podpisane", 0)
     status_done = dashboard_counts.get("Zakończone", 0)
     status_invoice = dashboard_counts.get("FV wystawiona", 0)
+    today_iso = datetime.now().date().isoformat()
+    today_remaining = sum(
+        1 for order in all_orders
+        if norm(order.get("delivery_date")) == today_iso
+        and dashboard_delivery_status(order["id"]) not in {"Zakończone", "FV wystawiona"}
+    )
     status_total = sum(dashboard_counts.values())
     status_divisor = max(1, status_total)
     c.close()
@@ -3316,7 +3322,7 @@ def home():
 
       <div class="metrics">
         <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
-        <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>W realizacji</span><b>{{ n_orders_current }}</b><small>zamówienia wymagające obsługi</small></div></div>
+        <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>W realizacji</span><b>{{ n_orders_current }}</b><small><a href="{{ url_for('orders', tab='today') }}">Pozostało do realizacji dzisiaj ({{ today_remaining }})</a></small></div></div>
       </div>
 
       <div class="dash-grid">
@@ -3340,7 +3346,7 @@ def home():
     {% endblock %}
     """
     return render_template_string(tpl, title="Start", base_url=BASE_URL, db_path=DB_PATH,
-                                  n_orders_current=n_orders_current, n_orders_today=n_orders_today,
+                                  n_orders_current=n_orders_current, n_orders_today=n_orders_today, today_remaining=today_remaining,
                                   recent_orders=recent_orders, status_new=status_new, status_assigned=status_assigned,
                                   status_delivery=status_delivery, status_signed=status_signed, status_done=status_done,
                                   status_invoice=status_invoice, status_total=status_total,
@@ -3932,7 +3938,7 @@ register_dispatch(app, {
     "DB_PATH": DB_PATH,
 })
 
-register_operations(app, conn, now_iso)
+register_operations(app, conn, now_iso, maybe_pull_shared_from_supabase)
 
 
 @app.after_request
