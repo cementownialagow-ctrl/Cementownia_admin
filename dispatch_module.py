@@ -7,7 +7,7 @@ import math
 import secrets
 import time
 
-from flask import Blueprint, abort, redirect, render_template_string, request, session, url_for
+from flask import Blueprint, abort, current_app, redirect, render_template_string, request, session, url_for
 
 bp = Blueprint("dispatch", __name__, url_prefix="/dispatch")
 D = {}
@@ -65,6 +65,10 @@ def register_dispatch(app, deps):
 
 @bp.route("/appointments", methods=["GET", "POST"])
 def appointments():
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        current_app.logger.exception('Nie udało się odświeżyć zamówień przed planowaniem transportów')
     day = request.values.get("day") or _now()[:10]
     if request.method == "POST":
         order_id = int(request.form.get("order_id") or 0)
@@ -171,7 +175,7 @@ def appointments():
                   EXISTS (SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL
                     AND t.status NOT IN ('returned','closed')
                     AND NOT EXISTS (SELECT 1 FROM dispatch_appointments a WHERE a.transport_id=t.id AND a.status NOT IN ('departed','cancelled')))
-                  OR COALESCE((SELECT SUM(wi.qty_issued) FROM wz_items wi WHERE wi.wz_id=w.id),0) >
+                  OR COALESCE((SELECT SUM(COALESCE(wi.qty_issued,wi.qty_planned)) FROM wz_items wi WHERE wi.wz_id=w.id),0) >
                      COALESCE((SELECT SUM(ti.qty) FROM transport_items ti JOIN transports t ON t.id=ti.transport_id
                        WHERE t.wz_id=w.id AND t.deleted_at IS NULL),0)
                 )
@@ -184,7 +188,7 @@ def appointments():
               EXISTS (SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL
                 AND t.status NOT IN ('returned','closed')
                 AND NOT EXISTS (SELECT 1 FROM dispatch_appointments a WHERE a.transport_id=t.id AND a.status NOT IN ('departed','cancelled')))
-              OR COALESCE((SELECT SUM(wi.qty_issued) FROM wz_items wi WHERE wi.wz_id=w.id),0) >
+              OR COALESCE((SELECT SUM(COALESCE(wi.qty_issued,wi.qty_planned)) FROM wz_items wi WHERE wi.wz_id=w.id),0) >
                  COALESCE((SELECT SUM(ti.qty) FROM transport_items ti JOIN transports t ON t.id=ti.transport_id
                    WHERE t.wz_id=w.id AND t.deleted_at IS NULL),0)
             )

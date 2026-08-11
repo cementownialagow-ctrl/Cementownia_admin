@@ -1070,6 +1070,16 @@ def transport_ready(transport_id):
         if not transport: abort(404)
         if transport['status'] not in ('assigned','issued'):
             return redirect(url_for('beton.transport_view',transport_id=transport_id))
+        wz=c.execute('SELECT id,status FROM wz_documents WHERE id=? AND deleted_at IS NULL',(transport['wz_id'],)).fetchone()
+        if not wz: abort(404)
+        if wz['status']=='created':
+            try:
+                c.execute('UPDATE wz_items SET qty_issued=qty_planned WHERE wz_id=?',(wz['id'],))
+                issue_recipe_materials(c,wz['id'],actor(),now)
+                c.execute("UPDATE wz_documents SET status='issued',issued_by=?,issued_at=? WHERE id=?",(actor(),now,wz['id']))
+            except ValueError as exc:
+                c.rollback()
+                return str(exc),409
         appointment=c.execute('SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
         if appointment:
             appointment_id=int(appointment['id'])
@@ -1080,6 +1090,16 @@ def transport_ready(transport_id):
         c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'ready_for_driver','transport',transport_id,'{}',now))
     D['sync_local_rows_to_supabase']('transports','id',[transport_id])
     if appointment_id: D['sync_local_rows_to_supabase']('dispatch_appointments','id',[appointment_id])
+    D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
+    with D['conn']() as c:
+        wz_item_ids=[row['id'] for row in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
+        snapshot_ids=[row['id'] for row in c.execute('SELECT id FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,)).fetchall()]
+        material_ids=[row['material_id'] for row in c.execute("SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue'",(wz_id,)).fetchall()]
+        movement_ids=[row['id'] for row in c.execute('SELECT id FROM raw_material_movements WHERE wz_id=?',(wz_id,)).fetchall()]
+    D['sync_local_rows_to_supabase']('wz_items','id',wz_item_ids)
+    D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
+    D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
+    D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
     return redirect(url_for('beton.transport_view',transport_id=transport_id))
 
 @bp.post('/transports/<int:transport_id>/delivery-data')
