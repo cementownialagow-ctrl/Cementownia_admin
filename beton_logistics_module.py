@@ -543,6 +543,22 @@ def build_wz_form_pdf(w,items,courses,technology,company,adjustment=None):
     date_value=issued[:10]; time_value=issued[11:16]
     first_course=dict(courses[0]) if courses else {}
     tech=technology[0] if technology else {}
+    recipe_materials=tech.get('materials') or []
+    cement_material=next((m for m in recipe_materials if
+        (m.get('material_type') or '').lower()=='cement' or 'cement' in (m.get('name') or '').lower()),{})
+    aggregate_materials=[m for m in recipe_materials if
+        (m.get('material_type') or '').lower() in ('kruszywo','aggregate','piasek','żwir') or
+        any(word in (m.get('name') or '').lower() for word in ('piasek','żwir','kruszywo','grys'))]
+    aggregate_parts=[]
+    for material in aggregate_materials:
+        description=material.get('aggregate_type') or material.get('name') or ''
+        fraction=material.get('fraction') or material.get('max_grain_size') or ''
+        value=' '.join(str(x) for x in (description,fraction) if x)
+        if value and value not in aggregate_parts: aggregate_parts.append(value)
+    aggregate_value=', '.join(aggregate_parts) or tech.get('max_aggregate_size')
+    aggregate_label='Kruszywo / uziarnienie' if aggregate_parts else 'Maks. wymiar kruszywa'
+    cement_value=tech.get('cement_type') or cement_material.get('technical_designation') or cement_material.get('cement_designation') or cement_material.get('name')
+    reference_value=tech.get('reference_document') or cement_material.get('reference_document')
     delivery_method='ODBIÓR WŁASNY' if str(w.get('delivery_method') or '').lower()=='pickup' else 'DOSTAWA'
     total_qty=sum(float(i['qty_issued'] if i['qty_issued'] is not None else i['qty_planned']) for i in items)
     product=', '.join(str(i['sku']) for i in items)
@@ -581,7 +597,7 @@ def build_wz_form_pdf(w,items,courses,technology,company,adjustment=None):
     tech_h=49*mm; tech_y=people_y-tech_h; rect(left,tech_y,width,tech_h)
     centered(left,people_y-6*mm,width,'Specyfikacja techniczna wskazana przez zamawiającego',10,True)
     col=width/4
-    fields=[('Cement',tech.get('cement_type')),('Dokument odniesienia',tech.get('reference_document')),('Klasa ekspozycji',tech.get('exposure_class')),('Rodzaj kruszywa',tech.get('max_aggregate_size')),('Konsystencja',tech.get('consistency')),('W/S',tech.get('water_cement_ratio')),('Wytrzymałość',tech.get('characteristic_strength')),('Klasa chlorków',tech.get('chloride_class'))]
+    fields=[('Cement',cement_value),('Dokument odniesienia',reference_value),('Klasa ekspozycji',tech.get('exposure_class')),(aggregate_label,aggregate_value),('Konsystencja',tech.get('consistency')),('W/S',tech.get('water_cement_ratio')),('Wytrzymałość',tech.get('characteristic_strength')),('Klasa chlorków',tech.get('chloride_class'))]
     for idx,(label,value) in enumerate(fields):
         row=idx//4; column=idx%4; x=left+column*col; y=people_y-12*mm-row*17*mm
         if column: p.line(x,tech_y,x,people_y-8*mm)
