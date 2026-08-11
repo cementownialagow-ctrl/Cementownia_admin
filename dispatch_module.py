@@ -3,6 +3,7 @@
 Moduł celowo nie steruje stanem magazynowym ani nie odczytuje wagi. Zachowuje
 etapy zakładowe, aby później można było bezpiecznie dołączyć urządzenie wagi.
 """
+import math
 import secrets
 import time
 
@@ -91,6 +92,14 @@ def appointments():
                 D['sync_local_rows_to_supabase']('transports','id',[transport_id])
                 item_ids=[x['id'] for x in c.execute('SELECT id FROM transport_items WHERE transport_id=?',(transport_id,)).fetchall()]
                 D['sync_local_rows_to_supabase']('transport_items','id',item_ids)
+        # Przypomnienie o rozdzieleniu betonu na gruszki pojawia się zaraz po
+        # dodaniu pierwszej awizacji. Jedna gruszka może zabrać maks. 8 m³.
+        total_row = c.execute("SELECT COALESCE(SUM(qty), 0) AS total_m3 FROM order_items WHERE order_id=?", (order_id,)).fetchone()
+        total_m3 = float(total_row["total_m3"] or 0)
+        required_trips = max(1, math.ceil(total_m3 / 8))
+        if required_trips > 1:
+            notice = f"Zamówienie ma {total_m3:g} m³. Wymaga co najmniej {required_trips} podjazdów po maksymalnie 8 m³. Dodaj kolejne awizacje dla pozostałej ilości."
+            return redirect(url_for("dispatch.appointments", day=day, capacity_notice=notice))
         return redirect(url_for("dispatch.appointments", day=day))
     with D["conn"]() as c:
         rows = c.execute("""SELECT a.*,o.order_no,o.customer_name,v.registration_no,d.name driver_name,b.code bay_code,t.status transport_status,
@@ -98,17 +107,48 @@ def appointments():
           FROM dispatch_appointments a JOIN orders o ON o.id=a.order_id
           LEFT JOIN transports t ON t.id=a.transport_id
           LEFT JOIN vehicles v ON v.id=a.vehicle_id LEFT JOIN drivers d ON d.id=a.driver_id LEFT JOIN loading_bays b ON b.id=a.loading_bay_id
-          WHERE a.planned_date=? ORDER BY a.queue_position,a.time_from,a.id""", (day,)).fetchall()
+          WHERE a.planned_date=?
+            AND COALESCE(t.status,'assigned') NOT IN ('returned','closed')
+            AND COALESCE(a.status,'planned') NOT IN ('departed','cancelled')
+          ORDER BY a.queue_position,a.time_from,a.id""", (day,)).fetchall()
         rows = [dict(x) for x in rows]
         for x in rows:
             x['display_stage'] = TRANSPORT_STAGE_LABEL.get(x.get('transport_status')) or STAGE_LABEL.get(x['status'], x['status'])
-        orders = c.execute("SELECT id,order_no,customer_name FROM orders WHERE lower(status) <> 'cancelled' ORDER BY id DESC LIMIT 300").fetchall()
-        wzs = c.execute("SELECT w.id,w.wz_no,o.order_no FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.deleted_at IS NULL ORDER BY w.id DESC LIMIT 300").fetchall()
+        # W formularzu pokazujemy tylko zamówienia, które nie trafiły jeszcze
+        # do harmonogramu ani nie mają przypisanego aktywnego transportu.
+        orders = c.execute("""SELECT o.id,o.order_no,o.customer_name,
+            COALESCE((SELECT SUM(oi.qty) FROM order_items oi WHERE oi.order_id=o.id),0) AS total_m3,
+            MAX(1, CAST((COALESCE((SELECT SUM(oi.qty) FROM order_items oi WHERE oi.order_id=o.id),0)+7.999999)/8 AS INTEGER)) AS required_trips
+          FROM orders o
+          WHERE lower(COALESCE(o.status,'')) NOT IN ('cancelled','issued','invoiced','completed')
+            AND NOT EXISTS (
+              SELECT 1 FROM dispatch_appointments a
+              WHERE a.order_id=o.id AND a.status NOT IN ('departed','cancelled')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM wz_documents w
+              JOIN transports t ON t.wz_id=w.id AND t.deleted_at IS NULL
+              WHERE w.order_id=o.id AND w.deleted_at IS NULL
+                AND t.status NOT IN ('returned','closed')
+            )
+          ORDER BY o.id DESC LIMIT 300""").fetchall()
+        wzs = c.execute("""SELECT w.id,w.wz_no,o.order_no FROM wz_documents w
+          JOIN orders o ON o.id=w.order_id
+          WHERE w.deleted_at IS NULL AND w.status NOT IN ('ready_invoice','invoiced','returned','completed')
+            AND NOT EXISTS (
+              SELECT 1 FROM dispatch_appointments a
+              WHERE a.wz_id=w.id AND a.status NOT IN ('departed','cancelled')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL
+                AND t.status NOT IN ('returned','closed')
+            )
+          ORDER BY w.id DESC LIMIT 300""").fetchall()
         transports = c.execute("SELECT id,transport_no FROM transports WHERE deleted_at IS NULL AND status NOT IN ('returned','closed') ORDER BY id DESC LIMIT 300").fetchall()
         drivers = c.execute("SELECT id,name FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name").fetchall()
         vehicles = c.execute("SELECT id,registration_no FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no").fetchall()
         bays = c.execute("SELECT * FROM loading_bays WHERE active=1 ORDER BY code").fetchall()
-    return render_template_string(TPL, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, vehicles=vehicles, bays=bays, day=day, labels=STAGE_LABEL, title="Awizacje", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
+    return render_template_string(TPL, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, vehicles=vehicles, bays=bays, day=day, labels=STAGE_LABEL, capacity_notice=request.args.get("capacity_notice", ""), title="Awizacje", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
 
 @bp.post("/appointments/<int:appointment_id>/status")
 def appointment_status(appointment_id):
@@ -145,7 +185,10 @@ def queue():
     with D["conn"]() as c:
         rows=c.execute("""SELECT a.*,o.customer_name,v.registration_no,d.name driver_name,b.code bay_code FROM dispatch_appointments a
           JOIN orders o ON o.id=a.order_id LEFT JOIN vehicles v ON v.id=a.vehicle_id LEFT JOIN drivers d ON d.id=a.driver_id LEFT JOIN loading_bays b ON b.id=a.loading_bay_id
-          WHERE a.planned_date=? AND a.status NOT IN ('departed','cancelled') ORDER BY a.queue_position,a.time_from""",(day,)).fetchall()
+          LEFT JOIN transports t ON t.id=a.transport_id
+          WHERE a.planned_date=? AND a.status NOT IN ('departed','cancelled')
+            AND COALESCE(t.status,'assigned') NOT IN ('returned','closed')
+          ORDER BY a.queue_position,a.time_from""",(day,)).fetchall()
     groups={"waiting":[],"weighing":[],"loading":[],"ready":[]}
     for row in rows:
         key="waiting" if row["status"] in {"planned","waiting","gate_entered","waiting_for_loading"} else "weighing" if row["status"] in {"first_weighing","second_weighing"} else "loading" if row["status"]=="loading" else "ready"
@@ -155,6 +198,6 @@ def queue():
 TPL = '''{% extends "base.html" %}{% block content %}
 <div class="flex"><h1>Awizacje zakładowe</h1><a class="btn right" href="{{url_for('dispatch.queue',day=day)}}">Ekran kolejki</a></div>
 <div class="card"><form method="get" class="flex"><label>Data <input type="date" name="day" value="{{day}}"></label><button class="btn primary">Pokaż dzień</button></form></div>
-<div class="card"><h2>Dodaj awizację</h2><form method="post" class="grid3"><input type="hidden" name="planned_date" value="{{day}}"><div><label>Zamówienie</label><select name="order_id" required><option value="">Wybierz</option>{% for x in orders %}<option value="{{x.id}}">{{x.order_no}} · {{x.customer_name}}</option>{% endfor %}</select></div><div><label>Planowany wyjazd</label><input name="time_from" type="time"></div><div><label>Planowana dostawa</label><input name="time_to" type="time"></div><div><label>Zmiana</label><input name="shift" placeholder="np. I"></div><div><label>WZ (opcjonalnie)</label><select name="wz_id"><option value="">—</option>{% for x in wzs %}<option value="{{x.id}}">{{x.wz_no}} · {{x.order_no}}</option>{% endfor %}</select></div><div><label>Transport</label><select name="transport_id"><option value="">—</option>{% for x in transports %}<option value="{{x.id}}">{{x.transport_no}}</option>{% endfor %}</select></div><div><label>Stanowisko</label><select name="loading_bay_id"><option value="">—</option>{% for x in bays %}<option value="{{x.id}}">{{x.code}}</option>{% endfor %}</select></div><div><label>Kierowca</label><select name="driver_id"><option value="">—</option>{% for x in drivers %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Auto</label><select name="vehicle_id"><option value="">—</option>{% for x in vehicles %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn primary">Dodaj do harmonogramu</button></div></form></div>
+<div class="card"><h2>Dodaj awizację</h2>{% if capacity_notice %}<div class="notice warn"><b>Podział transportu:</b> {{capacity_notice}}</div>{% endif %}<form method="post" class="grid3"><input type="hidden" name="planned_date" value="{{day}}"><div><label>Zamówienie</label><select name="order_id" required><option value="">Wybierz</option>{% for x in orders %}<option value="{{x.id}}">{{x.order_no}} · {{x.customer_name}} · {{'%.2f'|format(x.total_m3)|replace('.', ',')}} m³ · min. {{x.required_trips}} podjazd(y)</option>{% endfor %}</select></div><div><label>Planowany wyjazd</label><input name="time_from" type="time"></div><div><label>Planowana dostawa</label><input name="time_to" type="time"></div><div><label>Zmiana</label><input name="shift" placeholder="np. I"></div><div><label>WZ (opcjonalnie)</label><select name="wz_id"><option value="">—</option>{% for x in wzs %}<option value="{{x.id}}">{{x.wz_no}} · {{x.order_no}}</option>{% endfor %}</select></div><div><label>Transport</label><select name="transport_id"><option value="">—</option>{% for x in transports %}<option value="{{x.id}}">{{x.transport_no}}</option>{% endfor %}</select></div><div><label>Stanowisko</label><select name="loading_bay_id"><option value="">—</option>{% for x in bays %}<option value="{{x.id}}">{{x.code}}</option>{% endfor %}</select></div><div><label>Kierowca</label><select name="driver_id"><option value="">—</option>{% for x in drivers %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Auto</label><select name="vehicle_id"><option value="">—</option>{% for x in vehicles %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn primary">Dodaj do harmonogramu</button></div></form></div>
 <div class="card"><table><thead><tr><th>Wyjazd / dostawa</th><th>Awizacja / klient</th><th>Auto / kierowca</th><th>Stanowisko</th><th>Etap transportu</th><th>Kolejka</th><th>Zmień etap zakładowy</th></tr></thead><tbody>{% for x in rows %}<tr><td><b>Wyjazd: {{x.time_from or '—'}}</b><br><b>Dostawa: {{x.time_to or '—'}}</b><br><span class="muted">{{x.shift or ''}}</span></td><td><b>{{x.appointment_no}}</b><br>{{x.customer_name}}<br><span class="muted">{{x.items or 'Pozycje WZ po utworzeniu'}}</span></td><td>{{x.registration_no or '—'}}<br>{{x.driver_name or '—'}}</td><td>{{x.bay_code or '—'}}</td><td><span class="badge">{{x.display_stage}}</span></td><td><form method="post" action="{{url_for('dispatch.appointment_move',appointment_id=x.id)}}"><input type="hidden" name="day" value="{{day}}"><button name="direction" value="up" class="btn">↑</button><button name="direction" value="down" class="btn">↓</button></form></td><td><form method="post" action="{{url_for('dispatch.appointment_status',appointment_id=x.id)}}"><input type="hidden" name="day" value="{{day}}"><select name="status"><option value="">Ustaw etap</option>{% for value,label in labels.items() %}<option value="{{value}}">{{label}}</option>{% endfor %}</select><input name="reason" placeholder="Powód tylko dla problemu/anulowania"><button class="btn primary">Zapisz</button></form></td></tr>{% else %}<tr><td colspan="7">Brak awizacji na ten dzień.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}'''
 QUEUE_TPL = '''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Kolejka załadunkowa</h1><a class="btn right" href="{{url_for('dispatch.appointments',day=day)}}">Awizacje</a></div><div class="card"><form method="get" class="flex"><input type="date" name="day" value="{{day}}"><button class="btn primary">Pokaż</button></form></div><div class="grid3">{% for key,title in [('waiting','Oczekują'),('weighing','Ważenie'),('loading','Załadunek'),('ready','Gotowe do wyjazdu')] %}<section class="card"><h2>{{title}}</h2>{% for x in groups[key] %}<div style="border-bottom:1px solid #edf0f5;padding:12px 0"><b>{{x.registration_no or 'Auto nieprzypisane'}}</b><br>{{x.driver_name or 'Kierowca nieprzypisany'}} · {{x.customer_name}}<br><span class="muted">{{x.time_from or 'bez godziny'}} · stanowisko {{x.bay_code or '—'}} · {{labels[x.status]}}</span></div>{% else %}<div class="muted">Brak pojazdów.</div>{% endfor %}</section>{% endfor %}</div>{% endblock %}'''
