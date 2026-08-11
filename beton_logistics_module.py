@@ -827,10 +827,14 @@ def vehicle_add():
 
 @bp.get('/transports')
 def transports():
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        current_app.logger.exception('Nie udało się odświeżyć listy transportów z Supabase')
     with D['conn']() as c:
         rows=c.execute('''SELECT t.*,w.wz_no,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name
           FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id
-          JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id
+          LEFT JOIN drivers d ON d.id=t.driver_id LEFT JOIN vehicles v ON v.id=t.vehicle_id
           WHERE t.deleted_at IS NULL ORDER BY t.id DESC''').fetchall()
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Transporty</h1><a class="btn primary right" href="{{url_for('beton.wz_list')}}">Wybierz wydane WZ</a></div><div class="card"><table><thead><tr><th>Transport</th><th>WZ</th><th>Klient</th><th>Kierowca / auto</th><th>Status</th><th>Faktura</th></tr></thead><tbody>{% for x in rows %}<tr><td><a href="{{url_for('beton.transport_view',transport_id=x.id)}}"><b>{{x.transport_no}}</b></a></td><td><a href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a></td><td>{{x.customer_name}}</td><td>{{x.driver_name}}<br>{{x.registration_no}}</td><td><span class="badge">{{x.status}}</span></td><td>{{x.invoice_no or '—'}}</td></tr>{% else %}<tr><td colspan="6">Brak transportów.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',rows=rows,title='Transporty',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
@@ -984,8 +988,12 @@ def transport_course_print(transport_id):
 
 @bp.get('/transports/<int:transport_id>')
 def transport_view(transport_id):
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        current_app.logger.exception('Nie udało się odświeżyć transportu %s z Supabase',transport_id)
     with D['conn']() as c:
-        x=c.execute('''SELECT t.*,w.wz_no,w.invoice_id,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name FROM transports t JOIN wz_documents w ON w.id=t.wz_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN orders o ON o.id=w.order_id JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id WHERE t.id=?''',(transport_id,)).fetchone()
+        x=c.execute('''SELECT t.*,w.wz_no,w.invoice_id,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name FROM transports t JOIN wz_documents w ON w.id=t.wz_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN orders o ON o.id=w.order_id LEFT JOIN drivers d ON d.id=t.driver_id LEFT JOIN vehicles v ON v.id=t.vehicle_id WHERE t.id=?''',(transport_id,)).fetchone()
         if not x:abort(404)
         items=c.execute('''SELECT ti.qty, COALESCE(p.name, w.sku) AS sku
             FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
