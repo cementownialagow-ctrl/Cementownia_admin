@@ -474,12 +474,102 @@ def wz_delete(wz_id):
     D['sync_local_rows_to_supabase']('raw_material_movements', 'id', movement_ids)
     return redirect(url_for('beton.wz_list'))
 
+def build_wz_form_pdf(w,items,courses,technology,company):
+    """Jednostronicowy WZ w układzie formularza betoniarni."""
+    font='Helvetica'; bold='Helvetica-Bold'
+    for path in (r'C:\Windows\Fonts\arial.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
+        if os.path.exists(path):
+            try:
+                if 'WZForm' not in pdfmetrics.getRegisteredFontNames(): pdfmetrics.registerFont(TTFont('WZForm',path))
+                font=bold='WZForm'; break
+            except Exception: pass
+    out=io.BytesIO(); p=canvas.Canvas(out,pagesize=A4); W,H=A4
+    left=10*mm; right=W-10*mm; width=right-left; top=H-10*mm
+    p.setLineWidth(.6)
+    def rect(x,y,wid,hei): p.rect(x,y,wid,hei,stroke=1,fill=0)
+    def text(x,y,value,size=8,strong=False):
+        p.setFont(bold if strong else font,size); p.drawString(x,y,str(value or ''))
+    def centered(x,y,wid,value,size=8,strong=False):
+        p.setFont(bold if strong else font,size); p.drawCentredString(x+wid/2,y,str(value or ''))
+    def wrapped(x,y,value,max_chars=65,size=7,leading=3.6*mm,max_lines=3):
+        words=str(value or '').split(); lines=[]; current=''
+        for word in words:
+            candidate=(current+' '+word).strip()
+            if len(candidate)>max_chars and current: lines.append(current); current=word
+            else: current=candidate
+        if current: lines.append(current)
+        for idx,line_value in enumerate(lines[:max_lines]): text(x,y-idx*leading,line_value,size)
+    def labelled(x,y,label,value,size=8):
+        text(x,y,label,6.5); text(x,y-4*mm,value,size,True)
+    company_name=company.get('company_name') or 'Betoniarnia Łagów'
+    issued=str(w.get('issued_at') or w.get('created_at') or '')
+    date_value=issued[:10]; time_value=issued[11:16]
+    first_course=dict(courses[0]) if courses else {}
+    tech=technology[0] if technology else {}
+    total_qty=sum(float(i['qty_issued'] if i['qty_issued'] is not None else i['qty_planned']) for i in items)
+    product=', '.join(str(i['sku']) for i in items)
+    # Nagłówek
+    header_h=25*mm; header_y=top-header_h; rect(left,header_y,width,header_h)
+    text(left+4*mm,top-7*mm,company_name,13,True)
+    wrapped(left+4*mm,top-12*mm,company.get('address') or '',60,7,max_lines=2)
+    text(left+4*mm,header_y+5*mm,'Tel: '+str(company.get('phone') or '')+'    e-mail: '+str(company.get('email') or ''),7)
+    centered(left+width*.55,top-8*mm,width*.45,'WYDANIE ZEWNĘTRZNE',13,True)
+    centered(left+width*.55,top-15*mm,width*.45,w.get('wz_no'),12,True)
+    centered(left+width*.55,header_y+4*mm,width*.45,'Dokument dostawy mieszanki betonowej',7)
+    # Dane zlecenia i odbiorcy
+    info_h=50*mm; info_y=header_y-info_h; half=width/2
+    rect(left,info_y,half,info_h); rect(left+half,info_y,half,info_h)
+    labelled(left+4*mm,header_y-7*mm,'Godzina:',time_value)
+    labelled(left+29*mm,header_y-7*mm,'Data:',date_value)
+    labelled(left+4*mm,header_y-19*mm,'Zlecenie nr:',w.get('order_no'))
+    labelled(left+4*mm,header_y-31*mm,'Ilość m³:',f'{total_qty:g}')
+    labelled(left+29*mm,header_y-31*mm,'Klasa betonu:',tech.get('concrete_class') or product)
+    labelled(left+4*mm,header_y-43*mm,'Nr receptury:',tech.get('recipe_no') or '')
+    text(left+half+4*mm,header_y-7*mm,'Odbiorca:',6.5); text(left+half+25*mm,header_y-7*mm,w.get('customer_name'),9,True)
+    text(left+half+4*mm,header_y-15*mm,'Adres:',6.5); wrapped(left+half+25*mm,header_y-15*mm,w.get('customer_address'),40,8,max_lines=2)
+    text(left+half+4*mm,header_y-28*mm,'Plac budowy:',6.5); wrapped(left+half+25*mm,header_y-28*mm,w.get('destination'),40,8,max_lines=2)
+    text(left+half+4*mm,header_y-40*mm,'NIP:',6.5); text(left+half+25*mm,header_y-40*mm,w.get('customer_nip'),8)
+    text(left+half+4*mm,header_y-47*mm,'e-mail:',6.5); text(left+half+25*mm,header_y-47*mm,w.get('customer_email'),7)
+    # Dyspozycja / kierowca / odbiorca
+    people_h=35*mm; people_y=info_y-people_h; rect(left,people_y,width,people_h)
+    text(left+4*mm,info_y-7*mm,'Kierowca:',7); text(left+28*mm,info_y-7*mm,first_course.get('driver_name'),10,True)
+    text(left+4*mm,info_y-16*mm,'Nr rejestracyjny:',7); text(left+28*mm,info_y-16*mm,first_course.get('registration_no'),10,True)
+    text(left+4*mm,info_y-25*mm,'Transport:',7); text(left+28*mm,info_y-25*mm,first_course.get('transport_no'),9,True)
+    text(left+half,info_y-8*mm,'Towar zgodnie z dyspozycją',10,True)
+    text(left+half,info_y-19*mm,'Na odpowiedzialność kierowcy:',8)
+    p.line(left+half+48*mm,info_y-20*mm,right-5*mm,info_y-20*mm)
+    text(left+half,info_y-29*mm,'ODBIÓR WŁASNY / DOSTAWA',10,True)
+    # Specyfikacja techniczna
+    tech_h=49*mm; tech_y=people_y-tech_h; rect(left,tech_y,width,tech_h)
+    centered(left,people_y-6*mm,width,'Specyfikacja techniczna wskazana przez zamawiającego',10,True)
+    col=width/4
+    fields=[('Cement',tech.get('cement_type')),('Dokument odniesienia',tech.get('reference_document')),('Klasa ekspozycji',tech.get('exposure_class')),('Rodzaj kruszywa',tech.get('max_aggregate_size')),('Konsystencja',tech.get('consistency')),('W/S',tech.get('water_cement_ratio')),('Wytrzymałość',tech.get('characteristic_strength')),('Klasa chlorków',tech.get('chloride_class'))]
+    for idx,(label,value) in enumerate(fields):
+        row=idx//4; column=idx%4; x=left+column*col; y=people_y-12*mm-row*17*mm
+        if column: p.line(x,tech_y,x,people_y-8*mm)
+        labelled(x+3*mm,y,label+':',value or '—',8)
+    # Informacje o dodatkach i uwagi
+    notes_h=35*mm; notes_y=tech_y-notes_h; rect(left,notes_y,width,notes_h)
+    text(left+3*mm,tech_y-6*mm,'Domieszki / chemia:',7,True); wrapped(left+38*mm,tech_y-6*mm,tech.get('admixtures') or '—',75,7,max_lines=2)
+    text(left+3*mm,tech_y-15*mm,'Włókna:',7,True); wrapped(left+38*mm,tech_y-15*mm,tech.get('fibres') or '—',75,7,max_lines=2)
+    text(left+3*mm,tech_y-24*mm,'Inne dodatki:',7,True); wrapped(left+38*mm,tech_y-24*mm,tech.get('other_additions') or w.get('notes') or '—',75,7,max_lines=2)
+    # Ostrzeżenie i podpisy
+    warning_h=22*mm; warning_y=notes_y-warning_h; rect(left,warning_y,width,warning_h)
+    wrapped(left+3*mm,notes_y-5*mm,'Dodanie wody lub innych składników na żądanie odbiorcy może zmienić właściwości mieszanki. Zdarzenie musi być odnotowane na dokumencie dostawy.',125,6.5,max_lines=3)
+    sig_y=warning_y-25*mm
+    labels=('Operator betoniarni','Kierowca','Odbiorca / czytelny podpis')
+    for idx,label in enumerate(labels):
+        x=left+idx*(width/3)+4*mm; p.line(x,sig_y+8*mm,x+width/3-8*mm,sig_y+8*mm); centered(x,sig_y+3*mm,width/3-8*mm,label,6.5)
+    p.showPage(); p.save(); out.seek(0); return out
+
 @bp.get('/wz/<int:wz_id>/print')
 def wz_print(wz_id):
     with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.note AS order_delivery_address,
+        w=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.customer_phone,o.customer_email,o.note AS order_delivery_address,
+            COALESCE(c.nip,'') customer_nip,
             COALESCE(NULLIF(w.destination,''), o.customer_address) AS destination
-            FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
+            FROM wz_documents w JOIN orders o ON o.id=w.order_id LEFT JOIN customers c ON c.id=o.customer_id
+            WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
         if not w:abort(404)
         w=dict(w)
         w['destination']=(w.get('destination') or w.get('order_delivery_address') or w.get('customer_address') or '').strip()
@@ -494,6 +584,11 @@ def wz_print(wz_id):
         for snapshot_row in c.execute('SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall():
             try: technology.append(json.loads(snapshot_row['snapshot_json']))
             except Exception: pass
+        company=c.execute('SELECT * FROM company_profile WHERE id=1').fetchone()
+        company=dict(company) if company else {}
+    pdf_buffer=build_wz_form_pdf(w,items,courses,technology,company)
+    filename=re.sub(r'[^A-Za-z0-9_.-]+','_',w['wz_no'])+'.pdf'
+    return send_file(pdf_buffer,mimetype='application/pdf',as_attachment=False,download_name=filename)
     font_name='Helvetica'
     for font_path in (r'C:\Windows\Fonts\arial.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
         if os.path.exists(font_path):
@@ -828,8 +923,19 @@ def transport_course_print(transport_id):
         for row in c.execute('SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=(SELECT wz_id FROM transports WHERE id=?) ORDER BY id',(transport_id,)).fetchall():
             try: technology.append(json.loads(row['snapshot_json']))
             except Exception: pass
+        wz_data=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.customer_phone,o.customer_email,o.note AS order_delivery_address,COALESCE(cu.nip,'') customer_nip,COALESCE(NULLIF(t.destination,''),NULLIF(w.destination,''),o.customer_address) destination FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN customers cu ON cu.id=o.customer_id WHERE t.id=?''',(transport_id,)).fetchone()
+        wz_data=dict(wz_data)
+        company=c.execute('SELECT * FROM company_profile WHERE id=1').fetchone(); company=dict(company) if company else {}
     course_tpl='''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{t.course_wz_no}}</title><style>body{font:14px Arial;max-width:900px;margin:35px auto;color:#111}table{border-collapse:collapse;width:100%;margin:22px 0}td,th{border:1px solid #222;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:25px}.sign{margin-top:60px;border-top:1px solid #111;padding-top:8px;width:40%;text-align:center}.full-wz{page-break-before:always;padding-top:20px}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>WZ kursu {{t.course_wz_no}}</h1><p>Kurs: <b>{{t.transport_no}}</b> · dokument główny: <b>{{t.wz_no}}</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}<br><br><b>Adres dostawy</b><br>{{t.destination or '—'}}</div><div><b>Kierowca / auto</b><br>{{t.driver_name}} · {{t.registration_no}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość kursu [m³]</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis odbiorcy dla kursu</div>{% if t.is_final_course %}<section class="full-wz"><h1>Wydanie zewnętrzne {{t.wz_no}}</h1><p><b>Pełna WZ zbiorcza — dołączona do ostatniego kursu.</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}</div><div><b>Adres dostawy</b><br>{{t.destination or '—'}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Łączna ilość [m³]</th></tr></thead><tbody>{% for i in full_items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis i pieczęć odbiorcy — pełna WZ</div></section>{% endif %}</html>'''
     extra='''{% for tech in technology %}<section><h2>SPECYFIKACJA TECHNICZNA</h2>{% for label,key in [('Klasa betonu','concrete_class'),('Nr receptury','recipe_no'),('Wersja','version_no'),('Cement','cement_type'),('Konsystencja','consistency'),('W/S','water_cement_ratio'),('Klasa ekspozycji','exposure_class'),('Maks. wymiar kruszywa','max_aggregate_size'),('Klasa chlorkĂłw','chloride_class'),('WytrzymaĹ‚oĹ›Ä‡','characteristic_strength'),('Dokument odniesienia','reference_document'),('Domieszki','admixtures'),('WĹ‚Ăłkna','fibres'),('Inne dodatki','other_additions')] %}{% if tech.get(key) not in [none,''] %}<div><b>{{label}}:</b> {{tech.get(key)}}</div>{% endif %}{% endfor %}</section>{% endfor %}{% if adjustment %}<section><h2>Dane konkretnej dostawy</h2>{% if adjustment.water_added %}<p><b>Dodano wodÄ™ na ĹĽÄ…danie odbiorcy:</b> {{adjustment.water_qty or 'â€”'}} {{adjustment.water_unit or 'l'}} · {{adjustment.event_at or ''}}</p>{% endif %}{% if adjustment.added_fibres %}<p><b>Dodano wĹ‚Ăłkna:</b> {{adjustment.added_fibres}}</p>{% endif %}{% if adjustment.added_chemicals %}<p><b>Dodano chemiÄ™:</b> {{adjustment.added_chemicals}}</p>{% endif %}{% if adjustment.other_additions %}<p><b>Inne dodatki:</b> {{adjustment.other_additions}}</p>{% endif %}{% if adjustment.notes %}<p><b>Uwagi:</b> {{adjustment.notes}}</p>{% endif %}<p><b>Osoba odpowiedzialna:</b> {{adjustment.responsible_person or adjustment.created_by}}</p></section>{% endif %}<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:40px;margin-top:70px"><div class="sign">Operator betoniarni</div><div class="sign">Kierowca</div><div class="sign">Odbiorca</div></div></html>'''
+    if transport['is_final_course']:
+        print_items=[{'sku':x['product'],'qty_planned':x['qty'],'qty_issued':x['qty']} for x in full_items]
+    else:
+        wz_data['wz_no']=transport['course_wz_no']
+        print_items=[{'sku':x['product'],'qty_planned':x['qty'],'qty_issued':x['qty']} for x in items]
+    pdf_buffer=build_wz_form_pdf(wz_data,print_items,[transport],technology,company)
+    filename=re.sub(r'[^A-Za-z0-9_.-]+','_',wz_data['wz_no'])+'.pdf'
+    return send_file(pdf_buffer,mimetype='application/pdf',as_attachment=False,download_name=filename)
     course_tpl=course_tpl.replace('</html>',extra)
     return render_template_string(course_tpl,t=transport,items=items,full_items=full_items,technology=technology,adjustment=adjustment)
     return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>WZ kursu {{t.transport_no}}</title><style>body{font:14px Arial;max-width:900px;margin:35px auto}table{border-collapse:collapse;width:100%;margin:22px 0}td,th{border:1px solid #222;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:25px}.sign{margin-top:60px;border-top:1px solid #111;padding-top:8px;width:40%;text-align:center}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>WZ cząstkowa / kurs {{t.transport_no}}</h1><p>Dokument do WZ zbiorczej: <b>{{t.wz_no}}</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}<br><br><b>Adres dostawy</b><br>{{t.destination or '—'}}</div><div><b>Kierowca / auto</b><br>{{t.driver_name}} · {{t.registration_no}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość [m³]</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis odbiorcy dla kursu</div></html>''',t=transport,items=items)
