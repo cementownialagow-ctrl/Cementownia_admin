@@ -102,7 +102,7 @@ def appointments():
                 driver_id=int(selected_transport['driver_id'] or driver_id or 0)
                 vehicle_id=int(selected_transport['vehicle_id'] or vehicle_id or 0)
             if not wz_id:
-                return 'Wybierz wydany dokument WZ dla tego kursu.', 400
+                return 'Wybierz dokument WZ, z którego ma powstać transport.', 400
             if not planned_departure_time:
                 return 'Podaj planowaną godzinę wyjazdu.', 400
             if driver_id:
@@ -123,6 +123,8 @@ def appointments():
                     if abs((planned_departure - other_departure).total_seconds()) < 2 * 60 * 60:
                         return (f"Kierowca ma już kurs {conflict['order_no']} o {conflict['time_from']}. "
                                 "Między planowanymi wyjazdami muszą być co najmniej 2 godziny.", 409)
+            if not transport_id and (not driver_id or not vehicle_id):
+                return 'Aby utworzyć transport z WZ, wybierz kierowcę i auto.', 400
             # Jedna awizacja z wybranym WZ, kierowcą i autem od razu tworzy kurs.
             # Dzięki temu kierowca widzi go natychmiast w swoim panelu.
             if not transport_id and wz_id and driver_id and vehicle_id:
@@ -196,23 +198,13 @@ def appointments():
                 AND w.status NOT IN ('ready_invoice','invoiced','returned','completed')
                 AND NOT EXISTS (SELECT 1 FROM transports assigned_transport
                   WHERE assigned_transport.wz_id=w.id AND assigned_transport.deleted_at IS NULL)
-                AND COALESCE((SELECT SUM(COALESCE(wi.qty_issued,wi.qty_planned))
-                  FROM wz_items wi WHERE wi.wz_id=w.id),0) > 0
             )
           ORDER BY o.id DESC LIMIT 300""").fetchall()
-        wzs = c.execute("""SELECT w.id,w.wz_no,o.order_no FROM wz_documents w
+        wzs = c.execute("""SELECT w.id,w.wz_no,w.order_id,o.order_no FROM wz_documents w
           JOIN orders o ON o.id=w.order_id
           WHERE w.deleted_at IS NULL AND w.status NOT IN ('ready_invoice','invoiced','returned','completed')
             AND NOT EXISTS (SELECT 1 FROM transports assigned_transport
               WHERE assigned_transport.wz_id=w.id AND assigned_transport.deleted_at IS NULL)
-            AND (
-              EXISTS (SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL
-                AND t.status NOT IN ('returned','closed')
-                AND NOT EXISTS (SELECT 1 FROM dispatch_appointments a WHERE a.transport_id=t.id AND a.status<>'cancelled'))
-              OR COALESCE((SELECT SUM(COALESCE(wi.qty_issued,wi.qty_planned)) FROM wz_items wi WHERE wi.wz_id=w.id),0) >
-                 COALESCE((SELECT SUM(ti.qty) FROM transport_items ti JOIN transports t ON t.id=ti.transport_id
-                   WHERE t.wz_id=w.id AND t.deleted_at IS NULL),0)
-            )
           ORDER BY w.id DESC LIMIT 300""").fetchall()
         transports = c.execute("""SELECT t.id,t.transport_no,t.wz_id,w.wz_no,o.order_no
           FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id
@@ -225,7 +217,7 @@ def appointments():
           WHERE a.driver_id IS NOT NULL AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''""").fetchall()]
         vehicles = c.execute("SELECT id,registration_no FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no").fetchall()
         bays = c.execute("SELECT * FROM loading_bays WHERE active=1 ORDER BY code").fetchall()
-    dispatch_tpl = TPL.replace('<label>Transport</label>', '<label>Ilość na ten transport [m³]</label><input type="number" name="transport_qty" min="0.01" max="8" step="0.01" value="8" required><label>Transport</label>')
+    dispatch_tpl = TPL.replace('<label>Istniejący transport (opcjonalnie)</label>', '<label>Ilość na nowy transport [m³]</label><input type="number" name="transport_qty" min="0.01" max="8" step="0.01" value="8" required><label>Istniejący transport (opcjonalnie)</label>')
     return render_template_string(dispatch_tpl, rows=rows, orders=orders, wzs=wzs, transports=transports, drivers=drivers, driver_busy=driver_busy, vehicles=vehicles, bays=bays, day=day, labels=STAGE_LABEL, capacity_notice=request.args.get("capacity_notice", ""), title="Wydaj transport", base_url=D["BASE_URL"], db_path=D["DB_PATH"])
 
 @bp.post("/appointments/<int:appointment_id>/status")
@@ -287,16 +279,35 @@ def queue():
 TPL = '''{% extends "base.html" %}{% block content %}
 <div class="flex"><h1>Wydaj transport</h1><a class="btn right" href="{{url_for('dispatch.queue',day=day)}}">Ekran kolejki</a></div>
 <div class="card"><form method="get" class="flex"><label>Data <input type="date" name="day" value="{{day}}"></label><button class="btn primary">Pokaż dzień</button></form></div>
-<div class="card"><h2>Dodaj awizację</h2>{% if capacity_notice %}<div class="notice warn"><b>Podział transportu:</b> {{capacity_notice}}</div>{% endif %}<form method="post" class="grid3"><input type="hidden" name="planned_date" value="{{day}}"><div><label>Zamówienie</label><select name="order_id" required><option value="">Wybierz</option>{% for x in orders %}<option value="{{x.id}}" data-delivery-date="{{x.delivery_date}}">{{x.order_no}} · {{x.customer_name}} · {{'%.2f'|format(x.total_m3)|replace('.', ',')}} m³ · min. {{x.required_trips}} podjazd(y)</option>{% endfor %}</select></div><div><label>Planowany wyjazd</label><input name="time_from" type="time" required></div><div><label>Planowana dostawa</label><input name="time_to" type="time"></div><div><label>Zmiana</label><input name="shift" placeholder="np. I"></div><div><label>WZ (opcjonalnie)</label><select name="wz_id"><option value="">—</option>{% for x in wzs %}<option value="{{x.id}}">{{x.wz_no}} · {{x.order_no}}</option>{% endfor %}</select></div><div><label>Transport</label><select name="transport_id"><option value="">—</option>{% for x in transports %}<option value="{{x.id}}">{{x.transport_no}}</option>{% endfor %}</select></div><div><label>Stanowisko</label><select name="loading_bay_id"><option value="">—</option>{% for x in bays %}<option value="{{x.id}}">{{x.code}}</option>{% endfor %}</select></div><div><label>Kierowca</label><select name="driver_id"><option value="">—</option>{% for x in drivers %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select><small class="muted" id="driver-availability-note">Wybierz godzinę, aby sprawdzić dostępność.</small></div><div><label>Auto</label><select name="vehicle_id"><option value="">—</option>{% for x in vehicles %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn primary">Dodaj do harmonogramu</button></div></form></div>
+<div class="card"><h2>Utwórz transport z WZ i dodaj awizację</h2>{% if capacity_notice %}<div class="notice warn"><b>Podział transportu:</b> {{capacity_notice}}</div>{% endif %}<form method="post" class="grid3"><input type="hidden" name="planned_date" value="{{day}}"><div><label>Zamówienie</label><select name="order_id" required><option value="">Wybierz</option>{% for x in orders %}<option value="{{x.id}}" data-delivery-date="{{x.delivery_date}}">{{x.order_no}} · {{x.customer_name}} · {{'%.2f'|format(x.total_m3)|replace('.', ',')}} m³ · min. {{x.required_trips}} podjazd(y)</option>{% endfor %}</select></div><div><label>Planowany wyjazd</label><input name="time_from" type="time" required></div><div><label>Planowana dostawa</label><input name="time_to" type="time"></div><div><label>Zmiana</label><input name="shift" placeholder="np. I"></div><div><label>WZ bez transportu</label><select name="wz_id" required><option value="">Najpierw wybierz zamówienie</option>{% for x in wzs %}<option value="{{x.id}}" data-order-id="{{x.order_id}}">{{x.wz_no}}</option>{% endfor %}</select></div><div><label>Istniejący transport (opcjonalnie)</label><select name="transport_id"><option value="">Utwórz nowy z wybranego WZ</option>{% for x in transports %}<option value="{{x.id}}">{{x.transport_no}}</option>{% endfor %}</select></div><div><label>Stanowisko</label><select name="loading_bay_id"><option value="">—</option>{% for x in bays %}<option value="{{x.id}}">{{x.code}}</option>{% endfor %}</select></div><div><label>Kierowca</label><select name="driver_id" required><option value="">Wybierz kierowcę</option>{% for x in drivers %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select><small class="muted" id="driver-availability-note">Wybierz godzinę, aby sprawdzić dostępność.</small></div><div><label>Auto</label><select name="vehicle_id" required><option value="">Wybierz auto</option>{% for x in vehicles %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div><div style="align-self:end"><button class="btn primary">Utwórz transport i dodaj awizację</button></div></form></div>
 <div class="card"><table><thead><tr><th>Wyjazd / dostawa</th><th>Awizacja / klient</th><th>Auto / kierowca</th><th>Stanowisko</th><th>Etap transportu</th><th>Kolejka</th><th>Zmień etap zakładowy</th></tr></thead><tbody>{% for x in rows %}<tr><td><b>Wyjazd: {{x.time_from or '—'}}</b><br><b>Dostawa: {{x.time_to or '—'}}</b><br><span class="muted">{{x.shift or ''}}</span></td><td><b>{{x.appointment_no}}</b><br>{{x.customer_name}}<br><span class="muted">{{x['items'] or 'Pozycje WZ po utworzeniu'}}</span></td><td>{{x.registration_no or '—'}}<br>{{x.driver_name or '—'}}</td><td>{{x.bay_code or '—'}}</td><td><span class="badge">{{x.display_stage}}</span></td><td><form method="post" action="{{url_for('dispatch.appointment_move',appointment_id=x.id)}}"><input type="hidden" name="day" value="{{day}}"><button name="direction" value="up" class="btn">↑</button><button name="direction" value="down" class="btn">↓</button></form></td><td><form method="post" action="{{url_for('dispatch.appointment_status',appointment_id=x.id)}}"><input type="hidden" name="day" value="{{day}}"><select name="status"><option value="">Ustaw etap</option>{% for value,label in labels.items() %}<option value="{{value}}">{{label}}</option>{% endfor %}</select><input name="reason" placeholder="Powód tylko dla problemu/anulowania"><button class="btn primary">Zapisz</button></form></td></tr>{% else %}<tr><td colspan="7">Brak awizacji na ten dzień.</td></tr>{% endfor %}</tbody></table></div>
 <script>
 (() => {
   const busy = {{ driver_busy|tojson }};
   const order = document.querySelector('select[name="order_id"]');
+  const wz = document.querySelector('select[name="wz_id"]');
   const departure = document.querySelector('input[name="time_from"]');
   const driver = document.querySelector('select[name="driver_id"]');
   const note = document.getElementById('driver-availability-note');
-  if (!order || !departure || !driver) return;
+  if (!order || !wz || !departure || !driver) return;
+  const refreshWz = () => {
+    const orderId = order.value;
+    let available = 0;
+    [...wz.options].forEach((item, index) => {
+      if (!index) return;
+      const visible = Boolean(orderId) && item.dataset.orderId === orderId;
+      item.hidden = !visible;
+      item.disabled = !visible;
+      if (visible) available++;
+    });
+    if (wz.selectedOptions[0] && wz.selectedOptions[0].disabled) wz.value = '';
+    if (!wz.value && available === 1) {
+      const only = [...wz.options].find((item, index) => index && !item.disabled);
+      if (only) wz.value = only.value;
+    }
+    wz.options[0].textContent = !orderId ? 'Najpierw wybierz zamówienie' :
+      (available ? 'Wybierz WZ' : 'Brak wolnego WZ dla tego zamówienia');
+  };
   const refresh = () => {
     const option = order.options[order.selectedIndex];
     const date = (option && option.dataset.deliveryDate) || '{{day}}';
@@ -314,8 +325,9 @@ TPL = '''{% extends "base.html" %}{% block content %}
     if (driver.selectedOptions[0] && driver.selectedOptions[0].disabled) driver.value = '';
     note.textContent = value ? `Niedostępni kierowcy: ${blocked}. Obowiązuje odstęp minimum 2 godziny.` : 'Wybierz godzinę, aby sprawdzić dostępność.';
   };
-  order.addEventListener('change', refresh);
+  order.addEventListener('change', () => { refreshWz(); refresh(); });
   departure.addEventListener('change', refresh);
+  refreshWz();
   refresh();
 })();
 </script>{% endblock %}'''
