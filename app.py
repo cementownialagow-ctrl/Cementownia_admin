@@ -3245,13 +3245,51 @@ def home():
       GROUP BY o.id ORDER BY o.id DESC LIMIT 8
     """)
     recent_orders = [dict(r) for r in cur.fetchall()]
-    cur.execute("SELECT status,COUNT(*) AS n FROM orders GROUP BY status")
-    status_counts = {norm(r["status"]).lower(): int(r["n"] or 0) for r in cur.fetchall()}
-    status_new = sum(status_counts.get(x,0) for x in ("new","pending","unconfirmed"))
-    status_work = sum(status_counts.get(x,0) for x in ("confirmed","packed","in_delivery","shipped"))
-    status_done = status_counts.get("issued",0)
-    status_cancelled = status_counts.get("cancelled",0)
-    status_total = status_new + status_work + status_done + status_cancelled
+
+    # Pulpit nie opiera się na dawnym ręcznym statusie zamówienia. Etap jest
+    # wyliczany z faktycznie utworzonego transportu, podpisanego WZ i faktury.
+    def dashboard_delivery_status(order_id):
+        if cur.execute("SELECT 1 FROM invoices WHERE order_id=? LIMIT 1", (order_id,)).fetchone():
+            return "FV wystawiona"
+        rows = cur.execute("""SELECT t.status FROM transports t
+            JOIN wz_documents w ON w.id=t.wz_id
+            WHERE w.order_id=? AND w.deleted_at IS NULL AND t.deleted_at IS NULL""", (order_id,)).fetchall()
+        transport_statuses = {norm(row["status"]).lower() for row in rows}
+        if "in_transit" in transport_statuses:
+            return "W dostawie"
+        if "issued" in transport_statuses:
+            return "Wydane"
+        if "assigned" in transport_statuses:
+            return "Przydzielone"
+        if "delivered" in transport_statuses:
+            return "WZ podpisane"
+        if "closed" in transport_statuses:
+            return "Na miejscu"
+        if "returned" in transport_statuses:
+            return "Zakończone"
+        wz = cur.execute("""SELECT status FROM wz_documents
+            WHERE order_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1""", (order_id,)).fetchone()
+        wz_status = norm(wz["status"]).lower() if wz else ""
+        if wz_status == "ready_invoice":
+            return "WZ podpisane"
+        if wz_status in ("issued", "in_transport"):
+            return "Wydane"
+        return "Nieprzydzielone"
+
+    all_orders = [dict(row) for row in cur.execute("SELECT id FROM orders WHERE lower(COALESCE(status,'')) <> 'cancelled'").fetchall()]
+    for order in recent_orders:
+        order["delivery_status"] = dashboard_delivery_status(order["id"])
+    dashboard_counts = {}
+    for order in all_orders:
+        label = dashboard_delivery_status(order["id"])
+        dashboard_counts[label] = dashboard_counts.get(label, 0) + 1
+    status_new = dashboard_counts.get("Nieprzydzielone", 0)
+    status_assigned = dashboard_counts.get("Przydzielone", 0) + dashboard_counts.get("Wydane", 0)
+    status_delivery = dashboard_counts.get("W dostawie", 0) + dashboard_counts.get("Na miejscu", 0)
+    status_signed = dashboard_counts.get("WZ podpisane", 0)
+    status_done = dashboard_counts.get("Zakończone", 0)
+    status_invoice = dashboard_counts.get("FV wystawiona", 0)
+    status_total = sum(dashboard_counts.values())
     status_divisor = max(1, status_total)
     c.close()
 
@@ -3277,13 +3315,13 @@ def home():
         <div class="card orders-card">
           <div class="panel-title"><span>▣</span><h2>Ostatnie zamówienia</h2><a class="btn" href="{{ url_for('orders') }}">Zobacz wszystkie</a></div>
           <table><thead><tr><th>Nr zamówienia</th><th>Klient</th><th>Data</th><th>Wartość</th><th>Status</th><th></th></tr></thead><tbody>
-          {% for o in recent_orders %}<tr><td><a class="order-no" href="{{ url_for('order_view',order_id=o.id) }}">{{ canonical_order_no(o.id,o.created_at,o.order_no) }}</a></td><td class="customer-name">{{ o.customer_name or '-' }}</td><td>{{ o.created_at[:16] }}</td><td>{{ "%.2f"|format(o.total_net) }} zł</td><td><span class="badge {{ order_status_css(o.status) }}">{{ order_status_label(o.status) }}</span></td><td><a class="btn" href="{{ url_for('order_view',order_id=o.id) }}">•••</a></td></tr>{% endfor %}
+          {% for o in recent_orders %}<tr><td><a class="order-no" href="{{ url_for('order_view',order_id=o.id) }}">{{ canonical_order_no(o.id,o.created_at,o.order_no) }}</a></td><td class="customer-name">{{ o.customer_name or '-' }}</td><td>{{ o.created_at[:16] }}</td><td>{{ "%.2f"|format(o.total_net) }} zł</td><td><span class="badge">{{ o.delivery_status }}</span></td><td><a class="btn" href="{{ url_for('order_view',order_id=o.id) }}">•••</a></td></tr>{% endfor %}
           {% if not recent_orders %}<tr><td colspan="6" class="muted">Brak zamówień do wyświetlenia.</td></tr>{% endif %}
           </tbody></table>
         </div>
         <div class="side-stack">
-          <div class="card"><div class="panel-title"><h2>Status zamówień</h2></div><div class="donut-wrap"><div class="donut" style="--p1:{{ status_new*100/status_divisor }};--p2:{{ status_work*100/status_divisor }};--p3:{{ status_done*100/status_divisor }}"><div class="donut-label"><b>{{ status_total }}</b>łącznie</div></div><div class="legend">
-            <div class="legend-row"><i class="legend-dot" style="background:#5577ee"></i><span>Nowe</span><b>{{ status_new }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#65a7ec"></i><span>W realizacji</span><b>{{ status_work }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#31b98b"></i><span>Zrealizowane</span><b>{{ status_done }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#e05263"></i><span>Anulowane</span><b>{{ status_cancelled }}</b></div>
+          <div class="card"><div class="panel-title"><h2>Status realizacji</h2></div><div class="donut-wrap"><div class="donut" style="--p1:{{ status_new*100/status_divisor }};--p2:{{ status_assigned*100/status_divisor }};--p3:{{ (status_delivery + status_signed)*100/status_divisor }}"><div class="donut-label"><b>{{ status_total }}</b>łącznie</div></div><div class="legend">
+            <div class="legend-row"><i class="legend-dot" style="background:#5577ee"></i><span>Nieprzydzielone</span><b>{{ status_new }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#65a7ec"></i><span>Wydane / przydzielone</span><b>{{ status_assigned }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#31b98b"></i><span>W dostawie / na miejscu</span><b>{{ status_delivery }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#c784de"></i><span>WZ podpisane</span><b>{{ status_signed }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#45a879"></i><span>Zakończone</span><b>{{ status_done }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#e05263"></i><span>FV wystawiona</span><b>{{ status_invoice }}</b></div>
           </div></div></div>
         </div>
         <div class="card quick-card"><div class="panel-title"><span>ϟ</span><h2>Szybkie akcje</h2></div><div class="quick-grid">
@@ -3295,8 +3333,9 @@ def home():
     """
     return render_template_string(tpl, title="Start", base_url=BASE_URL, db_path=DB_PATH,
                                   n_orders_current=n_orders_current, n_orders_today=n_orders_today,
-                                  recent_orders=recent_orders, status_new=status_new, status_work=status_work,
-                                  status_done=status_done, status_cancelled=status_cancelled, status_total=status_total,
+                                  recent_orders=recent_orders, status_new=status_new, status_assigned=status_assigned,
+                                  status_delivery=status_delivery, status_signed=status_signed, status_done=status_done,
+                                  status_invoice=status_invoice, status_total=status_total,
                                   status_divisor=status_divisor)
 
 
