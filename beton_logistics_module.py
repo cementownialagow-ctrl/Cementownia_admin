@@ -576,6 +576,9 @@ def build_wz_form_pdf(w,items,courses,technology,company):
         'PO FAKTURĘ LUB PARAGON NALEŻY ZGŁOSIĆ DO BIURA BETONIARNI DO KOŃCA MIESIĄCA, W KTÓRYM ODBYŁA SIĘ SPRZEDAŻ.',
         5.4,True)
     sig_y=warning_y-25*mm
+    centered(left,warning_y-6*mm,width,
+        'Wyrażam zgodę na Przetwarzanie Danych Osobowych oraz potwierdzam odbiór zgodny z zamówieniem.',
+        7,True)
     labels=('Operator betoniarni','Kierowca','Odbiorca / czytelny podpis')
     for idx,label in enumerate(labels):
         x=left+idx*(width/3)+4*mm; p.line(x,sig_y+8*mm,x+width/3-8*mm,sig_y+8*mm); centered(x,sig_y+3*mm,width/3-8*mm,label,6.5)
