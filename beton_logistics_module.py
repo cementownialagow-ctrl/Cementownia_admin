@@ -647,7 +647,7 @@ def driver_transport_status_api(transport_id):
     driver_id=current_driver_id(); email=(g.client_user.get('email') or '').strip().lower(); data=request.get_json(silent=True) or {}; status=str(data.get('status',''))
     appointment_id_to_sync=None
     if not driver_id:return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
-    allowed={'issued','in_transit','closed','delivered','returned','problem'}
+    allowed={'closed','delivered','returned','problem'}
     if status not in allowed:return jsonify(ok=False,error='Niedozwolony status'),400
     field={'issued':'issued_at','in_transit':'departed_at','delivered':'delivered_at','returned':'returned_at'}.get(status)
     with D['conn']() as c:
@@ -655,7 +655,7 @@ def driver_transport_status_api(transport_id):
           FROM transports t JOIN drivers d ON d.id=t.driver_id
           WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL''',(transport_id,driver_id)).fetchone()
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
-        transitions={'assigned':{'issued','problem'},'issued':{'in_transit','problem'},'in_transit':{'closed','problem'},'closed':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'issued','in_transit','closed','delivered','returned'}}
+        transitions={'in_transit':{'closed','problem'},'closed':{'delivered','problem'},'delivered':{'returned','problem'},'problem':{'closed','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
         # Tylko kierowca ma obowiązkową przerwę między kolejnymi etapami.
         # Pracownik, dyspozytor i administrator zmieniają etap w panelu głównym bez tej blokady.
