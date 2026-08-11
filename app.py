@@ -235,6 +235,20 @@ def init_db():
         created_at TEXT NOT NULL,
         UNIQUE(product_id, material_id)
     );
+    CREATE TABLE IF NOT EXISTS recipe_versions(
+        id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        version_no INTEGER NOT NULL,recipe_no TEXT,name TEXT,valid_from TEXT,
+        concrete_class TEXT,consistency TEXT,water_cement_ratio REAL,exposure_class TEXT,
+        max_aggregate_size TEXT,chloride_class TEXT,characteristic_strength TEXT,
+        reference_document TEXT,cement_type TEXT,admixtures TEXT,fibres TEXT,other_additions TEXT,
+        technology_notes TEXT,created_by TEXT,created_at TEXT NOT NULL,
+        UNIQUE(product_id,version_no)
+    );
+    CREATE TABLE IF NOT EXISTS recipe_version_items(
+        id INTEGER PRIMARY KEY,recipe_version_id INTEGER NOT NULL REFERENCES recipe_versions(id) ON DELETE CASCADE,
+        material_id INTEGER NOT NULL REFERENCES raw_materials(id),qty_per_unit REAL NOT NULL CHECK(qty_per_unit>0),
+        unit TEXT NOT NULL,material_snapshot_json TEXT,created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS raw_material_stock(
         material_id INTEGER PRIMARY KEY REFERENCES raw_materials(id) ON DELETE CASCADE,
         qty REAL NOT NULL DEFAULT 0
@@ -508,6 +522,17 @@ def init_db():
     }.items():
         if col not in product_cols:
             cur.execute(f"ALTER TABLE products ADD COLUMN {col} {definition}")
+
+    raw_material_cols = {r[1] for r in cur.execute("PRAGMA table_info(raw_materials)").fetchall()}
+    for col, definition in {
+        "code": "TEXT", "material_type": "TEXT", "manufacturer": "TEXT",
+        "trade_name": "TEXT", "reference_document": "TEXT", "technical_designation": "TEXT",
+        "description": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1", "minimum_stock": "REAL NOT NULL DEFAULT 0",
+        "cement_type": "TEXT", "cement_designation": "TEXT", "strength_class": "TEXT",
+        "aggregate_type": "TEXT", "fraction": "TEXT", "max_grain_size": "TEXT",
+    }.items():
+        if col not in raw_material_cols:
+            cur.execute(f"ALTER TABLE raw_materials ADD COLUMN {col} {definition}")
 
     # Migracja nazewnictwa z odziedziczonego modułu „China” do zamówień materiałów.
     old_material_tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -980,6 +1005,8 @@ SUPABASE_SYNC_TABLES = [
     ("products", "id"),
     ("raw_materials", "id"),
     ("product_recipes", "id"),
+    ("recipe_versions", "id"),
+    ("recipe_version_items", "id"),
     ("raw_material_stock", "material_id"),
     # Nie sterujemy automatycznie stanem magazynowym, ale jeżeli zostanie
     # wpisany ręcznie, jego kopia również musi trafić do chmury.
@@ -1002,8 +1029,10 @@ SUPABASE_SYNC_TABLES = [
     ("vehicles", "id"),
     ("wz_documents", "id"),
     ("wz_items", "id"),
+    ("wz_technology_snapshots", "id"),
     ("raw_material_movements", "id"),
     ("transports", "id"),
+    ("transport_delivery_adjustments", "id"),
     ("transport_items", "id"),
     ("delivery_photos", "id"),
     ("loading_bays", "id"),
@@ -1030,6 +1059,8 @@ SUPABASE_PULL_TABLES = [
     ("products", "id"),
     ("raw_materials", "id"),
     ("product_recipes", "id"),
+    ("recipe_versions", "id"),
+    ("recipe_version_items", "id"),
     ("raw_material_stock", "material_id"),
     ("stock", "product_id"),
     ("drivers", "id"),
@@ -1045,8 +1076,10 @@ SUPABASE_PULL_TABLES = [
     ("vehicles", "id"),
     ("wz_documents", "id"),
     ("wz_items", "id"),
+    ("wz_technology_snapshots", "id"),
     ("raw_material_movements", "id"),
     ("transports", "id"),
+    ("transport_delivery_adjustments", "id"),
     ("transport_items", "id"),
     ("delivery_photos", "id"),
     ("loading_bays", "id"),
@@ -4907,6 +4940,23 @@ def product_recipe(product_id):
         abort(404)
     error = ""
     if request.method == "POST":
+        if request.form.get("form_action") == "save_version":
+            now=now_iso()
+            current_no=c.execute("SELECT COALESCE(MAX(version_no),0)+1 FROM recipe_versions WHERE product_id=?",(product_id,)).fetchone()[0]
+            version_id=cloud_row_id()
+            c.execute('''INSERT INTO recipe_versions(id,product_id,version_no,recipe_no,name,valid_from,concrete_class,consistency,water_cement_ratio,exposure_class,max_aggregate_size,chloride_class,characteristic_strength,reference_document,cement_type,admixtures,fibres,other_additions,technology_notes,created_by,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(version_id,product_id,current_no,norm(request.form.get('recipe_no')),norm(request.form.get('recipe_name')),request.form.get('valid_from') or now[:10],norm(request.form.get('concrete_class')),norm(request.form.get('consistency')),to_float(request.form.get('water_cement_ratio'),0) or None,norm(request.form.get('exposure_class')),norm(request.form.get('max_aggregate_size')),norm(request.form.get('chloride_class')),norm(request.form.get('characteristic_strength')),norm(request.form.get('reference_document')),norm(request.form.get('cement_type')),norm(request.form.get('admixtures')),norm(request.form.get('fibres')),norm(request.form.get('other_additions')),norm(request.form.get('technology_notes')),session.get('display_name') or session.get('username'),now))
+            source_items=c.execute('''SELECT pr.material_id,pr.qty_per_unit,rm.* FROM product_recipes pr JOIN raw_materials rm ON rm.id=pr.material_id WHERE pr.product_id=? ORDER BY rm.name''',(product_id,)).fetchall()
+            if not source_items:
+                c.rollback(); c.close(); return 'Najpierw dodaj skład receptury.',400
+            version_item_ids=[]
+            for source in source_items:
+                item_id=cloud_row_id(); version_item_ids.append(item_id); material=dict(source)
+                frozen={key:material.get(key) for key in ('id','name','code','material_type','unit','manufacturer','trade_name','reference_document','technical_designation','description','cement_type','cement_designation','strength_class','aggregate_type','fraction','max_grain_size')}
+                c.execute('INSERT INTO recipe_version_items(id,recipe_version_id,material_id,qty_per_unit,unit,material_snapshot_json,created_at) VALUES(?,?,?,?,?,?,?)',(item_id,version_id,source['material_id'],source['qty_per_unit'],source['unit'],json.dumps(frozen,ensure_ascii=False),now))
+            c.commit(); c.close()
+            sync_local_rows_to_supabase('recipe_versions','id',[version_id]); sync_local_rows_to_supabase('recipe_version_items','id',version_item_ids)
+            return redirect(url_for('product_recipe',product_id=product_id))
         material_name = norm(request.form.get("material_name"))
         unit = norm(request.form.get("unit")) or "kg"
         qty = to_float(request.form.get("qty_per_unit"), 0)
@@ -4934,7 +4984,10 @@ def product_recipe(product_id):
     recipe = c.execute("""SELECT pr.id,rm.name,rm.unit,pr.qty_per_unit
                           FROM product_recipes pr JOIN raw_materials rm ON rm.id=pr.material_id
                           WHERE pr.product_id=? ORDER BY rm.name""", (product_id,)).fetchall()
+    versions=c.execute('SELECT * FROM recipe_versions WHERE product_id=? ORDER BY version_no DESC,id DESC',(product_id,)).fetchall()
     c.close()
+    recipe_page=r'''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Receptura: {{product.name or product.sku}}</h1><a class="btn right" href="{{url_for('products')}}">WrĂłÄ‡ do produktĂłw</a></div>{% if error %}<div class="hint">{{error}}</div>{% endif %}<form method="post" class="card"><input type="hidden" name="form_action" value="save_version"><h2>Dane podstawowe</h2><div class="grid3"><div><label>Nazwa receptury</label><input name="recipe_name" required></div><div><label>Numer receptury</label><input name="recipe_no" required></div><div><label>Nowa wersja</label><input value="{{(versions[0].version_no+1) if versions else 1}}" readonly></div><div><label>ObowiÄ…zuje od</label><input type="date" name="valid_from" required></div></div><h2>Parametry betonu</h2><div class="grid3"><div><label>Klasa betonu</label><input name="concrete_class" placeholder="C20/25"></div><div><label>Konsystencja</label><input name="consistency" placeholder="S3"></div><div><label>W/S</label><input type="number" step="0.01" name="water_cement_ratio" placeholder="0,55"></div><div><label>Klasa ekspozycji</label><input name="exposure_class" placeholder="XC2"></div><div><label>Maks. wymiar kruszywa</label><input name="max_aggregate_size" placeholder="16 mm"></div><div><label>Klasa chlorkĂłw</label><input name="chloride_class" placeholder="Cl 0,20"></div><div><label>WytrzymaĹ‚oĹ›Ä‡ charakterystyczna</label><input name="characteristic_strength"></div><div><label>Norma / dokument odniesienia</label><input name="reference_document" placeholder="PN-EN 206"></div><div><label>Rodzaj cementu</label><input name="cement_type"></div></div><h2>Dodatki</h2><div class="grid3"><div><label>Domieszki</label><textarea name="admixtures"></textarea></div><div><label>WĹ‚Ăłkna</label><textarea name="fibres"></textarea></div><div><label>Inne dodatki</label><textarea name="other_additions"></textarea></div></div><label>Uwagi technologiczne</label><textarea name="technology_notes"></textarea><button class="btn primary" style="margin-top:12px">Zapisz jako nowÄ… wersjÄ™</button></form><div class="card"><h2>Wersje receptury</h2><table><thead><tr><th>Wersja</th><th>Numer</th><th>Nazwa</th><th>Od</th><th>Parametry</th></tr></thead><tbody>{% for v in versions %}<tr><td><b>{{v.version_no}}</b></td><td>{{v.recipe_no}}</td><td>{{v.name}}</td><td>{{v.valid_from}}</td><td>{{v.concrete_class or 'â€”'}} Â· {{v.consistency or 'â€”'}} Â· W/S {{v.water_cement_ratio or 'â€”'}}</td></tr>{% else %}<tr><td colspan="5">Brak zapisanej wersji.</td></tr>{% endfor %}</tbody></table></div><div class="row"><div class="card"><h2>SkĹ‚ad</h2><form method="post"><label>Surowiec</label><input name="material_name" required><div class="row"><div><label>IloĹ›Ä‡ na 1 {{product.unit or 'm3'}}</label><input name="qty_per_unit" type="number" min="0.0001" step="0.0001" required></div><div><label>Jednostka</label><select name="unit"><option>kg</option><option>t</option><option>m3</option><option>l</option><option>szt.</option></select></div></div><button class="btn primary" style="margin-top:12px">Dodaj / zaktualizuj</button></form></div><div class="card"><h2>Aktualny skĹ‚ad na 1 {{product.unit or 'm3'}}</h2><table><tbody>{% for x in recipe %}<tr><td><b>{{x.name}}</b></td><td>{{x.qty_per_unit}} {{x.unit}}</td><td><form method="post" action="{{url_for('product_recipe_item_delete',product_id=product.id,recipe_id=x.id)}}"><button class="btn danger">UsuĹ„</button></form></td></tr>{% else %}<tr><td>Brak skĹ‚adu.</td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}'''
+    return render_template_string(recipe_page,product=product,recipe=recipe,versions=versions,error=error,title='Receptura',base_url=BASE_URL,db_path=DB_PATH)
     return render_template_string(r'''{% extends "base.html" %}{% block content %}
       <div class="flex"><h1>Receptura: {{product.name or product.sku}}</h1><a class="btn right" href="{{url_for('products')}}">Wróć do produktów</a></div>
       {% if error %}<div class="hint">{{error}}</div>{% endif %}
@@ -4965,6 +5018,25 @@ def raw_material_warehouse():
       <div class="card"><p class="muted">Pozycje powstają automatycznie po dodaniu ich do receptury produktu. Przyjęcie zwiększa stan; wydanie WZ rozchoduje składniki według receptury.</p><table><thead><tr><th>Surowiec</th><th>Stan</th><th>Receptury</th><th>Dodaj na stan</th></tr></thead><tbody>{% for x in rows %}<tr><td><b>{{x.name}}</b></td><td><span class="badge">{{'%.4f'|format(x.qty)|float}} {{x.unit}}</span></td><td>{{x.recipe_count}}</td><td><form method="post" action="{{url_for('raw_material_stock_add',material_id=x.id)}}" class="flex"><input name="qty" type="number" min="0.0001" step="0.0001" placeholder="Ilość" required style="max-width:150px"><button class="btn ok">Dodaj</button></form></td></tr>{% else %}<tr><td colspan="4" class="muted">Dodaj pierwszy składnik w recepturze produktu.</td></tr>{% endfor %}</tbody></table></div>
       <div class="card"><h2>Ostatnie ruchy</h2><table><thead><tr><th>Data</th><th>Surowiec</th><th>Ruch</th><th>WZ / opis</th></tr></thead><tbody>{% for x in movements %}<tr><td>{{x.created_at}}</td><td>{{x.name}}</td><td><b>{{'+' if x.qty_delta>0 else ''}}{{x.qty_delta}} {{x.unit}}</b></td><td>{{x.wz_no or x.note or 'Korekta ręczna'}}</td></tr>{% else %}<tr><td colspan="4" class="muted">Brak ruchów magazynowych.</td></tr>{% endfor %}</tbody></table></div>
     {% endblock %}''', rows=rows, movements=movements, title="Magazyn", base_url=BASE_URL, db_path=DB_PATH)
+
+@app.route("/warehouse/<int:material_id>",methods=["GET","POST"])
+def raw_material_detail(material_id):
+    fields=('name','code','material_type','unit','manufacturer','trade_name','reference_document','technical_designation','description','active','minimum_stock','cement_type','cement_designation','strength_class','aggregate_type','fraction','max_grain_size')
+    with conn() as c:
+        material=c.execute('''SELECT rm.*,COALESCE(s.qty,0) stock_qty FROM raw_materials rm LEFT JOIN raw_material_stock s ON s.material_id=rm.id WHERE rm.id=?''',(material_id,)).fetchone()
+        if not material: abort(404)
+        if request.method=='POST':
+            values=[]
+            for field in fields:
+                if field=='active': values.append(1 if request.form.get('active') else 0)
+                elif field=='minimum_stock': values.append(to_float(request.form.get(field),0))
+                else: values.append(norm(request.form.get(field)))
+            c.execute('UPDATE raw_materials SET '+','.join(f'{x}=?' for x in fields)+' WHERE id=?',values+[material_id])
+            c.commit()
+            sync_local_rows_to_supabase('raw_materials','id',[material_id])
+            return redirect(url_for('raw_material_detail',material_id=material_id))
+    tpl=r'''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{m.name}}</h1><a class="btn right" href="{{url_for('raw_material_warehouse')}}">WrĂłÄ‡ do magazynu</a></div><div class="grid3"><div class="card"><span class="muted">Aktualny stan</span><h2>{{m.stock_qty}} {{m.unit}}</h2></div><div class="card"><span class="muted">Minimum</span><h2>{{m.minimum_stock}} {{m.unit}}</h2></div><div class="card"><span class="muted">Oznaczenie</span><h2>{{m.technical_designation or m.cement_designation or 'â€”'}}</h2></div></div><form method="post" class="card"><h2>Kartoteka surowca</h2><div class="grid3"><div><label>Nazwa</label><input name="name" value="{{m.name}}" required></div><div><label>Kod</label><input name="code" value="{{m.code or ''}}"></div><div><label>Typ</label><input name="material_type" value="{{m.material_type or ''}}" list="types"><datalist id="types"><option>cement</option><option>piasek</option><option>kruszywo</option><option>woda</option><option>domieszka chemiczna</option><option>wĹ‚Ăłkna</option><option>dodatek</option><option>inne</option></datalist></div><div><label>Jednostka</label><input name="unit" value="{{m.unit}}" required></div><div><label>Stan minimalny</label><input type="number" step="0.001" name="minimum_stock" value="{{m.minimum_stock or 0}}"></div><div><label>Producent / dostawca</label><input name="manufacturer" value="{{m.manufacturer or ''}}"></div><div><label>Nazwa handlowa</label><input name="trade_name" value="{{m.trade_name or ''}}"></div><div><label>Dokument / norma</label><input name="reference_document" value="{{m.reference_document or ''}}"></div><div><label>Oznaczenie techniczne</label><input name="technical_designation" value="{{m.technical_designation or ''}}"></div></div><h2>Cement</h2><div class="grid3"><div><label>Typ cementu</label><input name="cement_type" value="{{m.cement_type or ''}}"></div><div><label>Oznaczenie cementu</label><input name="cement_designation" value="{{m.cement_designation or ''}}"></div><div><label>Klasa wytrzymaĹ‚oĹ›ci</label><input name="strength_class" value="{{m.strength_class or ''}}"></div></div><h2>Kruszywo</h2><div class="grid3"><div><label>Rodzaj</label><input name="aggregate_type" value="{{m.aggregate_type or ''}}"></div><div><label>Frakcja</label><input name="fraction" value="{{m.fraction or ''}}"></div><div><label>Maks. wymiar ziarna</label><input name="max_grain_size" value="{{m.max_grain_size or ''}}"></div></div><label>Opis</label><textarea name="description">{{m.description or ''}}</textarea><label><input type="checkbox" name="active" value="1" {{'checked' if m.active}}> Aktywny</label><button class="btn primary">Zapisz kartotekÄ™</button></form>{% endblock %}'''
+    return render_template_string(tpl,m=material,title=material['name'],base_url=BASE_URL,db_path=DB_PATH)
 
 @app.post("/warehouse/<int:material_id>/add")
 def raw_material_stock_add(material_id):

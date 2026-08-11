@@ -1,6 +1,7 @@
 import re
 import os
 import io
+import json
 import secrets
 import time
 import unicodedata
@@ -42,6 +43,10 @@ def register_beton_logistics(app,deps):
           order_item_id INTEGER NOT NULL REFERENCES order_items(id),product_id INTEGER NOT NULL REFERENCES products(id),
           sku TEXT NOT NULL,qty_planned REAL NOT NULL CHECK(qty_planned>0),qty_issued REAL,
           created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS wz_technology_snapshots(
+          id INTEGER PRIMARY KEY,wz_id INTEGER NOT NULL REFERENCES wz_documents(id) ON DELETE CASCADE,
+          wz_item_id INTEGER NOT NULL REFERENCES wz_items(id) ON DELETE CASCADE,product_id INTEGER NOT NULL REFERENCES products(id),
+          recipe_version_id INTEGER,snapshot_json TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(wz_item_id));
         CREATE TABLE IF NOT EXISTS transports(
           id INTEGER PRIMARY KEY AUTOINCREMENT,transport_no TEXT NOT NULL UNIQUE,invoice_id INTEGER REFERENCES invoices(id),wz_id INTEGER REFERENCES wz_documents(id),
           driver_id INTEGER NOT NULL REFERENCES drivers(id),vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),destination TEXT,
@@ -51,6 +56,11 @@ def register_beton_logistics(app,deps):
         CREATE TABLE IF NOT EXISTS transport_items(
           id INTEGER PRIMARY KEY AUTOINCREMENT,transport_id INTEGER NOT NULL REFERENCES transports(id) ON DELETE CASCADE,
           invoice_allocation_id INTEGER REFERENCES invoice_allocations(id),wz_item_id INTEGER REFERENCES wz_items(id),qty REAL NOT NULL CHECK(qty>0),created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS transport_delivery_adjustments(
+          id INTEGER PRIMARY KEY,transport_id INTEGER NOT NULL REFERENCES transports(id) ON DELETE CASCADE,
+          water_added INTEGER NOT NULL DEFAULT 0,water_qty REAL,water_unit TEXT DEFAULT 'l',event_at TEXT,
+          added_fibres TEXT,added_chemicals TEXT,other_additions TEXT,notes TEXT,responsible_person TEXT,
+          created_by TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS delivery_photos(
           id INTEGER PRIMARY KEY AUTOINCREMENT,transport_id INTEGER NOT NULL REFERENCES transports(id) ON DELETE CASCADE,
           storage_ref TEXT NOT NULL,photo_type TEXT NOT NULL DEFAULT 'delivery',caption TEXT,created_by TEXT NOT NULL,created_at TEXT NOT NULL,deleted_at TEXT);
@@ -116,8 +126,54 @@ def next_wz_no(c):
     year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM wz_documents WHERE wz_no LIKE ?",(f'WZ/{year}/%',)).fetchone()[0]+1
     return f'WZ/{year}/{n:05d}'
 
+def snapshot_wz_technology(c, wz_id, created_by, created_at):
+    """Freeze recipe and material technology for every WZ line exactly once."""
+    for wz_item in c.execute('SELECT * FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall():
+        if c.execute('SELECT 1 FROM wz_technology_snapshots WHERE wz_item_id=?',(wz_item['id'],)).fetchone(): continue
+        version=c.execute('''SELECT * FROM recipe_versions WHERE product_id=? AND (valid_from IS NULL OR valid_from='' OR valid_from<=?) ORDER BY version_no DESC,id DESC LIMIT 1''',(wz_item['product_id'],created_at[:10])).fetchone()
+        if version:
+            material_rows=c.execute('''SELECT rvi.qty_per_unit,rvi.unit,rvi.material_snapshot_json,rm.* FROM recipe_version_items rvi JOIN raw_materials rm ON rm.id=rvi.material_id WHERE rvi.recipe_version_id=? ORDER BY rm.name''',(version['id'],)).fetchall()
+        else:
+            material_rows=c.execute('''SELECT pr.qty_per_unit,rm.unit,NULL material_snapshot_json,rm.* FROM product_recipes pr JOIN raw_materials rm ON rm.id=pr.material_id WHERE pr.product_id=? ORDER BY rm.name''',(wz_item['product_id'],)).fetchall()
+        materials=[]
+        for row in material_rows:
+            material=dict(row); frozen={}
+            if material.get('material_snapshot_json'):
+                try: frozen=json.loads(material['material_snapshot_json'])
+                except Exception: frozen={}
+            for key in ('id','name','code','material_type','unit','manufacturer','trade_name','reference_document','technical_designation','description','cement_type','cement_designation','strength_class','aggregate_type','fraction','max_grain_size'):
+                frozen.setdefault(key,material.get(key))
+            frozen['qty_per_unit']=float(material['qty_per_unit']); materials.append(frozen)
+        version_data=dict(version) if version else {}
+        product=c.execute('SELECT id,sku,name,model,unit FROM products WHERE id=?',(wz_item['product_id'],)).fetchone()
+        cement=next((m for m in materials if (m.get('material_type') or '').lower()=='cement'),{})
+        snapshot={'recipe_version_id':version_data.get('id'),'recipe_no':version_data.get('recipe_no') or '','recipe_name':version_data.get('name') or 'Receptura produktu','version_no':version_data.get('version_no') or 1,'valid_from':version_data.get('valid_from'),'concrete_class':version_data.get('concrete_class'),'consistency':version_data.get('consistency'),'water_cement_ratio':version_data.get('water_cement_ratio'),'exposure_class':version_data.get('exposure_class'),'max_aggregate_size':version_data.get('max_aggregate_size'),'chloride_class':version_data.get('chloride_class'),'characteristic_strength':version_data.get('characteristic_strength'),'reference_document':version_data.get('reference_document'),'cement_type':version_data.get('cement_type') or cement.get('technical_designation') or cement.get('cement_designation'),'admixtures':version_data.get('admixtures'),'fibres':version_data.get('fibres'),'other_additions':version_data.get('other_additions'),'technology_notes':version_data.get('technology_notes'),'product':dict(product) if product else {},'materials':materials,'qty':float(wz_item['qty_issued'] if wz_item['qty_issued'] is not None else wz_item['qty_planned'])}
+        c.execute('INSERT INTO wz_technology_snapshots(id,wz_id,wz_item_id,product_id,recipe_version_id,snapshot_json,created_at) VALUES(?,?,?,?,?,?,?)',(cloud_id(),wz_id,wz_item['id'],wz_item['product_id'],version_data.get('id'),json.dumps(snapshot,ensure_ascii=False),created_at))
+
 def issue_recipe_materials(c, wz_id, issued_by, issued_at):
     """Book one idempotent raw-material issue for a WZ."""
+    snapshot_wz_technology(c,wz_id,issued_by,issued_at)
+    if c.execute("SELECT 1 FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue' LIMIT 1",(wz_id,)).fetchone():
+        raise ValueError('Materiały dla tego WZ zostały już rozchodowane.')
+    totals={}
+    for row in c.execute('SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,)).fetchall():
+        data=json.loads(row['snapshot_json']); product_qty=float(data.get('qty') or 0)
+        if not data.get('materials'):
+            raise ValueError(f"Produkt {(data.get('product') or {}).get('name') or (data.get('product') or {}).get('sku')} nie ma receptury.")
+        for material in data['materials']:
+            material_id=int(material['id'])
+            entry=totals.setdefault(material_id,{'name':material.get('name') or str(material_id),'unit':material.get('unit') or 'kg','qty':0.0})
+            entry['qty']+=float(material.get('qty_per_unit') or 0)*product_qty
+    shortages=[]
+    for material_id,entry in totals.items():
+        stock=c.execute('SELECT COALESCE(qty,0) qty FROM raw_material_stock WHERE material_id=?',(material_id,)).fetchone()
+        entry['stock']=float(stock['qty'] if stock else 0)
+        if entry['stock']+1e-9<entry['qty']: shortages.append(f"{entry['name']}: potrzeba {entry['qty']:.4f} {entry['unit']}, stan {entry['stock']:.4f} {entry['unit']}")
+    if shortages: raise ValueError('Brak materiału na magazynie: '+'; '.join(shortages))
+    for material_id,entry in totals.items():
+        c.execute('UPDATE raw_material_stock SET qty=qty-? WHERE material_id=?',(entry['qty'],material_id))
+        c.execute("INSERT INTO raw_material_movements(id,material_id,wz_id,qty_delta,movement_type,note,created_by,created_at) VALUES(?,?,?,?,'wz_issue','Rozchód według wersji receptury zapisanej w snapshot WZ',?,?)",(cloud_id(),material_id,wz_id,-entry['qty'],issued_by,issued_at))
+    return
     already=c.execute("SELECT 1 FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue' LIMIT 1",(wz_id,)).fetchone()
     if already:
         raise ValueError('Materiały dla tego WZ zostały już rozchodowane.')
@@ -421,7 +477,7 @@ def wz_delete(wz_id):
 @bp.get('/wz/<int:wz_id>/print')
 def wz_print(wz_id):
     with D['conn']() as c:
-        w=c.execute('''SELECT w.*,o.customer_name,o.customer_address,o.note AS order_delivery_address,
+        w=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.note AS order_delivery_address,
             COALESCE(NULLIF(w.destination,''), o.customer_address) AS destination
             FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
         if not w:abort(404)
@@ -434,6 +490,10 @@ def wz_print(wz_id):
               COALESCE((SELECT SUM(ti.qty) FROM transport_items ti WHERE ti.transport_id=t.id),0) qty
             FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id
             WHERE t.wz_id=? AND t.deleted_at IS NULL ORDER BY t.id''',(wz_id,)).fetchall()
+        technology=[]
+        for snapshot_row in c.execute('SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall():
+            try: technology.append(json.loads(snapshot_row['snapshot_json']))
+            except Exception: pass
     font_name='Helvetica'
     for font_path in (r'C:\Windows\Fonts\arial.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
         if os.path.exists(font_path):
@@ -453,6 +513,7 @@ def wz_print(wz_id):
         pdf.setFont(font_name,size); pdf.drawString(18*mm,y,str(text or '—')[:115]); y-=gap*mm
     line(f"Wydanie zewnętrzne {w['wz_no']}",16,9)
     line(f"Data: {str(w['created_at'])[:10]}    Status: {w['status']}")
+    line(f"Numer zlecenia: {w['order_no']}")
     line(f"Odbiorca: {w['customer_name']}")
     line(f"Adres odbiorcy: {w['customer_address'] or '—'}")
     line(f"Adres dostawy: {w['destination'] or '—'}")
@@ -462,6 +523,10 @@ def wz_print(wz_id):
         qty=item['qty_issued'] if item['qty_issued'] is not None else item['qty_planned']
         line(f"{item['sku']}    {qty} m³")
     y-=3*mm; line("Kursy składające się na wydanie",12,7)
+    for tech in technology:
+        y-=3*mm; line("SPECYFIKACJA TECHNICZNA",12,7)
+        for label,key in (("Klasa betonu","concrete_class"),("Nr receptury","recipe_no"),("Wersja","version_no"),("Cement","cement_type"),("Konsystencja","consistency"),("W/S","water_cement_ratio"),("Klasa ekspozycji","exposure_class"),("Maks. wymiar kruszywa","max_aggregate_size"),("Klasa chlorkĂłw","chloride_class"),("Wytrzymałość","characteristic_strength"),("Dokument odniesienia","reference_document"),("Domieszki","admixtures"),("Włókna","fibres"),("Inne dodatki","other_additions")):
+            if tech.get(key) not in (None,''): line(f"{label}: {tech[key]}")
     if courses:
         for course in courses:
             line(f"{course['transport_no']}    {course['driver_name']} / {course['registration_no']}    {course['qty']} m³")
@@ -469,6 +534,9 @@ def wz_print(wz_id):
         line("Brak przydzielonych kursów.")
     y-=15*mm; line("________________________________________",10,5)
     line("Podpis i pieczęć odbiorcy",9)
+    line("Operator betoniarni: ____________________",9)
+    line("Kierowca: _______________________________",9)
+    line("Odbiorca: _______________________________",9)
     pdf.save(); out.seek(0)
     filename=re.sub(r'[^A-Za-z0-9_.-]+','_',w['wz_no'])+'.pdf'
     return send_file(out,mimetype='application/pdf',as_attachment=False,download_name=filename)
@@ -491,9 +559,11 @@ def wz_issue(wz_id):
     D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
     with D['conn']() as c:
         item_ids=[x['id'] for x in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
+        snapshot_ids=[x['id'] for x in c.execute('SELECT id FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,)).fetchall()]
         material_ids=[x['material_id'] for x in c.execute("SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue'",(wz_id,)).fetchall()]
         movement_ids=[x['id'] for x in c.execute("SELECT id FROM raw_material_movements WHERE wz_id=?",(wz_id,)).fetchall()]
     D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
+    D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
     D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
     D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
     return redirect(url_for('beton.wz_view',wz_id=wz_id))
@@ -753,8 +823,15 @@ def transport_course_print(transport_id):
             WHERE wi.wz_id=(SELECT wz_id FROM transports WHERE id=?) ORDER BY wi.id''',(transport_id,)).fetchall()
         full_total=sum(float(x['qty'] or 0) for x in full_items)
         transport['is_final_course']=cumulative+0.00001>=full_total
+        adjustment=c.execute('SELECT * FROM transport_delivery_adjustments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
+        technology=[]
+        for row in c.execute('SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=(SELECT wz_id FROM transports WHERE id=?) ORDER BY id',(transport_id,)).fetchall():
+            try: technology.append(json.loads(row['snapshot_json']))
+            except Exception: pass
     course_tpl='''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{t.course_wz_no}}</title><style>body{font:14px Arial;max-width:900px;margin:35px auto;color:#111}table{border-collapse:collapse;width:100%;margin:22px 0}td,th{border:1px solid #222;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:25px}.sign{margin-top:60px;border-top:1px solid #111;padding-top:8px;width:40%;text-align:center}.full-wz{page-break-before:always;padding-top:20px}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>WZ kursu {{t.course_wz_no}}</h1><p>Kurs: <b>{{t.transport_no}}</b> · dokument główny: <b>{{t.wz_no}}</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}<br><br><b>Adres dostawy</b><br>{{t.destination or '—'}}</div><div><b>Kierowca / auto</b><br>{{t.driver_name}} · {{t.registration_no}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość kursu [m³]</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis odbiorcy dla kursu</div>{% if t.is_final_course %}<section class="full-wz"><h1>Wydanie zewnętrzne {{t.wz_no}}</h1><p><b>Pełna WZ zbiorcza — dołączona do ostatniego kursu.</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}</div><div><b>Adres dostawy</b><br>{{t.destination or '—'}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Łączna ilość [m³]</th></tr></thead><tbody>{% for i in full_items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis i pieczęć odbiorcy — pełna WZ</div></section>{% endif %}</html>'''
-    return render_template_string(course_tpl,t=transport,items=items,full_items=full_items)
+    extra='''{% for tech in technology %}<section><h2>SPECYFIKACJA TECHNICZNA</h2>{% for label,key in [('Klasa betonu','concrete_class'),('Nr receptury','recipe_no'),('Wersja','version_no'),('Cement','cement_type'),('Konsystencja','consistency'),('W/S','water_cement_ratio'),('Klasa ekspozycji','exposure_class'),('Maks. wymiar kruszywa','max_aggregate_size'),('Klasa chlorkĂłw','chloride_class'),('WytrzymaĹ‚oĹ›Ä‡','characteristic_strength'),('Dokument odniesienia','reference_document'),('Domieszki','admixtures'),('WĹ‚Ăłkna','fibres'),('Inne dodatki','other_additions')] %}{% if tech.get(key) not in [none,''] %}<div><b>{{label}}:</b> {{tech.get(key)}}</div>{% endif %}{% endfor %}</section>{% endfor %}{% if adjustment %}<section><h2>Dane konkretnej dostawy</h2>{% if adjustment.water_added %}<p><b>Dodano wodÄ™ na ĹĽÄ…danie odbiorcy:</b> {{adjustment.water_qty or 'â€”'}} {{adjustment.water_unit or 'l'}} · {{adjustment.event_at or ''}}</p>{% endif %}{% if adjustment.added_fibres %}<p><b>Dodano wĹ‚Ăłkna:</b> {{adjustment.added_fibres}}</p>{% endif %}{% if adjustment.added_chemicals %}<p><b>Dodano chemiÄ™:</b> {{adjustment.added_chemicals}}</p>{% endif %}{% if adjustment.other_additions %}<p><b>Inne dodatki:</b> {{adjustment.other_additions}}</p>{% endif %}{% if adjustment.notes %}<p><b>Uwagi:</b> {{adjustment.notes}}</p>{% endif %}<p><b>Osoba odpowiedzialna:</b> {{adjustment.responsible_person or adjustment.created_by}}</p></section>{% endif %}<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:40px;margin-top:70px"><div class="sign">Operator betoniarni</div><div class="sign">Kierowca</div><div class="sign">Odbiorca</div></div></html>'''
+    course_tpl=course_tpl.replace('</html>',extra)
+    return render_template_string(course_tpl,t=transport,items=items,full_items=full_items,technology=technology,adjustment=adjustment)
     return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>WZ kursu {{t.transport_no}}</title><style>body{font:14px Arial;max-width:900px;margin:35px auto}table{border-collapse:collapse;width:100%;margin:22px 0}td,th{border:1px solid #222;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:25px}.sign{margin-top:60px;border-top:1px solid #111;padding-top:8px;width:40%;text-align:center}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>WZ cząstkowa / kurs {{t.transport_no}}</h1><p>Dokument do WZ zbiorczej: <b>{{t.wz_no}}</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}<br><br><b>Adres dostawy</b><br>{{t.destination or '—'}}</div><div><b>Kierowca / auto</b><br>{{t.driver_name}} · {{t.registration_no}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość [m³]</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis odbiorcy dla kursu</div></html>''',t=transport,items=items)
 
 @bp.get('/transports/<int:transport_id>')
@@ -765,7 +842,24 @@ def transport_view(transport_id):
         items=c.execute('''SELECT ti.qty, COALESCE(p.name, w.sku) AS sku
             FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
             LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(transport_id,)).fetchall()
+        adjustment=c.execute('SELECT * FROM transport_delivery_adjustments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
+    detail_tpl='''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a><a class="btn" target="_blank" href="{{url_for('beton.transport_course_print',transport_id=x.id)}}">Drukuj WZ kursu</a></div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><table><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}} mÂł</b></td></tr>{% endfor %}</tbody></table></div><form method="post" action="{{url_for('beton.transport_adjustment_save',transport_id=x.id)}}" class="card"><h2>Dane konkretnej dostawy</h2><div class="grid3"><div><label><input type="checkbox" name="water_added" value="1" {{'checked' if adjustment and adjustment.water_added}}> Dodano wodÄ™ na ĹĽÄ…danie odbiorcy</label></div><div><label>IloĹ›Ä‡ wody</label><input type="number" step="0.01" name="water_qty" value="{{adjustment.water_qty if adjustment else ''}}"></div><div><label>Jednostka</label><select name="water_unit"><option>l</option><option>kg</option></select></div><div><label>Data i godzina</label><input type="datetime-local" name="event_at" value="{{(adjustment.event_at or '')[:16] if adjustment else ''}}"></div><div><label>Osoba odpowiedzialna</label><input name="responsible_person" value="{{adjustment.responsible_person or '' if adjustment else ''}}"></div><div><label>Dodano wĹ‚Ăłkna</label><input name="added_fibres" value="{{adjustment.added_fibres or '' if adjustment else ''}}"></div><div><label>Dodano chemiÄ™</label><input name="added_chemicals" value="{{adjustment.added_chemicals or '' if adjustment else ''}}"></div><div><label>Inne dodatki</label><input name="other_additions" value="{{adjustment.other_additions or '' if adjustment else ''}}"></div></div><label>Uwagi</label><textarea name="notes">{{adjustment.notes or '' if adjustment else ''}}</textarea><button class="btn primary">Zapisz dane dostawy</button></form>{% endblock %}'''
+    return render_template_string(detail_tpl,x=x,items=items,adjustment=adjustment,title=x['transport_no'],base_url=D['BASE_URL'],db_path=D['DB_PATH'])
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a>{% if x.invoice_id %}<a class="btn" href="{{url_for('invoice_download_admin',invoice_id=x.invoice_id)}}">Pobierz fakturę</a>{% endif %}</div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><div class="line"></div><table><thead><tr><th>Materiał / SKU</th><th>Ilość</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}}</b></td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',x=x,items=items,title=x['transport_no'],base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+
+@bp.post('/transports/<int:transport_id>/delivery-data')
+def transport_adjustment_save(transport_id):
+    now=stamp(); adjustment_id=cloud_id()
+    with D['conn']() as c:
+        if not c.execute('SELECT 1 FROM transports WHERE id=? AND deleted_at IS NULL',(transport_id,)).fetchone(): abort(404)
+        existing=c.execute('SELECT id FROM transport_delivery_adjustments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
+        values=(1 if request.form.get('water_added') else 0,request.form.get('water_qty') or None,request.form.get('water_unit') or 'l',request.form.get('event_at') or now,request.form.get('added_fibres','').strip(),request.form.get('added_chemicals','').strip(),request.form.get('other_additions','').strip(),request.form.get('notes','').strip(),request.form.get('responsible_person','').strip(),actor(),now)
+        if existing:
+            adjustment_id=int(existing['id']); c.execute('''UPDATE transport_delivery_adjustments SET water_added=?,water_qty=?,water_unit=?,event_at=?,added_fibres=?,added_chemicals=?,other_additions=?,notes=?,responsible_person=?,created_by=?,updated_at=? WHERE id=?''',values+(adjustment_id,))
+        else:
+            c.execute('''INSERT INTO transport_delivery_adjustments(id,transport_id,water_added,water_qty,water_unit,event_at,added_fibres,added_chemicals,other_additions,notes,responsible_person,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(adjustment_id,transport_id)+values[:-1]+(now,now))
+    D['sync_local_rows_to_supabase']('transport_delivery_adjustments','id',[adjustment_id])
+    return redirect(url_for('beton.transport_view',transport_id=transport_id))
 
 def current_driver_id():
     """Resolve the logged-in Supabase account to the internal driver record."""
