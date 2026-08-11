@@ -3,10 +3,12 @@ from datetime import date, datetime, timedelta
 from flask import Blueprint, Response, jsonify, redirect, render_template, request, session, url_for
 
 bp=Blueprint('ops',__name__)
-DB=None; NOW=None
+DB=None; NOW=None; PULL_BEFORE_READ=None
 
-def register_operations(app,db_factory,now_factory):
-    global DB,NOW; DB=db_factory; NOW=now_factory
+def register_operations(app,db_factory,now_factory,pull_before_read=None):
+    """Rejestruje moduł kosztów i odświeża dane wspólne przed podglądem."""
+    global DB,NOW,PULL_BEFORE_READ
+    DB=db_factory; NOW=now_factory; PULL_BEFORE_READ=pull_before_read
     with DB() as c:
         c.executescript('''
         CREATE TABLE IF NOT EXISTS departments(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,active INTEGER NOT NULL DEFAULT 1);
@@ -38,6 +40,13 @@ def period():
 
 @bp.route('/operations',methods=['GET','POST'])
 def operations():
+    # Pojazdy oraz kierowcy są współdzielone przez Supabase. Odświeżamy je
+    # przed pokazaniem formularza, aby auto dodane w panelu głównym było tu od razu dostępne.
+    if request.method == 'GET' and PULL_BEFORE_READ:
+        try:
+            PULL_BEFORE_READ()
+        except Exception:
+            pass
     with DB() as c:
         if request.method=='POST':
             typ=request.form['type']; stamp=NOW(); user=session.get('display_name') or session.get('username') or 'Pracownik'
@@ -51,7 +60,7 @@ def operations():
                 net=float(request.form['net_cost'].replace(',','.')); vat=float(request.form['vat_rate'].replace(',','.'))
                 c.execute('INSERT INTO vehicle_expenses(vehicle_id,expense_date,category_id,description,net_cost,vat_rate,gross_cost,mileage,vendor,document_no,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(request.form['vehicle_id'],request.form['entry_date'],request.form['category_id'],request.form['description'],net,vat,round(net*(1+vat/100),2),request.form.get('mileage') or 0,request.form.get('vendor',''),request.form.get('document_no',''),request.form.get('notes',''),user,stamp,stamp))
             return redirect(url_for('ops.operations'))
-        materials=c.execute('SELECT * FROM products ORDER BY name,sku').fetchall(); vehicles=c.execute('SELECT * FROM vehicles WHERE active=1 ORDER BY registration_no').fetchall(); drivers=c.execute('SELECT * FROM drivers WHERE active=1 ORDER BY name').fetchall(); departments=c.execute('SELECT * FROM departments WHERE active=1 ORDER BY name').fetchall(); categories=c.execute('SELECT * FROM expense_categories ORDER BY name').fetchall()
+        materials=c.execute('SELECT * FROM products ORDER BY name,sku').fetchall(); vehicles=c.execute('SELECT * FROM vehicles WHERE COALESCE(active,1) != 0 ORDER BY registration_no').fetchall(); drivers=c.execute('SELECT * FROM drivers WHERE COALESCE(active,1) != 0 ORDER BY name').fetchall(); departments=c.execute('SELECT * FROM departments WHERE active=1 ORDER BY name').fetchall(); categories=c.execute('SELECT * FROM expense_categories ORDER BY name').fetchall()
         recent=c.execute("""SELECT kind,event_date,label,amount,user FROM (SELECT 'Materiał' kind,u.usage_date event_date,COALESCE(m.name,m.sku) label,u.total_cost amount,u.entered_by user FROM material_usage u JOIN products m ON m.id=u.material_id WHERE u.deleted_at IS NULL UNION ALL SELECT 'Paliwo',f.entry_date,v.registration_no,f.total_cost,f.created_by FROM fuel_entries f JOIN vehicles v ON v.id=f.vehicle_id WHERE f.deleted_at IS NULL UNION ALL SELECT ec.name,e.expense_date,v.registration_no||' · '||e.description,e.gross_cost,e.created_by FROM vehicle_expenses e JOIN vehicles v ON v.id=e.vehicle_id JOIN expense_categories ec ON ec.id=e.category_id WHERE e.deleted_at IS NULL) ORDER BY event_date DESC LIMIT 30""").fetchall()
     return render_template('operations.html',materials=materials,vehicles=vehicles,drivers=drivers,departments=departments,categories=categories,recent=recent,today=date.today().isoformat())
 
@@ -92,9 +101,44 @@ def analytics():
               AND substr(w.issued_at,1,10) BETWEEN ? AND ?
             GROUP BY substr(w.issued_at,1,10) ORDER BY day
         """,(start,end)).fetchall()
+        # Only completed transports are treated as completed courses in rankings.
+        driver_ranking=c.execute("""
+            SELECT d.name, COUNT(t.id) trips
+            FROM transports t JOIN drivers d ON d.id=t.driver_id
+            WHERE t.deleted_at IS NULL AND t.status='returned'
+              AND substr(COALESCE(t.returned_at,t.updated_at,t.created_at),1,10) BETWEEN ? AND ?
+            GROUP BY d.id,d.name ORDER BY trips DESC,d.name ASC
+        """,(start,end)).fetchall()
+        vehicle_stats=c.execute("""
+            SELECT v.registration_no,
+                   COALESCE(t.trips,0) trips,
+                   COALESCE(f.fuel_cost,0) fuel_cost,
+                   COALESCE(e.repair_cost,0) repair_cost,
+                   COALESCE(f.fuel_cost,0)+COALESCE(e.repair_cost,0) total_cost
+            FROM vehicles v
+            LEFT JOIN (
+              SELECT vehicle_id,COUNT(*) trips FROM transports
+              WHERE deleted_at IS NULL AND status='returned'
+                AND substr(COALESCE(returned_at,updated_at,created_at),1,10) BETWEEN ? AND ?
+              GROUP BY vehicle_id
+            ) t ON t.vehicle_id=v.id
+            LEFT JOIN (
+              SELECT vehicle_id,SUM(total_cost) fuel_cost FROM fuel_entries
+              WHERE deleted_at IS NULL AND entry_date BETWEEN ? AND ? GROUP BY vehicle_id
+            ) f ON f.vehicle_id=v.id
+            LEFT JOIN (
+              SELECT vehicle_id,SUM(gross_cost) repair_cost FROM vehicle_expenses
+              WHERE deleted_at IS NULL AND expense_date BETWEEN ? AND ? GROUP BY vehicle_id
+            ) e ON e.vehicle_id=v.id
+            WHERE v.deleted_at IS NULL
+            ORDER BY repair_cost DESC,total_cost DESC,v.registration_no ASC
+        """,(start,end,start,end,start,end)).fetchall()
     total=material+fuel+sum(costs.values())
     sold_m3=sum(float(x['qty'] or 0) for x in products)
-    return render_template('analytics.html',start=start,end=end,period=kind,material=material,fuel=fuel,costs=costs,total=total,monthly=monthly,vehicles=vehicles,sales=sales,products=products,sales_daily=sales_daily,sold_m3=sold_m3)
+    total_trips=sum(int(x['trips'] or 0) for x in vehicle_stats)
+    fleet_cost=sum(float(x['total_cost'] or 0) for x in vehicle_stats)
+    avg_transport_cost=(fleet_cost/total_trips) if total_trips else 0
+    return render_template('analytics.html',start=start,end=end,period=kind,material=material,fuel=fuel,costs=costs,total=total,monthly=monthly,vehicles=vehicles,sales=sales,products=products,sales_daily=sales_daily,sold_m3=sold_m3,driver_ranking=driver_ranking,vehicle_stats=vehicle_stats,total_trips=total_trips,fleet_cost=fleet_cost,avg_transport_cost=avg_transport_cost)
 
 @bp.get('/analytics/export.csv')
 def export_costs():
