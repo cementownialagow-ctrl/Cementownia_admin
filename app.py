@@ -6044,7 +6044,6 @@ def order_invoice(order_id):
             msg = "Faktura musi zawieraÄ‡ co najmniej jednÄ… pozycjÄ™."
         else:
             pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
-            packing_pdf_path = generate_invoice_packing_list_pdf(o, invoice_items, data, pdf_path)
             c = conn()
             cur = c.cursor()
             cur.execute("""
@@ -6072,7 +6071,7 @@ def order_invoice(order_id):
                 c.execute("UPDATE transports SET invoice_id=?,updated_by=?,updated_at=? WHERE wz_id=? AND deleted_at IS NULL",
                           (invoice_id, session.get("display_name") or session.get("username") or "Księgowość", now_iso(), wz_id))
                 c.commit(); c.close()
-            stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, data["invoice_no"], pdf_path, packing_pdf_path)
+            stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, data["invoice_no"], pdf_path)
             upsert_invoice_meta(invoice_id, stored_pdf_path, json.dumps(invoice_items, ensure_ascii=False), sent_to_client=None)
             allocation_ids = replace_invoice_allocations(invoice_id, invoice_items)
             touched_order_ids = [int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items]
@@ -6175,7 +6174,7 @@ def order_invoice(order_id):
       <div class="card">
         <h2>Zapisane faktury</h2>
         <table>
-          <thead><tr><th>Numer</th><th>Data</th><th>Netto</th><th>Brutto</th><th>Status klienta</th><th>Płatność</th><th>Akcje</th></tr></thead>
+          <thead><tr><th>Numer</th><th>Data</th><th>Netto</th><th>Brutto</th><th>Płatność</th><th>Akcje</th></tr></thead>
           <tbody>
             {% for inv in invoice_rows %}
               <tr>
@@ -6183,7 +6182,6 @@ def order_invoice(order_id):
                 <td>{{ inv['issue_date'] }}</td>
                 <td>{{ "%.2f"|format(inv['total_net']) }}</td>
                 <td>{{ "%.2f"|format(inv['total_gross']) }}</td>
-                <td>{{ "Udostępniona" if inv['sent_to_client'] else "Tylko wewnętrzna" }}</td>
                 <td>
                   {% if inv['paid'] %}
                     <span class="badge ok">Opłacona</span>
@@ -6196,30 +6194,18 @@ def order_invoice(order_id):
                 <td>
                   <div class="flex">
                     <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
-                    <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv['id']) }}" target="_blank">Pakuj</a>
                     <form method="post" action="{{ url_for('invoice_regenerate_admin', invoice_id=inv['id']) }}">
                       <button class="btn" type="submit">Regeneruj PDF</button>
                     </form>
-                    {% if not inv['sent_to_client'] %}
-                      <form method="post" action="{{ url_for('order_invoice_send', order_id=o['id'], invoice_id=inv['id']) }}" style="display:none">
-                        <button class="btn primary" type="submit">WyĹ›lij fakturÄ™ klientowi</button>
-                      </form>
-                    {% else %}
-                      <span class="badge" style="display:none">Widoczna w panelu klienta</span>
-                    {% endif %}
                     {% if not inv['paid'] %}
-                      <form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv['id']) }}" style="display:none">
-                        <input type="hidden" name="next" value="{{ request.full_path }}">
-                        <button class="btn" type="submit">Przypomnij o płatności</button>
-                      </form>
                       <form method="post" action="{{ url_for('invoice_paid_admin', invoice_id=inv['id']) }}">
                         <input type="hidden" name="next" value="{{ request.full_path }}">
-                        <button class="btn ok" type="submit">Faktura opłacona</button>
+                        <button class="btn ok" type="submit">Oznacz jako opłaconą</button>
                       </form>
                     {% else %}
                       <form method="post" action="{{ url_for('invoice_unpaid_admin', invoice_id=inv['id']) }}">
                         <input type="hidden" name="next" value="{{ request.full_path }}">
-                        <button class="btn" type="submit">Cofnij opłacenie</button>
+                        <button class="btn" type="submit">Oznacz jako nieopłaconą</button>
                       </form>
                     {% endif %}
                     <form method="post" action="{{ url_for('order_invoice_delete', order_id=o['id'], invoice_id=inv['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ fakturÄ™?')">
@@ -7318,7 +7304,7 @@ def invoices():
                       <th>Zamówienie</th>
                       <th>Netto</th>
                       <th>Brutto</th>
-                      <th>Status</th>
+                      <th>Płatność / KSeF</th>
                       <th>Akcje</th>
                     </tr>
                   </thead>
@@ -7331,19 +7317,6 @@ def invoices():
                         <td>{{ "%.2f"|format(inv.total_net) }}</td>
                         <td>{{ "%.2f"|format(inv.total_gross) }}</td>
                         <td>
-                          {% if inv.sent_to_client %}
-                            <span class="badge ok">Udostępniona klientowi</span>
-                          {% else %}
-                            <span class="badge">Nieudostępniona</span>
-                          {% endif %}
-                          {% if inv.sent_to_client %}
-                            {% if inv.seen_by_client %}
-                              <span class="badge ok">PDF pobrany</span>
-                              {% if inv.seen_at %}<div class="muted small">{{ inv.seen_at }}</div>{% endif %}
-                            {% else %}
-                              <span class="badge">PDF niepobrany</span>
-                            {% endif %}
-                          {% endif %}
                           {% if not inv.pdf_ok %}
                             <span class="badge danger">Brak PDF</span>
                           {% endif %}
@@ -7351,7 +7324,6 @@ def invoices():
                             <span class="badge ok">Opłacona</span>
                           {% else %}
                             <span class="badge danger">Nieopłacona</span>
-                            {% if inv.payment_reminder %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
                           {% endif %}
                           {% if inv.ksef_status == 'sent' %}
                             <span class="badge ok">W KSeF</span>
@@ -7368,29 +7340,18 @@ def invoices():
                         <td>
                           <div class="flex">
                             <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
-                            <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Pakuj</a>
-                            {% if not inv.sent_to_client %}
-                              <form method="post" action="{{ url_for('invoice_send_admin', invoice_id=inv.id) }}">
-                                <input type="hidden" name="next" value="{{ request.full_path }}">
-                                <button class="btn primary" type="submit">Udostępnij klientowi</button>
-                              </form>
-                            {% endif %}
                             {% if inv.source_order_id %}
                               <a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>
                             {% endif %}
                             {% if not inv.paid %}
-                              <form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv.id) }}">
-                                <input type="hidden" name="next" value="{{ request.full_path }}">
-                                <button class="btn" type="submit">Przypomnij o płatności</button>
-                              </form>
                               <form method="post" action="{{ url_for('invoice_paid_admin', invoice_id=inv.id) }}">
                                 <input type="hidden" name="next" value="{{ request.full_path }}">
-                                <button class="btn ok" type="submit">Faktura opłacona</button>
+                                <button class="btn ok" type="submit">Oznacz jako opłaconą</button>
                               </form>
                             {% else %}
                               <form method="post" action="{{ url_for('invoice_unpaid_admin', invoice_id=inv.id) }}">
                                 <input type="hidden" name="next" value="{{ request.full_path }}">
-                                <button class="btn" type="submit">Cofnij opłacenie</button>
+                                <button class="btn" type="submit">Oznacz jako nieopłaconą</button>
                               </form>
                             {% endif %}
                             {% if inv.ksef_status != 'sent' %}
@@ -8071,20 +8032,6 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
             pass
 
 
-@app.post("/invoices/<int:invoice_id>/payment-reminder")
-def invoice_payment_reminder_admin(invoice_id):
-    _set_invoice_payment_state(invoice_id, reminder=1, paid=0)
-    if not EMAIL_NOTIFICATIONS_ENABLED:
-        return _redirect_after_invoice_action()
-    try:
-        if send_payment_reminder:
-            invoice_row, pdf_url = _invoice_email_context(invoice_id)
-            send_payment_reminder(invoice_row, pdf_url=pdf_url)
-    except Exception:
-        pass
-    return _redirect_after_invoice_action()
-
-
 @app.post("/invoices/<int:invoice_id>/paid")
 def invoice_paid_admin(invoice_id):
     _set_invoice_payment_state(invoice_id, reminder=0, paid=1)
@@ -8408,108 +8355,6 @@ def _invoice_email_context(invoice_id: int):
     else:
         pdf_url = build_public_url(f"/api/invoices/{invoice_id}/download")
     return invoice, pdf_url
-
-
-def _send_invoice_to_client(invoice_id: int) -> int:
-    if not EMAIL_NOTIFICATIONS_ENABLED:
-        return 0
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-      SELECT i.id, i.order_id, i.buyer_email, i.invoice_no, o.customer_email
-      FROM invoices i
-      LEFT JOIN orders o ON o.id = i.order_id
-      WHERE i.id=?
-      LIMIT 1
-    """, (invoice_id,))
-    row = cur.fetchone()
-    if not row:
-        c.close()
-        abort(404)
-
-    buyer_email = _email_key(row["buyer_email"])
-    order_email = _email_key(row["customer_email"])
-    if not buyer_email and order_email:
-        cur.execute("UPDATE invoices SET buyer_email=? WHERE id=?", (order_email, invoice_id))
-        c.commit()
-        if supabase_enabled():
-            try:
-                supabase_update_rows("invoices", {"buyer_email": order_email}, {"id": invoice_id})
-            except Exception:
-                pass
-    c.close()
-
-    meta = load_invoice_meta(invoice_id) or {}
-    pdf_path = norm(meta.get("pdf_path"))
-    stored_pdf_path = pdf_path
-
-    if not parse_supabase_storage_ref(stored_pdf_path):
-        local_pdf_path = ""
-        if pdf_path:
-            candidate = pdf_path if os.path.isabs(pdf_path) else invoice_pdf_abspath(pdf_path)
-            if os.path.exists(candidate):
-                local_pdf_path = candidate
-
-        if not local_pdf_path:
-            fallback = find_invoice_pdf_fallback(row["invoice_no"])
-            if fallback:
-                local_pdf_path = fallback
-
-        items = invoice_items_from_saved_json(invoice_id)
-        if not local_pdf_path and items:
-            c = conn()
-            cur = c.cursor()
-            cur.execute("SELECT * FROM orders WHERE id=?", (row["order_id"],))
-            order_row = cur.fetchone()
-            c.close()
-            if order_row:
-                meta_payload = invoice_meta_payload(dict(row))
-                local_pdf_path, _total_net, _total_gross = generate_order_invoice_pdf(order_row, items, meta_payload)
-
-        if local_pdf_path:
-            packing_pdf_path = ""
-            if items:
-                pack_candidate = packing_list_pdf_path_for_invoice(local_pdf_path, row["invoice_no"])
-                if os.path.exists(pack_candidate):
-                    packing_pdf_path = pack_candidate
-                else:
-                    c = conn()
-                    cur = c.cursor()
-                    cur.execute("SELECT * FROM orders WHERE id=?", (row["order_id"],))
-                    order_row = cur.fetchone()
-                    c.close()
-                    if order_row:
-                        packing_pdf_path = generate_invoice_packing_list_pdf(order_row, items, invoice_meta_payload(dict(row)), local_pdf_path)
-            stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, row["invoice_no"], local_pdf_path, packing_pdf_path)
-
-    upsert_invoice_meta(invoice_id, stored_pdf_path, meta.get("invoice_items_json",""), sent_to_client=1, seen_by_client=0, seen_at=None)
-
-    if supabase_enabled():
-        try:
-            sync_invoice_meta_to_supabase(invoice_id)
-        except Exception:
-            pass
-
-    try:
-        if send_invoice_available:
-            invoice_row, pdf_url = _invoice_email_context(invoice_id)
-            send_invoice_available(invoice_row, pdf_url=pdf_url)
-    except Exception:
-        pass
-
-    return int(row["order_id"] or 0)
-
-
-@app.post("/invoices/<int:invoice_id>/send")
-def invoice_send_admin(invoice_id):
-    _send_invoice_to_client(invoice_id)
-    return _redirect_after_invoice_action()
-
-
-@app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/send")
-def order_invoice_send(order_id, invoice_id):
-    _send_invoice_to_client(invoice_id)
-    return redirect(url_for("order_invoice", order_id=order_id, sent="1", invoice_id=invoice_id))
 
 
 @app.route("/invoices/<int:invoice_id>/edit", methods=["GET", "POST"])
