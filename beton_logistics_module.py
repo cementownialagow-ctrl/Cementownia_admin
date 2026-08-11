@@ -7,6 +7,11 @@ import unicodedata
 from datetime import datetime
 
 from flask import Blueprint, abort, current_app, g, jsonify, redirect, render_template_string, request, send_file, session, url_for
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 
 bp=Blueprint('beton',__name__,url_prefix='/beton')
 driver_api=Blueprint('driver_api',__name__,url_prefix='/api/driver')
@@ -378,7 +383,7 @@ def photo_download(photo_id):
 
 @bp.post('/wz/<int:wz_id>/delete')
 def wz_delete(wz_id):
-    """Soft-delete WZ and any linked transport; invoices must be removed first."""
+    """Delete only an unfulfilled WZ; completed logistics require a formal correction."""
     s = stamp()
     with D['conn']() as c:
         wz = c.execute('SELECT * FROM wz_documents WHERE id=? AND deleted_at IS NULL', (wz_id,)).fetchone()
@@ -386,6 +391,13 @@ def wz_delete(wz_id):
             abort(404)
         if wz['invoice_id']:
             return 'Najpierw usuń powiązaną fakturę VAT, a następnie WZ.', 409
+        if wz['status'] in {'in_transport','ready_invoice','returned','invoiced'}:
+            return 'Nie można usunąć WZ po rozpoczęciu dostawy, podpisaniu dokumentu lub fakturowaniu. Wymagana jest formalna korekta.', 409
+        progressed = c.execute('''SELECT transport_no,status FROM transports
+            WHERE wz_id=? AND deleted_at IS NULL AND status NOT IN ('assigned')
+            ORDER BY id LIMIT 1''',(wz_id,)).fetchone()
+        if progressed:
+            return f"Nie można usunąć WZ: transport {progressed['transport_no']} rozpoczął realizację ({progressed['status']}).", 409
         reverse_recipe_materials(c, wz_id, actor(), s)
         material_ids = [x['material_id'] for x in c.execute('SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=?',(wz_id,)).fetchall()]
         movement_ids = [x['id'] for x in c.execute('SELECT id FROM raw_material_movements WHERE wz_id=?',(wz_id,)).fetchall()]
@@ -422,6 +434,44 @@ def wz_print(wz_id):
               COALESCE((SELECT SUM(ti.qty) FROM transport_items ti WHERE ti.transport_id=t.id),0) qty
             FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id
             WHERE t.wz_id=? AND t.deleted_at IS NULL ORDER BY t.id''',(wz_id,)).fetchall()
+    font_name='Helvetica'
+    for font_path in (r'C:\Windows\Fonts\arial.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
+        if os.path.exists(font_path):
+            try:
+                if 'WZRegular' not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont('WZRegular',font_path))
+                font_name='WZRegular'
+                break
+            except Exception:
+                pass
+    out=io.BytesIO(); pdf=canvas.Canvas(out,pagesize=A4)
+    width,height=A4; y=height-22*mm
+    def line(text,size=10,gap=6):
+        nonlocal y
+        if y<22*mm:
+            pdf.showPage(); pdf.setFont(font_name,10); y=height-22*mm
+        pdf.setFont(font_name,size); pdf.drawString(18*mm,y,str(text or '—')[:115]); y-=gap*mm
+    line(f"Wydanie zewnętrzne {w['wz_no']}",16,9)
+    line(f"Data: {str(w['created_at'])[:10]}    Status: {w['status']}")
+    line(f"Odbiorca: {w['customer_name']}")
+    line(f"Adres odbiorcy: {w['customer_address'] or '—'}")
+    line(f"Adres dostawy: {w['destination'] or '—'}")
+    line(f"Miejsce wydania: {w['issue_location']} → {w['warehouse_location']}",10,9)
+    line("Pozycje dokumentu",12,7)
+    for item in items:
+        qty=item['qty_issued'] if item['qty_issued'] is not None else item['qty_planned']
+        line(f"{item['sku']}    {qty} m³")
+    y-=3*mm; line("Kursy składające się na wydanie",12,7)
+    if courses:
+        for course in courses:
+            line(f"{course['transport_no']}    {course['driver_name']} / {course['registration_no']}    {course['qty']} m³")
+    else:
+        line("Brak przydzielonych kursów.")
+    y-=15*mm; line("________________________________________",10,5)
+    line("Podpis i pieczęć odbiorcy",9)
+    pdf.save(); out.seek(0)
+    filename=re.sub(r'[^A-Za-z0-9_.-]+','_',w['wz_no'])+'.pdf'
+    return send_file(out,mimetype='application/pdf',as_attachment=False,download_name=filename)
     return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{w.wz_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}table{border-collapse:collapse;width:100%;margin:22px 0}th,td{border:1px solid #333;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.sign{border-top:1px solid #111;padding-top:7px;text-align:center;margin-top:70px;width:40%}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Wydanie zewnętrzne {{w.wz_no}}</h1><p>WZ zbiorcza — obejmuje wszystkie kursy dla tego zamówienia.</p><div class="grid"><div><b>Odbiorca</b><br>{{w.customer_name}}<br>{{w.customer_address or ''}}</div><div><b>Adres dostawy</b><br>{{w.destination or '—'}}<br><br><b>Miejsce wydania</b><br>{{w.issue_location}} → {{w.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Łączna ilość [m³]</th></tr></thead><tbody>{% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td></tr>{% endfor %}</tbody></table><h2>Kursy składające się na wydanie</h2><table><thead><tr><th>Transport / WZ kursu</th><th>Kierowca / auto</th><th>Ilość [m³]</th><th>Data utworzenia</th></tr></thead><tbody>{% for x in courses %}<tr><td>{{x.transport_no}}</td><td>{{x.driver_name}} · {{x.registration_no}}</td><td>{{x.qty}}</td><td>{{x.created_at[:16]}}</td></tr>{% else %}<tr><td colspan="4">Brak przydzielonych kursów.</td></tr>{% endfor %}</tbody></table><div class="sign">Odbiorca — podpis i pieczęć na WZ zbiorczej</div></html>''',w=w,items=items,courses=courses)
     return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{w.wz_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}h1{margin-bottom:4px}table{border-collapse:collapse;width:100%;margin:22px 0}th,td{border:1px solid #333;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.sign{display:grid;grid-template-columns:1fr 1fr;gap:70px;margin-top:70px}.line{border-top:1px solid #111;padding-top:7px;text-align:center}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Wydanie zewnętrzne {{w.wz_no}}</h1><p>Data: {{w.created_at[:10]}} · Status: {{w.status}}</p><div class="grid"><div><b>Zamawiający / odbiorca</b><br>{{w.customer_name}}<br>{{w.customer_address or ''}}</div><div><b>Miejsce wydania</b><br>{{w.issue_location}} → {{w.warehouse_location}}<br><br><b>Adres dostawy</b><br>{{w.destination or '—'}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość [m³]</th></tr></thead><tbody>{% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td></tr>{% endfor %}</tbody></table><p>Uwagi: {{w.notes or '—'}}</p><div class="sign"><div class="line">Wydał: {{w.issued_by or ''}}</div><div class="line">Odebrał / podpis i pieczęć</div></div></html>''',w=w,items=items)
 

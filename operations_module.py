@@ -13,10 +13,11 @@ def register_operations(app,db_factory,now_factory,pull_before_read=None):
         c.executescript('''
         CREATE TABLE IF NOT EXISTS departments(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,active INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS material_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,usage_date TEXT NOT NULL,material_id INTEGER NOT NULL REFERENCES products(id),qty REAL NOT NULL CHECK(qty>0),unit TEXT NOT NULL,unit_price REAL NOT NULL CHECK(unit_price>=0),total_cost REAL NOT NULL,department_id INTEGER REFERENCES departments(id),location TEXT DEFAULT '',entered_by TEXT NOT NULL,notes TEXT DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
+        CREATE TABLE IF NOT EXISTS raw_material_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,usage_date TEXT NOT NULL,material_id INTEGER NOT NULL REFERENCES raw_materials(id),qty REAL NOT NULL CHECK(qty>0),unit TEXT NOT NULL,unit_price REAL NOT NULL CHECK(unit_price>=0),total_cost REAL NOT NULL,department_id INTEGER REFERENCES departments(id),location TEXT DEFAULT '',entered_by TEXT NOT NULL,notes TEXT DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
         CREATE TABLE IF NOT EXISTS fuel_entries(id INTEGER PRIMARY KEY AUTOINCREMENT,vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),entry_date TEXT NOT NULL,mileage REAL NOT NULL CHECK(mileage>=0),liters REAL NOT NULL CHECK(liters>0),price_per_liter REAL NOT NULL CHECK(price_per_liter>=0),total_cost REAL NOT NULL,fuel_type TEXT NOT NULL,driver_id INTEGER REFERENCES drivers(id),document_no TEXT DEFAULT '',notes TEXT DEFAULT '',created_by TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
         CREATE TABLE IF NOT EXISTS expense_categories(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,group_code TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS vehicle_expenses(id INTEGER PRIMARY KEY AUTOINCREMENT,vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),expense_date TEXT NOT NULL,category_id INTEGER NOT NULL REFERENCES expense_categories(id),description TEXT NOT NULL,net_cost REAL NOT NULL CHECK(net_cost>=0),vat_rate REAL NOT NULL DEFAULT 23,gross_cost REAL NOT NULL,mileage REAL DEFAULT 0,vendor TEXT DEFAULT '',document_no TEXT DEFAULT '',notes TEXT DEFAULT '',created_by TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
-        CREATE INDEX IF NOT EXISTS idx_usage_date ON material_usage(usage_date); CREATE INDEX IF NOT EXISTS idx_fuel_date_vehicle ON fuel_entries(entry_date,vehicle_id); CREATE INDEX IF NOT EXISTS idx_expense_date_vehicle ON vehicle_expenses(expense_date,vehicle_id);
+        CREATE INDEX IF NOT EXISTS idx_usage_date ON material_usage(usage_date); CREATE INDEX IF NOT EXISTS idx_raw_usage_date ON raw_material_usage(usage_date); CREATE INDEX IF NOT EXISTS idx_fuel_date_vehicle ON fuel_entries(entry_date,vehicle_id); CREATE INDEX IF NOT EXISTS idx_expense_date_vehicle ON vehicle_expenses(expense_date,vehicle_id);
         ''')
         c.executemany('INSERT OR IGNORE INTO departments(name) VALUES(?)',[('Betoniarnia',),('Transport',),('Warsztat',),('Biuro',)])
         c.executemany('INSERT OR IGNORE INTO expense_categories(name,group_code) VALUES(?,?)',[('Części','parts'),('Naprawy','repairs'),('Serwis','service'),('Opony','tires'),('Przeglądy','inspection'),('Ubezpieczenie','insurance'),('Inne','other')])
@@ -52,7 +53,16 @@ def operations():
             typ=request.form['type']; stamp=NOW(); user=session.get('display_name') or session.get('username') or 'Pracownik'
             if typ=='material':
                 q=float(request.form['qty'].replace(',','.')); p=float(request.form['unit_price'].replace(',','.'))
-                c.execute('INSERT INTO material_usage(usage_date,material_id,qty,unit,unit_price,total_cost,department_id,location,entered_by,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(request.form['entry_date'],request.form['material_id'],q,request.form['unit'],p,round(q*p,2),request.form.get('department_id') or None,request.form.get('location',''),user,request.form.get('notes',''),stamp,stamp))
+                material_id=int(request.form['material_id'])
+                material=c.execute('SELECT name,unit FROM raw_materials WHERE id=?',(material_id,)).fetchone()
+                stock=c.execute('SELECT COALESCE(qty,0) qty FROM raw_material_stock WHERE material_id=?',(material_id,)).fetchone()
+                if not material:
+                    return 'Nie znaleziono surowca.',404
+                if not stock or float(stock['qty'])+1e-9<q:
+                    return f"Za mało surowca {material['name']} na stanie.",409
+                c.execute('INSERT INTO raw_material_usage(usage_date,material_id,qty,unit,unit_price,total_cost,department_id,location,entered_by,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(request.form['entry_date'],material_id,q,material['unit'],p,round(q*p,2),request.form.get('department_id') or None,request.form.get('location',''),user,request.form.get('notes',''),stamp,stamp))
+                c.execute('UPDATE raw_material_stock SET qty=qty-? WHERE material_id=?',(q,material_id))
+                c.execute("INSERT INTO raw_material_movements(material_id,qty_delta,movement_type,note,created_by,created_at) VALUES(?,?,'manual_usage',?,?,?)",(material_id,-q,request.form.get('notes','') or 'Zużycie wpisane w kosztach',user,stamp))
             elif typ=='fuel':
                 liters=float(request.form['liters'].replace(',','.')); price=float(request.form['price'].replace(',','.'))
                 c.execute('INSERT INTO fuel_entries(vehicle_id,entry_date,mileage,liters,price_per_liter,total_cost,fuel_type,driver_id,document_no,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(request.form['vehicle_id'],request.form['entry_date'],request.form['mileage'],liters,price,round(liters*price,2),request.form['fuel_type'],request.form.get('driver_id') or None,request.form.get('document_no',''),request.form.get('notes',''),user,stamp,stamp))
@@ -60,27 +70,36 @@ def operations():
                 net=float(request.form['net_cost'].replace(',','.')); vat=float(request.form['vat_rate'].replace(',','.'))
                 c.execute('INSERT INTO vehicle_expenses(vehicle_id,expense_date,category_id,description,net_cost,vat_rate,gross_cost,mileage,vendor,document_no,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(request.form['vehicle_id'],request.form['entry_date'],request.form['category_id'],request.form['description'],net,vat,round(net*(1+vat/100),2),request.form.get('mileage') or 0,request.form.get('vendor',''),request.form.get('document_no',''),request.form.get('notes',''),user,stamp,stamp))
             return redirect(url_for('ops.operations'))
-        materials=c.execute('SELECT * FROM products ORDER BY name,sku').fetchall(); vehicles=c.execute('SELECT * FROM vehicles WHERE COALESCE(active,1) != 0 ORDER BY registration_no').fetchall(); drivers=c.execute('SELECT * FROM drivers WHERE COALESCE(active,1) != 0 ORDER BY name').fetchall(); departments=c.execute('SELECT * FROM departments WHERE active=1 ORDER BY name').fetchall(); categories=c.execute('SELECT * FROM expense_categories ORDER BY name').fetchall()
-        recent=c.execute("""SELECT kind,event_date,label,amount,user FROM (SELECT 'Materiał' kind,u.usage_date event_date,COALESCE(m.name,m.sku) label,u.total_cost amount,u.entered_by user FROM material_usage u JOIN products m ON m.id=u.material_id WHERE u.deleted_at IS NULL UNION ALL SELECT 'Paliwo',f.entry_date,v.registration_no,f.total_cost,f.created_by FROM fuel_entries f JOIN vehicles v ON v.id=f.vehicle_id WHERE f.deleted_at IS NULL UNION ALL SELECT ec.name,e.expense_date,v.registration_no||' · '||e.description,e.gross_cost,e.created_by FROM vehicle_expenses e JOIN vehicles v ON v.id=e.vehicle_id JOIN expense_categories ec ON ec.id=e.category_id WHERE e.deleted_at IS NULL) ORDER BY event_date DESC LIMIT 30""").fetchall()
+        materials=c.execute('SELECT rm.*,COALESCE(s.qty,0) stock_qty FROM raw_materials rm LEFT JOIN raw_material_stock s ON s.material_id=rm.id ORDER BY rm.name').fetchall()
+        vehicles=c.execute('SELECT * FROM vehicles WHERE COALESCE(active,1) != 0 ORDER BY registration_no').fetchall()
+        drivers=c.execute('SELECT * FROM drivers WHERE COALESCE(active,1) != 0 ORDER BY name').fetchall()
+        departments=c.execute('SELECT * FROM departments WHERE active=1 ORDER BY name').fetchall()
+        categories=c.execute('SELECT * FROM expense_categories ORDER BY name').fetchall()
+        recent=c.execute("""SELECT kind,event_date,label,amount,user FROM (SELECT 'Surowiec' kind,u.usage_date event_date,m.name label,u.total_cost amount,u.entered_by user FROM raw_material_usage u JOIN raw_materials m ON m.id=u.material_id WHERE u.deleted_at IS NULL UNION ALL SELECT 'Materiał (archiwalny)',u.usage_date,COALESCE(m.name,m.sku),u.total_cost,u.entered_by FROM material_usage u JOIN products m ON m.id=u.material_id WHERE u.deleted_at IS NULL UNION ALL SELECT 'Paliwo',f.entry_date,v.registration_no,f.total_cost,f.created_by FROM fuel_entries f JOIN vehicles v ON v.id=f.vehicle_id WHERE f.deleted_at IS NULL UNION ALL SELECT ec.name,e.expense_date,v.registration_no||' · '||e.description,e.gross_cost,e.created_by FROM vehicle_expenses e JOIN vehicles v ON v.id=e.vehicle_id JOIN expense_categories ec ON ec.id=e.category_id WHERE e.deleted_at IS NULL) ORDER BY event_date DESC LIMIT 30""").fetchall()
     return render_template('operations.html',materials=materials,vehicles=vehicles,drivers=drivers,departments=departments,categories=categories,recent=recent,today=date.today().isoformat())
 
 @bp.get('/analytics')
 def analytics():
     start,end,kind=period()
     with DB() as c:
-        material=c.execute('SELECT COALESCE(SUM(total_cost),0) FROM material_usage WHERE deleted_at IS NULL AND usage_date BETWEEN ? AND ?',(start,end)).fetchone()[0]
+        material=c.execute('SELECT COALESCE(SUM(total_cost),0) FROM (SELECT total_cost FROM raw_material_usage WHERE deleted_at IS NULL AND usage_date BETWEEN ? AND ? UNION ALL SELECT total_cost FROM material_usage WHERE deleted_at IS NULL AND usage_date BETWEEN ? AND ?)',(start,end,start,end)).fetchone()[0]
         fuel=c.execute('SELECT COALESCE(SUM(total_cost),0) FROM fuel_entries WHERE deleted_at IS NULL AND entry_date BETWEEN ? AND ?',(start,end)).fetchone()[0]
         exp=c.execute("SELECT ec.group_code,COALESCE(SUM(e.gross_cost),0) value FROM vehicle_expenses e JOIN expense_categories ec ON ec.id=e.category_id WHERE e.deleted_at IS NULL AND e.expense_date BETWEEN ? AND ? GROUP BY ec.group_code",(start,end)).fetchall(); costs={r['group_code']:r['value'] for r in exp}
-        monthly=c.execute("""SELECT substr(d,1,7) period,SUM(amount) amount FROM (SELECT usage_date d,total_cost amount FROM material_usage WHERE deleted_at IS NULL UNION ALL SELECT entry_date,total_cost FROM fuel_entries WHERE deleted_at IS NULL UNION ALL SELECT expense_date,gross_cost FROM vehicle_expenses WHERE deleted_at IS NULL) WHERE d BETWEEN ? AND ? GROUP BY substr(d,1,7) ORDER BY period""",(start,end)).fetchall()
+        monthly=c.execute("""SELECT substr(d,1,7) period,SUM(amount) amount FROM (SELECT usage_date d,total_cost amount FROM raw_material_usage WHERE deleted_at IS NULL UNION ALL SELECT usage_date,total_cost FROM material_usage WHERE deleted_at IS NULL UNION ALL SELECT entry_date,total_cost FROM fuel_entries WHERE deleted_at IS NULL UNION ALL SELECT expense_date,gross_cost FROM vehicle_expenses WHERE deleted_at IS NULL) WHERE d BETWEEN ? AND ? GROUP BY substr(d,1,7) ORDER BY period""",(start,end)).fetchall()
         vehicles=c.execute("""SELECT v.registration_no,COALESCE(f.cost,0)+COALESCE(e.cost,0) cost FROM vehicles v LEFT JOIN (SELECT vehicle_id,SUM(total_cost) cost FROM fuel_entries WHERE deleted_at IS NULL AND entry_date BETWEEN ? AND ? GROUP BY vehicle_id) f ON f.vehicle_id=v.id LEFT JOIN (SELECT vehicle_id,SUM(gross_cost) cost FROM vehicle_expenses WHERE deleted_at IS NULL AND expense_date BETWEEN ? AND ? GROUP BY vehicle_id) e ON e.vehicle_id=v.id ORDER BY cost DESC""",(start,end,start,end)).fetchall()
         # Sales are based on issued WZ documents. This is available immediately,
         # even when an invoice is issued later by the accounting department.
         sales=c.execute("""
-            SELECT COALESCE(SUM(i.total_net),0) net, COALESCE(SUM(i.total_gross),0) gross,
-                   COUNT(i.id) invoices
-            FROM invoices i
-            WHERE substr(i.issue_date,1,10) BETWEEN ? AND ?
-        """,(start,end)).fetchone()
+            SELECT
+              COALESCE(SUM(COALESCE(wi.qty_issued,wi.qty_planned) * COALESCE(p.unit_net_price,0)),0) net,
+              COALESCE(SUM(COALESCE(wi.qty_issued,wi.qty_planned) * COALESCE(p.unit_gross_price,p.unit_net_price,0)),0) gross,
+              (SELECT COUNT(*) FROM invoices i WHERE substr(i.issue_date,1,10) BETWEEN ? AND ?) invoices
+            FROM wz_items wi
+            JOIN wz_documents w ON w.id=wi.wz_id
+            LEFT JOIN products p ON p.id=wi.product_id
+            WHERE w.deleted_at IS NULL AND w.issued_at IS NOT NULL
+              AND substr(w.issued_at,1,10) BETWEEN ? AND ?
+        """,(start,end,start,end)).fetchone()
         products=c.execute("""
             SELECT COALESCE(p.name, wi.sku) product, wi.sku,
                    ROUND(SUM(COALESCE(wi.qty_issued,wi.qty_planned)),2) qty
@@ -144,6 +163,6 @@ def analytics():
 def export_costs():
     start,end,_=period(); out=io.StringIO(); out.write('\ufeff'); w=csv.writer(out,delimiter=';'); w.writerow(['Data','Rodzaj','Opis','Koszt brutto'])
     with DB() as c:
-        rows=c.execute("""SELECT d,kind,label,amount FROM (SELECT usage_date d,'Materiał' kind,COALESCE(m.name,m.sku) label,total_cost amount FROM material_usage u JOIN products m ON m.id=u.material_id WHERE u.deleted_at IS NULL UNION ALL SELECT entry_date,'Paliwo',v.registration_no,total_cost FROM fuel_entries f JOIN vehicles v ON v.id=f.vehicle_id WHERE f.deleted_at IS NULL UNION ALL SELECT expense_date,ec.name,v.registration_no||' · '||description,gross_cost FROM vehicle_expenses e JOIN vehicles v ON v.id=e.vehicle_id JOIN expense_categories ec ON ec.id=e.category_id WHERE e.deleted_at IS NULL) WHERE d BETWEEN ? AND ? ORDER BY d""",(start,end)).fetchall()
+        rows=c.execute("""SELECT d,kind,label,amount FROM (SELECT usage_date d,'Surowiec' kind,m.name label,total_cost amount FROM raw_material_usage u JOIN raw_materials m ON m.id=u.material_id WHERE u.deleted_at IS NULL UNION ALL SELECT usage_date,'Materiał (archiwalny)',COALESCE(m.name,m.sku),total_cost FROM material_usage u JOIN products m ON m.id=u.material_id WHERE u.deleted_at IS NULL UNION ALL SELECT entry_date,'Paliwo',v.registration_no,total_cost FROM fuel_entries f JOIN vehicles v ON v.id=f.vehicle_id WHERE f.deleted_at IS NULL UNION ALL SELECT expense_date,ec.name,v.registration_no||' · '||description,gross_cost FROM vehicle_expenses e JOIN vehicles v ON v.id=e.vehicle_id JOIN expense_categories ec ON ec.id=e.category_id WHERE e.deleted_at IS NULL) WHERE d BETWEEN ? AND ? ORDER BY d""",(start,end)).fetchall()
     for r in rows:w.writerow(r)
     return Response(out.getvalue(),mimetype='text/csv',headers={'Content-Disposition':f'attachment; filename=koszty_{start}_{end}.csv'})

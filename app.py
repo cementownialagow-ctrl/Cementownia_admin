@@ -1014,6 +1014,7 @@ SUPABASE_SYNC_TABLES = [
     ("email_events", "id"),
     ("departments", "id"),
     ("material_usage", "id"),
+    ("raw_material_usage", "id"),
     ("fuel_entries", "id"),
     ("expense_categories", "id"),
     ("vehicle_expenses", "id"),
@@ -1057,6 +1058,7 @@ SUPABASE_PULL_TABLES = [
     ("departments", "id"),
     ("expense_categories", "id"),
     ("material_usage", "id"),
+    ("raw_material_usage", "id"),
     ("fuel_entries", "id"),
     ("vehicle_expenses", "id"),
 ]
@@ -2871,6 +2873,34 @@ def role_may_write(role: str, path: str) -> bool:
     return False
 
 
+def role_may_read(role: str, path: str) -> bool:
+    """Nie pokazuj pracownikowi danych spoza jego obszaru odpowiedzialności."""
+    role = (role or "").lower()
+    if role == "admin":
+        return True
+    if path == "/" or path.startswith("/brand-logo") or path.startswith("/static/"):
+        return True
+    if path.startswith("/admin/"):
+        return False
+    if role == "manager":
+        return True
+    if role == "accounting":
+        return (path.startswith("/invoices") or path.startswith("/ksef")
+                or path.startswith("/cash-flow") or path.startswith("/customers")
+                or path.startswith("/company") or path.startswith("/pricing")
+                or path.startswith("/orders") or path.startswith("/analytics")
+                or path.startswith("/document-search"))
+    if role == "warehouse":
+        return (path.startswith("/beton/wz") or path.startswith("/beton/transports")
+                or path.startswith("/dispatch") or path.startswith("/operations")
+                or path.startswith("/warehouse") or path.startswith("/material-orders")
+                or path.startswith("/products") or path.startswith("/document-search"))
+    if role == "office":
+        return (path.startswith("/orders") or path.startswith("/customers")
+                or path.startswith("/products") or path.startswith("/document-search"))
+    return False
+
+
 @app.before_request
 def security_gate():
     path = request.path
@@ -2923,6 +2953,8 @@ def security_gate():
 
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not role_may_write(session.get("role"), path):
         return "Brak uprawnienia dla tej roli.", 403
+    if request.method in {"GET", "HEAD"} and not role_may_read(session.get("role"), path):
+        return "Brak uprawnienia do podglądu tego obszaru.", 403
 
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         if request.is_json:
@@ -3350,7 +3382,7 @@ def admin_test_data():
             c=conn()
             try:
                 c.execute("PRAGMA foreign_keys=OFF")
-                for table in ("delivery_photos","transport_items","transports","wz_items","wz_documents","invoice_allocations","invoice_meta","ksef_documents","invoices","order_items","orders","material_usage","fuel_entries","vehicle_expenses","audit_log","audit_events","email_events","client_search_logs"):
+                for table in ("delivery_photos","transport_items","transports","wz_items","wz_documents","invoice_allocations","invoice_meta","ksef_documents","invoices","order_items","orders","raw_material_usage","material_usage","fuel_entries","vehicle_expenses","audit_log","audit_events","email_events","client_search_logs"):
                     c.execute(f"DELETE FROM {table}")
                 c.execute("UPDATE stock SET qty=0")
                 c.commit(); done=True
@@ -3370,7 +3402,8 @@ def home():
     cur = c.cursor()
     cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','confirmed','in_delivery')")
     n_orders_current = cur.fetchone()["n"]
-    cur.execute("SELECT COUNT(*) AS n FROM orders WHERE date(created_at)=date('now','localtime')")
+    today_iso = app_now().date().isoformat()
+    cur.execute("SELECT COUNT(*) AS n FROM orders WHERE substr(created_at,1,10)=?", (today_iso,))
     n_orders_today = int(cur.fetchone()["n"] or 0)
     cur.execute("""
       SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,
@@ -3426,7 +3459,6 @@ def home():
     status_signed = dashboard_counts.get("WZ podpisane", 0)
     status_done = dashboard_counts.get("Zakończone", 0)
     status_invoice = dashboard_counts.get("FV wystawiona", 0)
-    today_iso = datetime.now().date().isoformat()
     today_remaining = sum(
         1 for order in all_orders
         if norm(order.get("delivery_date")) == today_iso
