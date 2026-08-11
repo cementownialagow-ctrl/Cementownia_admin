@@ -64,8 +64,72 @@ def analytics():
         exp=c.execute("SELECT ec.group_code,COALESCE(SUM(e.gross_cost),0) value FROM vehicle_expenses e JOIN expense_categories ec ON ec.id=e.category_id WHERE e.deleted_at IS NULL AND e.expense_date BETWEEN ? AND ? GROUP BY ec.group_code",(start,end)).fetchall(); costs={r['group_code']:r['value'] for r in exp}
         monthly=c.execute("""SELECT substr(d,1,7) period,SUM(amount) amount FROM (SELECT usage_date d,total_cost amount FROM material_usage WHERE deleted_at IS NULL UNION ALL SELECT entry_date,total_cost FROM fuel_entries WHERE deleted_at IS NULL UNION ALL SELECT expense_date,gross_cost FROM vehicle_expenses WHERE deleted_at IS NULL) WHERE d BETWEEN ? AND ? GROUP BY substr(d,1,7) ORDER BY period""",(start,end)).fetchall()
         vehicles=c.execute("""SELECT v.registration_no,COALESCE(f.cost,0)+COALESCE(e.cost,0) cost FROM vehicles v LEFT JOIN (SELECT vehicle_id,SUM(total_cost) cost FROM fuel_entries WHERE deleted_at IS NULL AND entry_date BETWEEN ? AND ? GROUP BY vehicle_id) f ON f.vehicle_id=v.id LEFT JOIN (SELECT vehicle_id,SUM(gross_cost) cost FROM vehicle_expenses WHERE deleted_at IS NULL AND expense_date BETWEEN ? AND ? GROUP BY vehicle_id) e ON e.vehicle_id=v.id ORDER BY cost DESC""",(start,end,start,end)).fetchall()
+        # Sales are based on issued WZ documents. This is available immediately,
+        # even when an invoice is issued later by the accounting department.
+        sales=c.execute("""
+            SELECT COALESCE(SUM(i.total_net),0) net, COALESCE(SUM(i.total_gross),0) gross,
+                   COUNT(i.id) invoices
+            FROM invoices i
+            WHERE substr(i.issue_date,1,10) BETWEEN ? AND ?
+        """,(start,end)).fetchone()
+        products=c.execute("""
+            SELECT COALESCE(p.name, wi.sku) product, wi.sku,
+                   ROUND(SUM(COALESCE(wi.qty_issued,wi.qty_planned)),2) qty
+            FROM wz_items wi
+            JOIN wz_documents w ON w.id=wi.wz_id
+            LEFT JOIN products p ON p.id=wi.product_id
+            WHERE w.deleted_at IS NULL AND w.issued_at IS NOT NULL
+              AND substr(w.issued_at,1,10) BETWEEN ? AND ?
+            GROUP BY wi.product_id, wi.sku, p.name
+            ORDER BY qty DESC, product ASC
+            LIMIT 12
+        """,(start,end)).fetchall()
+        sales_daily=c.execute("""
+            SELECT substr(w.issued_at,1,10) day,
+                   ROUND(SUM(COALESCE(wi.qty_issued,wi.qty_planned)),2) qty
+            FROM wz_items wi JOIN wz_documents w ON w.id=wi.wz_id
+            WHERE w.deleted_at IS NULL AND w.issued_at IS NOT NULL
+              AND substr(w.issued_at,1,10) BETWEEN ? AND ?
+            GROUP BY substr(w.issued_at,1,10) ORDER BY day
+        """,(start,end)).fetchall()
+        # Only completed transports are treated as completed courses in rankings.
+        driver_ranking=c.execute("""
+            SELECT d.name, COUNT(t.id) trips
+            FROM transports t JOIN drivers d ON d.id=t.driver_id
+            WHERE t.deleted_at IS NULL AND t.status='returned'
+              AND substr(COALESCE(t.returned_at,t.updated_at,t.created_at),1,10) BETWEEN ? AND ?
+            GROUP BY d.id,d.name ORDER BY trips DESC,d.name ASC
+        """,(start,end)).fetchall()
+        vehicle_stats=c.execute("""
+            SELECT v.registration_no,
+                   COALESCE(t.trips,0) trips,
+                   COALESCE(f.fuel_cost,0) fuel_cost,
+                   COALESCE(e.repair_cost,0) repair_cost,
+                   COALESCE(f.fuel_cost,0)+COALESCE(e.repair_cost,0) total_cost
+            FROM vehicles v
+            LEFT JOIN (
+              SELECT vehicle_id,COUNT(*) trips FROM transports
+              WHERE deleted_at IS NULL AND status='returned'
+                AND substr(COALESCE(returned_at,updated_at,created_at),1,10) BETWEEN ? AND ?
+              GROUP BY vehicle_id
+            ) t ON t.vehicle_id=v.id
+            LEFT JOIN (
+              SELECT vehicle_id,SUM(total_cost) fuel_cost FROM fuel_entries
+              WHERE deleted_at IS NULL AND entry_date BETWEEN ? AND ? GROUP BY vehicle_id
+            ) f ON f.vehicle_id=v.id
+            LEFT JOIN (
+              SELECT vehicle_id,SUM(gross_cost) repair_cost FROM vehicle_expenses
+              WHERE deleted_at IS NULL AND expense_date BETWEEN ? AND ? GROUP BY vehicle_id
+            ) e ON e.vehicle_id=v.id
+            WHERE v.deleted_at IS NULL
+            ORDER BY repair_cost DESC,total_cost DESC,v.registration_no ASC
+        """,(start,end,start,end,start,end)).fetchall()
     total=material+fuel+sum(costs.values())
-    return render_template('analytics.html',start=start,end=end,period=kind,material=material,fuel=fuel,costs=costs,total=total,monthly=monthly,vehicles=vehicles)
+    sold_m3=sum(float(x['qty'] or 0) for x in products)
+    total_trips=sum(int(x['trips'] or 0) for x in vehicle_stats)
+    fleet_cost=sum(float(x['total_cost'] or 0) for x in vehicle_stats)
+    avg_transport_cost=(fleet_cost/total_trips) if total_trips else 0
+    return render_template('analytics.html',start=start,end=end,period=kind,material=material,fuel=fuel,costs=costs,total=total,monthly=monthly,vehicles=vehicles,sales=sales,products=products,sales_daily=sales_daily,sold_m3=sold_m3,driver_ranking=driver_ranking,vehicle_stats=vehicle_stats,total_trips=total_trips,fleet_cost=fleet_cost,avg_transport_cost=avg_transport_cost)
 
 @bp.get('/analytics/export.csv')
 def export_costs():
