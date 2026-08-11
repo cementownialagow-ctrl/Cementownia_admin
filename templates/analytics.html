@@ -1,1 +1,81 @@
-{% extends 'base.html' %}{% block content %}<div class="topline"><div><h1>Analizy i raporty</h1><p class="lead">Koszty wyliczane automatycznie z wpisów pracowników</p></div><a class="btn" href="{{url_for('ops.export_costs',date_from=start,date_to=end)}}">Eksport CSV</a></div><form class="filters card"><select name="period"><option value="day">Dzień</option><option value="week">Tydzień</option><option value="month" selected>Miesiąc</option><option value="quarter">Kwartał</option><option value="year">Rok</option></select><input type="date" name="date_from" value="{{start}}"><input type="date" name="date_to" value="{{end}}"><button class="btn primary">Pokaż</button></form><div class="grid4"><div class="metric"><span>Wszystkie koszty</span><b>{{'%.2f'|format(total)}} zł</b></div><div class="metric"><span>Materiały</span><b>{{'%.2f'|format(material)}} zł</b></div><div class="metric"><span>Paliwo</span><b>{{'%.2f'|format(fuel)}} zł</b></div><div class="metric"><span>Pojazdy i naprawy</span><b>{{'%.2f'|format(total-material-fuel)}} zł</b></div></div><div class="card"><h2>Koszty pojazdów</h2><table><thead><tr><th>Pojazd</th><th>Koszt</th></tr></thead><tbody>{% for x in vehicles %}<tr><td>{{x.registration_no}}</td><td><b>{{'%.2f'|format(x.cost)}} zł</b></td></tr>{% endfor %}</tbody></table></div><div class="card"><h2>Koszty miesiącami</h2><div style="display:flex;align-items:end;gap:14px;height:260px;padding:20px">{% set maxv=(monthly|map(attribute='amount')|max) if monthly else 1 %}{% for x in monthly %}<div style="flex:1;text-align:center"><b>{{'%.0f'|format(x.amount)}}</b><div style="height:{{(x.amount/maxv*190)|int}}px;background:#3178c6;border-radius:8px 8px 0 0;margin:6px auto;width:70%"></div><small>{{x.period}}</small></div>{% endfor %}</div></div>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="topline">
+  <div><h1>Analizy i raporty</h1><p class="lead">Sprzedaż, produkty oraz koszty w wybranym okresie.</p></div>
+  <a class="btn" href="{{url_for('ops.export_costs',date_from=start,date_to=end)}}">Eksport kosztów CSV</a>
+</div>
+
+<form class="filters card">
+  <select name="period">
+    <option value="day" {{'selected' if period=='day'}}>Dzień</option>
+    <option value="week" {{'selected' if period=='week'}}>Tydzień</option>
+    <option value="month" {{'selected' if period=='month'}}>Miesiąc</option>
+    <option value="quarter" {{'selected' if period=='quarter'}}>Kwartał</option>
+    <option value="year" {{'selected' if period=='year'}}>Rok</option>
+  </select>
+  <input type="date" name="date_from" value="{{start}}">
+  <input type="date" name="date_to" value="{{end}}">
+  <button class="btn primary">Pokaż</button>
+</form>
+
+<h2>Sprzedaż w okresie {{start}} – {{end}}</h2>
+<div class="grid4">
+  <div class="metric"><span>Sprzedano betonu</span><b>{{'%.2f'|format(sold_m3)}} m³</b></div>
+  <div class="metric"><span>Sprzedaż netto</span><b>{{'%.2f'|format(sales.net)}} zł</b></div>
+  <div class="metric"><span>Sprzedaż brutto</span><b>{{'%.2f'|format(sales.gross)}} zł</b></div>
+  <div class="metric"><span>Wystawione FV</span><b>{{sales.invoices}}</b></div>
+</div>
+
+<div class="card">
+  <h2>Wykres wydanego betonu [m³]</h2>
+  {% if sales_daily %}
+  {% set maxv=(sales_daily|map(attribute='qty')|max) or 1 %}
+  <div style="display:flex;align-items:end;gap:10px;min-height:260px;padding:20px 8px;overflow-x:auto">
+    {% for x in sales_daily %}
+    <div style="min-width:64px;flex:1;text-align:center"><b>{{'%.1f'|format(x.qty)}}</b><div title="{{x.day}}: {{x.qty}} m³" style="height:{{[x.qty/maxv*185,5]|max|int}}px;background:linear-gradient(#5679ef,#2749b8);border-radius:8px 8px 0 0;margin:7px auto;width:75%"></div><small>{{x.day[5:]}}</small></div>
+    {% endfor %}
+  </div>
+  {% else %}<p class="muted">W tym okresie nie wydano jeszcze betonu.</p>{% endif %}
+</div>
+
+<div class="card">
+  <h2>Najlepiej sprzedające się produkty</h2>
+  <table><thead><tr><th>Miejsce</th><th>Produkt</th><th>SKU</th><th>Sprzedano [m³]</th><th>Udział</th></tr></thead><tbody>
+  {% for x in products %}<tr><td><b>#{{loop.index}}</b></td><td>{{x.product}}</td><td>{{x.sku}}</td><td><b>{{'%.2f'|format(x.qty)}} m³</b></td><td>{% if sold_m3 %}{{'%.1f'|format(x.qty / sold_m3 * 100)}}%{% else %}—{% endif %}</td></tr>{% else %}<tr><td colspan="5">Brak sprzedaży w wybranym okresie.</td></tr>{% endfor %}
+  </tbody></table>
+</div>
+
+<h2>Efektywność transportu</h2>
+<div class="grid4">
+  <div class="metric"><span>Zrealizowane kursy</span><b>{{total_trips}}</b></div>
+  <div class="metric"><span>Paliwo i naprawy</span><b>{{'%.2f'|format(fleet_cost)}} zł</b></div>
+  <div class="metric"><span>Orientacyjny koszt kursu</span><b>{{'%.2f'|format(avg_transport_cost)}} zł</b></div>
+  <div class="metric"><span>Najwięcej kursów</span><b>{% if driver_ranking %}{{driver_ranking[0].name}} · {{driver_ranking[0].trips}}{% else %}—{% endif %}</b></div>
+</div>
+
+<div class="card">
+  <h2>Ranking kierowców — zrealizowane kursy</h2>
+  <table><thead><tr><th>Miejsce</th><th>Kierowca</th><th>Liczba kursów</th></tr></thead><tbody>
+  {% for x in driver_ranking %}<tr><td><b>#{{loop.index}}</b></td><td>{{x.name}}</td><td><b>{{x.trips}}</b></td></tr>{% else %}<tr><td colspan="3">Brak zakończonych kursów w wybranym okresie.</td></tr>{% endfor %}
+  </tbody></table>
+</div>
+
+<div class="card">
+  <h2>Pojazdy — koszt paliwa, napraw i kursu</h2>
+  <p class="muted">Najdroższe naprawy w okresie: {% if vehicle_stats %}<b>{{vehicle_stats[0].registration_no}}</b> — {{'%.2f'|format(vehicle_stats[0].repair_cost)}} zł{% else %}brak danych{% endif %}.</p>
+  <table><thead><tr><th>Pojazd</th><th>Kursy</th><th>Paliwo</th><th>Naprawy</th><th>Łączny koszt</th><th>Koszt / kurs</th></tr></thead><tbody>
+  {% for x in vehicle_stats %}<tr>
+    <td>{{x.registration_no}}</td><td>{{x.trips}}</td><td>{{'%.2f'|format(x.fuel_cost)}} zł</td><td><b>{{'%.2f'|format(x.repair_cost)}} zł</b></td><td>{{'%.2f'|format(x.total_cost)}} zł</td><td>{% if x.trips %}{{'%.2f'|format(x.total_cost/x.trips)}} zł{% else %}—{% endif %}</td>
+  </tr>{% else %}<tr><td colspan="6">Brak pojazdów w systemie.</td></tr>{% endfor %}
+  </tbody></table>
+</div>
+
+<h2>Koszty</h2>
+<div class="grid4">
+  <div class="metric"><span>Wszystkie koszty</span><b>{{'%.2f'|format(total)}} zł</b></div>
+  <div class="metric"><span>Materiały</span><b>{{'%.2f'|format(material)}} zł</b></div>
+  <div class="metric"><span>Paliwo</span><b>{{'%.2f'|format(fuel)}} zł</b></div>
+  <div class="metric"><span>Pojazdy i naprawy</span><b>{{'%.2f'|format(total-material-fuel)}} zł</b></div>
+</div>
+<div class="card"><h2>Koszty pojazdów</h2><table><thead><tr><th>Pojazd</th><th>Koszt</th></tr></thead><tbody>{% for x in vehicles %}<tr><td>{{x.registration_no}}</td><td><b>{{'%.2f'|format(x.cost)}} zł</b></td></tr>{% else %}<tr><td colspan="2">Brak kosztów pojazdów w tym okresie.</td></tr>{% endfor %}</tbody></table></div>
+{% endblock %}
