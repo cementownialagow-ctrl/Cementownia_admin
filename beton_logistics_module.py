@@ -596,6 +596,12 @@ def build_wz_form_pdf(w,items,courses,technology,company):
 
 @bp.get('/wz/<int:wz_id>/print')
 def wz_print(wz_id):
+    # Dokument mógł zostać utworzony na innej instancji Rendera. Przed drukiem
+    # pobieramy wspólne dane z Supabase, aby lokalna baza nie powodowała 404.
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        current_app.logger.exception('Nie udało się odświeżyć WZ %s przed wydrukiem',wz_id)
     with D['conn']() as c:
         w=c.execute('''SELECT w.*,o.order_no,o.customer_name,o.customer_address,o.customer_phone,o.customer_email,o.delivery_method,o.note AS order_delivery_address,
             COALESCE(c.nip,'') customer_nip,
