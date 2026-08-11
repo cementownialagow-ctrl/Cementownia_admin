@@ -133,6 +133,11 @@ def snapshot_wz_technology(c, wz_id, created_by, created_at):
         version=c.execute('''SELECT * FROM recipe_versions WHERE product_id=? AND (valid_from IS NULL OR valid_from='' OR valid_from<=?) ORDER BY version_no DESC,id DESC LIMIT 1''',(wz_item['product_id'],created_at[:10])).fetchone()
         if version:
             material_rows=c.execute('''SELECT rvi.qty_per_unit,rvi.unit,rvi.material_snapshot_json,rm.* FROM recipe_version_items rvi JOIN raw_materials rm ON rm.id=rvi.material_id WHERE rvi.recipe_version_id=? ORDER BY rm.name''',(version['id'],)).fetchall()
+            # Starsze wersje receptur mogły zostać zapisane przed dodaniem składu.
+            # Wtedy parametry technologiczne bierzemy z wersji, a aktualny skład
+            # z receptury przypisanej do produktu.
+            if not material_rows:
+                material_rows=c.execute('''SELECT pr.qty_per_unit,rm.unit,NULL material_snapshot_json,rm.* FROM product_recipes pr JOIN raw_materials rm ON rm.id=pr.material_id WHERE pr.product_id=? ORDER BY rm.name''',(wz_item['product_id'],)).fetchall()
         else:
             material_rows=c.execute('''SELECT pr.qty_per_unit,rm.unit,NULL material_snapshot_json,rm.* FROM product_recipes pr JOIN raw_materials rm ON rm.id=pr.material_id WHERE pr.product_id=? ORDER BY rm.name''',(wz_item['product_id'],)).fetchall()
         materials=[]
@@ -241,6 +246,9 @@ def create_wz_from_order(c, order_id, destination='', issue_location='Beton Łag
         wz_item_ids.append(wz_item_id)
     if not wz_item_ids:
         raise ValueError('WZ musi zawierać co najmniej jedną pozycję.')
+    # Receptura i dane betonu są przypinane już podczas tworzenia WZ, dzięki
+    # czemu są widoczne również na roboczym wydruku przed wydaniem materiału.
+    snapshot_wz_technology(c,wz_id,created_by or actor(),created_at)
     return wz_id,wz_item_ids
 
 def driver_auth_email(username):
@@ -399,6 +407,8 @@ def wz_view(wz_id):
             LEFT JOIN invoices i ON i.id=w.invoice_id WHERE w.id=? AND w.deleted_at IS NULL''',(wz_id,)).fetchone()
         if not w:abort(404)
         w=dict(w)
+        # Uzupełnia także starsze WZ utworzone przed dodaniem snapshotów.
+        snapshot_wz_technology(c,wz_id,w.get('created_by') or actor(),w.get('created_at') or stamp())
         w['destination']=(w.get('destination') or w.get('order_delivery_address') or w.get('customer_address') or '').strip()
         items=c.execute('''SELECT wi.*, COALESCE(p.name, wi.sku) AS sku
             FROM wz_items wi LEFT JOIN products p ON p.id=wi.product_id
@@ -913,6 +923,12 @@ def transport_new():
 @bp.get('/transports/<int:transport_id>/wz-print')
 def transport_course_print(transport_id):
     """Druk pojedynczego kursu; końcowa WZ pozostaje dokumentem zbiorczym."""
+    # Render może obsłużyć kliknięcie na innej instancji niż ta, która utworzyła
+    # kurs. Najpierw odświeżamy lokalną kopię z Supabase, aby nie zwracać 404.
+    try:
+        D['pull_shared_tables_from_supabase'](force=True)
+    except Exception:
+        current_app.logger.exception('Nie udało się odświeżyć transportu %s przed drukiem WZ kursu',transport_id)
     with D['conn']() as c:
         transport=c.execute('''SELECT t.transport_no,t.created_at,t.destination,w.wz_no,w.issue_location,w.warehouse_location,
               o.customer_name,o.customer_address,d.name driver_name,v.registration_no
@@ -941,6 +957,10 @@ def transport_course_print(transport_id):
         full_total=sum(float(x['qty'] or 0) for x in full_items)
         transport['is_final_course']=cumulative+0.00001>=full_total
         adjustment=c.execute('SELECT * FROM transport_delivery_adjustments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
+        wz_meta=c.execute('''SELECT w.id,w.created_by,w.created_at FROM transports t
+            JOIN wz_documents w ON w.id=t.wz_id WHERE t.id=?''',(transport_id,)).fetchone()
+        if wz_meta:
+            snapshot_wz_technology(c,wz_meta['id'],wz_meta['created_by'] or actor(),wz_meta['created_at'] or stamp())
         technology=[]
         for row in c.execute('SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=(SELECT wz_id FROM transports WHERE id=?) ORDER BY id',(transport_id,)).fetchall():
             try: technology.append(json.loads(row['snapshot_json']))
