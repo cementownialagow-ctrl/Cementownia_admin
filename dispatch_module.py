@@ -86,6 +86,10 @@ def appointments():
             vehicle_id = int(request.form.get("vehicle_id") or 0)
             transport_id = int(request.form.get("transport_id") or 0)
             planned_departure_time = (request.form.get("time_from") or "").strip()
+            allow_resource_conflict = request.form.get("allow_resource_conflict") == "1"
+            conflict_reason = (request.form.get("conflict_reason") or "").strip()
+            if allow_resource_conflict and not conflict_reason:
+                return 'Podaj powód wyjątku od blokady kierowcy lub auta.', 400
             if transport_id:
                 selected_transport=c.execute('''SELECT t.id,t.wz_id,t.driver_id,t.vehicle_id,w.order_id
                     FROM transports t JOIN wz_documents w ON w.id=t.wz_id
@@ -113,28 +117,32 @@ def appointments():
                 driver_conflicts = c.execute("""SELECT a.planned_date,a.time_from,o.order_no
                     FROM dispatch_appointments a
                     JOIN orders o ON o.id=a.order_id
-                    WHERE a.driver_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''""",
+                    LEFT JOIN transports t ON t.id=a.transport_id
+                    WHERE a.driver_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
+                      AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')""",
                     (driver_id,)).fetchall()
                 for conflict in driver_conflicts:
                     try:
                         other_departure = datetime.fromisoformat(f"{conflict['planned_date']}T{conflict['time_from']}")
                     except (TypeError, ValueError):
                         continue
-                    if abs((planned_departure - other_departure).total_seconds()) < 2 * 60 * 60:
+                    if abs((planned_departure - other_departure).total_seconds()) < 2 * 60 * 60 and not allow_resource_conflict:
                         return (f"Kierowca ma już kurs {conflict['order_no']} o {conflict['time_from']}. "
                                 "Między planowanymi wyjazdami muszą być co najmniej 2 godziny.", 409)
             if vehicle_id:
                 vehicle_conflicts = c.execute("""SELECT a.planned_date,a.time_from,o.order_no
                     FROM dispatch_appointments a
                     JOIN orders o ON o.id=a.order_id
-                    WHERE a.vehicle_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''""",
+                    LEFT JOIN transports t ON t.id=a.transport_id
+                    WHERE a.vehicle_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
+                      AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')""",
                     (vehicle_id,)).fetchall()
                 for conflict in vehicle_conflicts:
                     try:
                         other_departure = datetime.fromisoformat(f"{conflict['planned_date']}T{conflict['time_from']}")
                     except (TypeError, ValueError):
                         continue
-                    if abs((planned_departure - other_departure).total_seconds()) < 2 * 60 * 60:
+                    if abs((planned_departure - other_departure).total_seconds()) < 2 * 60 * 60 and not allow_resource_conflict:
                         return (f"Auto ma już kurs {conflict['order_no']} o {conflict['time_from']}. "
                                 "Między planowanymi wyjazdami tego samego auta muszą być co najmniej 2 godziny.", 409)
             if not transport_id and (not driver_id or not vehicle_id):
@@ -170,8 +178,12 @@ def appointments():
                             c.execute("INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)", (_cloud_id(), transport_id, item["id"], qty, now))
                             left-=qty
             position = c.execute("SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?", (planned_date,)).fetchone()[0]
+            appointment_notes = request.form.get("notes", "").strip()
+            if allow_resource_conflict:
+                exception_note = f"WYJĄTEK OD BLOKADY 2H ({_actor()}): {conflict_reason}"
+                appointment_notes = f"{appointment_notes}\n{exception_note}".strip()
             c.execute("""INSERT INTO dispatch_appointments(appointment_no,order_id,wz_id,transport_id,driver_id,vehicle_id,loading_bay_id,planned_date,time_from,time_to,shift,queue_position,status,notes,created_by,updated_by,created_at,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'waiting',?,?,?,?,?)""", (_number(c), order_id, wz_id or None, transport_id or None, driver_id or None, vehicle_id or None, request.form.get("loading_bay_id") or None, planned_date, request.form.get("time_from") or None, planned_delivery_time or None, request.form.get("shift") or None, position, request.form.get("notes", "").strip(), _actor(), _actor(), now, now))
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'waiting',?,?,?,?,?)""", (_number(c), order_id, wz_id or None, transport_id or None, driver_id or None, vehicle_id or None, request.form.get("loading_bay_id") or None, planned_date, request.form.get("time_from") or None, planned_delivery_time or None, request.form.get("shift") or None, position, appointment_notes, _actor(), _actor(), now, now))
             c.commit()
             if transport_id:
                 D['sync_local_rows_to_supabase']('transports','id',[transport_id])
@@ -228,10 +240,14 @@ def appointments():
         drivers = c.execute("SELECT id,name FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name").fetchall()
         driver_busy = [dict(x) for x in c.execute("""SELECT a.driver_id,a.planned_date,a.time_from,o.order_no
           FROM dispatch_appointments a JOIN orders o ON o.id=a.order_id
-          WHERE a.driver_id IS NOT NULL AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''""").fetchall()]
+          LEFT JOIN transports t ON t.id=a.transport_id
+          WHERE a.driver_id IS NOT NULL AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
+            AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')""").fetchall()]
         vehicle_busy = [dict(x) for x in c.execute("""SELECT a.vehicle_id,a.planned_date,a.time_from,o.order_no
           FROM dispatch_appointments a JOIN orders o ON o.id=a.order_id
-          WHERE a.vehicle_id IS NOT NULL AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''""").fetchall()]
+          LEFT JOIN transports t ON t.id=a.transport_id
+          WHERE a.vehicle_id IS NOT NULL AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
+            AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')""").fetchall()]
         vehicles = c.execute("SELECT id,registration_no FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no").fetchall()
         bays = c.execute("SELECT * FROM loading_bays WHERE active=1 ORDER BY code").fetchall()
     dispatch_tpl = TPL.replace('<label>Istniejący transport (opcjonalnie)</label>', '<label>Ilość na nowy transport [m³]</label><input type="number" name="transport_qty" min="0.01" max="8" step="0.01" value="8" required><label>Istniejący transport (opcjonalnie)</label>')
@@ -309,6 +325,12 @@ TPL = '''{% extends "base.html" %}{% block content %}
   const vehicle = document.querySelector('select[name="vehicle_id"]');
   const note = document.getElementById('driver-availability-note');
   if (!order || !wz || !departure || !driver || !vehicle) return;
+  const form = order.closest('form');
+  const exceptionBox = document.createElement('div');
+  exceptionBox.innerHTML = '<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="allow_resource_conflict" value="1" style="width:auto"> Wyjątek od blokady 2 godzin</label><input name="conflict_reason" placeholder="Obowiązkowy powód wyjątku" style="display:none">';
+  form.insertBefore(exceptionBox, form.lastElementChild);
+  const override = exceptionBox.querySelector('[name="allow_resource_conflict"]');
+  const overrideReason = exceptionBox.querySelector('[name="conflict_reason"]');
   const vehicleNote = document.createElement('small');
   vehicleNote.className = 'muted';
   vehicleNote.textContent = 'Wybierz godzinę, aby sprawdzić dostępność.';
@@ -341,9 +363,10 @@ TPL = '''{% extends "base.html" %}{% block content %}
       if (!item.dataset.label) item.dataset.label = item.textContent;
       const clashes = value && busy.filter(x => String(x.driver_id) === item.value &&
         Math.abs(new Date(`${date}T${value}`).getTime() - new Date(`${x.planned_date}T${x.time_from}`).getTime()) < 7200000);
-      item.disabled = Boolean(clashes && clashes.length);
-      item.textContent = item.dataset.label + (item.disabled ? ` — zajęty (${clashes[0].time_from})` : '');
-      if (item.disabled) blocked++;
+      const hasClash = Boolean(clashes && clashes.length);
+      item.disabled = hasClash && !override.checked;
+      item.textContent = item.dataset.label + (hasClash ? ` — konflikt (${clashes[0].time_from})` : '');
+      if (hasClash) blocked++;
     });
     if (driver.selectedOptions[0] && driver.selectedOptions[0].disabled) driver.value = '';
     note.textContent = value ? `Niedostępni kierowcy: ${blocked}. Obowiązuje odstęp minimum 2 godziny.` : 'Wybierz godzinę, aby sprawdzić dostępność.';
@@ -353,15 +376,22 @@ TPL = '''{% extends "base.html" %}{% block content %}
       if (!item.dataset.label) item.dataset.label = item.textContent;
       const clashes = value && vehicleBusy.filter(x => String(x.vehicle_id) === item.value &&
         Math.abs(new Date(`${date}T${value}`).getTime() - new Date(`${x.planned_date}T${x.time_from}`).getTime()) < 7200000);
-      item.disabled = Boolean(clashes && clashes.length);
-      item.textContent = item.dataset.label + (item.disabled ? ` — zajęte (${clashes[0].time_from})` : '');
-      if (item.disabled) blockedVehicles++;
+      const hasClash = Boolean(clashes && clashes.length);
+      item.disabled = hasClash && !override.checked;
+      item.textContent = item.dataset.label + (hasClash ? ` — konflikt (${clashes[0].time_from})` : '');
+      if (hasClash) blockedVehicles++;
     });
     if (vehicle.selectedOptions[0] && vehicle.selectedOptions[0].disabled) vehicle.value = '';
     vehicleNote.textContent = value ? `Niedostępne auta: ${blockedVehicles}. Obowiązuje odstęp minimum 2 godziny.` : 'Wybierz godzinę, aby sprawdzić dostępność.';
   };
   order.addEventListener('change', () => { refreshWz(); refresh(); });
   departure.addEventListener('change', refresh);
+  override.addEventListener('change', () => {
+    overrideReason.style.display = override.checked ? '' : 'none';
+    overrideReason.required = override.checked;
+    if (!override.checked) overrideReason.value = '';
+    refresh();
+  });
   refreshWz();
   refresh();
 })();
