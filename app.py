@@ -1100,6 +1100,23 @@ def trigger_background_supabase_sync(reason: str = "write"):
 
 
 
+def supabase_json_value(value):
+    """Prepare values for PostgREST without turning whole quantities into 14.0.
+
+    Several existing Supabase quantity columns are bigint. Python converts an
+    HTML number such as ``14`` to float ``14.0`` while processing m³ values;
+    PostgreSQL then rejects the JSON value for a bigint column. Whole values
+    are therefore serialized as integers, recursively for all API payloads.
+    """
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    if isinstance(value, dict):
+        return {key: supabase_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [supabase_json_value(item) for item in value]
+    return value
+
+
 def supabase_request(path: str, method: str = "GET", params: dict | None = None, payload=None, prefer: str | None = None, timeout: int = 60, use_anon_key: bool = False):
     if not supabase_enabled():
         raise RuntimeError("Brak konfiguracji SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY")
@@ -1111,7 +1128,7 @@ def supabase_request(path: str, method: str = "GET", params: dict | None = None,
 
     data = None
     if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        data = json.dumps(supabase_json_value(payload), ensure_ascii=False).encode("utf-8")
 
     # Zwykłe logowanie hasłem jest endpointem publicznego Auth API. Musi użyć
     # anon key, a nie service-role key (ten drugi służy wyłącznie serwerowi).
@@ -5276,7 +5293,16 @@ def order_create():
         return "Dodaj minimum 1 pozycjÄ™", 400
 
     if supabase_enabled():
-        oid = remote_first_create_order(customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, note, items)
+        try:
+            oid = remote_first_create_order(customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, note, items)
+        except Exception as exc:
+            app.logger.exception("Nie udało się zapisać zamówienia w Supabase")
+            return render_template_string("""
+              <h1>Zamówienie nie zostało zapisane</h1>
+              <p>Supabase odrzucił zapis danych. Zamówienie nie zostało utworzone.</p>
+              <p><strong>Szczegół techniczny:</strong> {{ error }}</p>
+              <p><a href="{{ url_for('order_new') }}">Wróć do formularza zamówienia</a></p>
+            """, error=str(exc)), 400
     else:
         c = conn()
         cur = c.cursor()
