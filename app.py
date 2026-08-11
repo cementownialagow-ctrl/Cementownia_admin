@@ -3271,6 +3271,9 @@ def admin_audit():
       'order_invoice':'Wystawił fakturę do zamówienia','invoice_delete':'Usunął fakturę',
       'product_recipe':'Dodał lub zmienił składnik receptury','product_recipe_item_delete':'Usunął składnik z receptury',
       'raw_material_stock_add':'Dodał materiał na stan magazynowy',
+      'material_order_create':'Utworzył zamówienie materiałów','material_order_status':'Zmienił status zamówienia materiałów',
+      'material_direct_receipt':'Dodał materiał na stan bez zamówienia','material_purchase_item_add':'Dodał pozycję do zamówienia materiałów',
+      'material_purchase_item_delete':'Usunął pozycję z zamówienia materiałów',
     }
     status_labels={'closed':'zamknął załadunek','in_transit':'potwierdził wyjazd','delivered':'potwierdził dostawę i podpisanie WZ','returned':'potwierdził powrót pojazdu','problem':'zgłosił problem'}
     enriched=[]
@@ -3294,7 +3297,7 @@ def admin_audit():
                 if wz: order=orders.get(str(wz['order_id'])) or order
             if ('recipe' in (event.get('path') or '') or 'product_recipe' in (event.get('action') or '')) and object_id in products:
                 product=products[object_id]
-            if (event.get('path') or '').startswith('/warehouse/') and object_id in materials:
+            if ((event.get('path') or '').startswith('/warehouse/') or event.get('action') in {'material_direct_receipt','raw_material_stock_add'}) and object_id in materials:
                 material=materials[object_id]
         if not order and event.get('action')=='order_create':
             customer_value=payload.get('customer_name') or payload.get('name') or ''
@@ -3431,6 +3434,16 @@ def home():
     )
     status_total = sum(dashboard_counts.values())
     status_divisor = max(1, status_total)
+    # Niski stan = zapas na najwyżej 5 jednostek produktu według najbardziej
+    # materiałochłonnej receptury wykorzystującej dany surowiec.
+    low_raw_materials=[dict(row) for row in cur.execute('''SELECT rm.id,rm.name,rm.unit,COALESCE(s.qty,0) qty,
+      MAX(pr.qty_per_unit) max_usage,
+      CASE WHEN MAX(pr.qty_per_unit)>0 THEN COALESCE(s.qty,0)/MAX(pr.qty_per_unit) ELSE 0 END coverage
+      FROM raw_materials rm JOIN product_recipes pr ON pr.material_id=rm.id
+      LEFT JOIN raw_material_stock s ON s.material_id=rm.id
+      GROUP BY rm.id,rm.name,rm.unit,s.qty
+      HAVING COALESCE(s.qty,0)<=MAX(pr.qty_per_unit)*5
+      ORDER BY coverage ASC,rm.name LIMIT 8''').fetchall()]
     c.close()
 
     tpl = r"""
@@ -3464,6 +3477,7 @@ def home():
           <div class="card"><div class="panel-title"><h2>Status realizacji</h2></div><div class="donut-wrap"><div class="donut" style="--p1:{{ status_new*100/status_divisor }};--p2:{{ status_assigned*100/status_divisor }};--p3:{{ (status_delivery + status_signed)*100/status_divisor }}"><div class="donut-label"><b>{{ status_total }}</b>łącznie</div></div><div class="legend">
             <div class="legend-row"><i class="legend-dot" style="background:#5577ee"></i><span>Nieprzydzielone</span><b>{{ status_new }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#65a7ec"></i><span>Wydane / przydzielone</span><b>{{ status_assigned }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#31b98b"></i><span>W dostawie / na miejscu</span><b>{{ status_delivery }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#c784de"></i><span>WZ podpisane</span><b>{{ status_signed }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#45a879"></i><span>Zakończone</span><b>{{ status_done }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#e05263"></i><span>FV wystawiona</span><b>{{ status_invoice }}</b></div>
           </div></div></div>
+          <div class="card"><div class="panel-title"><span>⚠</span><h2>Niskie stany surowców</h2><a class="btn" href="{{url_for('raw_material_warehouse')}}">Magazyn</a></div><div class="stock-list">{% for m in low_raw_materials %}<div class="stock-item"><div class="stock-icon">{% if m.qty<=0 %}!{% else %}▥{% endif %}</div><div><div class="stock-name">{{m.name}}</div><div class="stock-sku">Zapas na ok. {{'%.1f'|format(m.coverage)}} jedn. produktu</div></div><div class="stock-qty" style="color:{{'#c7354c' if m.qty<=0 else '#c57a10'}}">{{'%.4f'|format(m.qty)|float}} {{m.unit}}</div></div>{% else %}<div class="muted">Brak niskich stanów. Zapasy surowców są wystarczające.</div>{% endfor %}</div></div>
         </div>
         <div class="card quick-card"><div class="panel-title"><span>ϟ</span><h2>Szybkie akcje</h2></div><div class="quick-grid">
           <a class="btn" href="{{ url_for('order_new') }}"><b>＋</b><span>Nowe zamówienie</span></a><a class="btn" href="{{ url_for('products') }}"><b>◇</b><span>Dodaj produkt</span></a><a class="btn" href="{{ url_for('material_orders') }}"><b>⇢</b><span>Zamów materiały</span></a><a class="btn" href="{{ url_for('invoices') }}"><b>▤</b><span>Faktury</span></a>
@@ -3477,7 +3491,7 @@ def home():
                                   recent_orders=recent_orders, status_new=status_new, status_assigned=status_assigned,
                                   status_delivery=status_delivery, status_signed=status_signed, status_done=status_done,
                                   status_invoice=status_invoice, status_total=status_total,
-                                  status_divisor=status_divisor)
+                                  status_divisor=status_divisor,low_raw_materials=low_raw_materials)
 
 
 @app.get("/documents/search")
@@ -9221,14 +9235,32 @@ def invoice_edit_admin(invoice_id):
 # ZAMÓWIENIA MATERIAŁÓW
 # -------------------------
 
+def material_purchase_data(note):
+    try:
+        data=json.loads(note or '{}')
+        if isinstance(data,dict) and data.get('_type')=='raw_material_purchase': return data
+    except Exception: pass
+    return {'_type':'raw_material_purchase','supplier_name':note or '','supplier_address':'','supplier_nip':'','items':[],'remarks':'','received':False}
+
+def material_purchase_note(data):
+    return json.dumps(data,ensure_ascii=False,separators=(',',':'))
+
+def next_material_order_no(c):
+    year=now_iso()[:4]
+    count=c.execute("SELECT COUNT(*) FROM material_orders WHERE package_no LIKE ?",(f'ZM/{year}/%',)).fetchone()[0]+1
+    return f'ZM/{year}/{count:05d}'
+
 @app.get("/material-orders")
 def material_orders():
     # WyĹ‚Ä…czony pull z Supabase tylko dla moduĹ‚u Zamówienia materiałów.
     # Tu pracujemy na lokalnej bazie, ĹĽeby POST -> redirect nie cofaĹ‚ zmian.
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT * FROM material_orders ORDER BY id DESC LIMIT 200")
-    packs = cur.fetchall()
+    packs=[]
+    for row in cur.execute("SELECT * FROM material_orders ORDER BY id DESC LIMIT 200").fetchall():
+        item=dict(row); item['purchase']=material_purchase_data(item.get('note')); packs.append(item)
+    customers=cur.execute("SELECT id,name,address,nip FROM customers ORDER BY name LIMIT 2000").fetchall()
+    materials=cur.execute("SELECT rm.id,rm.name,rm.unit,COALESCE(s.qty,0) qty FROM raw_materials rm LEFT JOIN raw_material_stock s ON s.material_id=rm.id ORDER BY rm.name").fetchall()
     c.close()
 
     tpl = r"""
@@ -9238,51 +9270,44 @@ def material_orders():
         <div class="flex">
           <h1 style="margin:0;">Zamówienia materiałów</h1>
         </div>
-        <div class="muted">ZarzÄ…dzaj przesyĹ‚kami: status, tracking i zawartoĹ›Ä‡ paczki. Tracking otwiera 17TRACK.</div>
+        <div class="muted">Twórz zamówienia surowców, wybieraj dostawcę i drukuj gotowy dokument zamówienia.</div>
       </div>
 
       <div class="card">
         <h2>Nowe zamówienie materiałów</h2>
-        <form method="post" action="{{ url_for('material_order_create') }}" class="row">
-          <div>
-            <label class="muted small">Numer zamówienia materiałów</label>
-            <input name="package_no" placeholder="np. PO-2026-02-01" required>
-          </div>
-          <div>
-            <label class="muted small">Notatka</label>
-            <input name="note">
-          </div>
-          <div class="flex" style="align-items:flex-end;">
-            <button class="btn primary" type="submit">Zapisz</button>
-          </div>
+        <form method="post" action="{{ url_for('material_order_create') }}">
+          <div class="grid3"><div><label>Dostawca z zapisanych klientów</label><select name="customer_id"><option value="">— wpiszę nową firmę —</option>{% for c in customers %}<option value="{{c.id}}">{{c.name}}{% if c.nip %} · NIP {{c.nip}}{% endif %}</option>{% endfor %}</select></div><div><label>Nazwa nowej firmy</label><input name="supplier_name" placeholder="Wypełnij, jeśli nie wybierasz z listy"></div><div><label>NIP nowej firmy</label><input name="supplier_nip"></div></div>
+          <label>Adres nowej firmy</label><input name="supplier_address"><label class="flex" style="justify-content:flex-start"><input type="checkbox" name="save_supplier" value="1" style="width:auto"> Zapisz nową firmę na liście klientów</label>
+          <div class="grid3" style="margin-top:14px"><div><label>Materiał</label><select name="material_id" required><option value="">— wybierz —</option>{% for m in materials %}<option value="{{m.id}}">{{m.name}} · stan {{m.qty}} {{m.unit}}</option>{% endfor %}</select></div><div><label>Ilość</label><input name="qty" type="number" min="0.0001" step="0.0001" required></div><div><label>Uwagi</label><input name="remarks"></div></div>
+          <button class="btn primary" style="margin-top:14px">Utwórz zamówienie i dokument</button>
         </form>
       </div>
+
+      <div class="card"><h2>Dodaj materiał bez zamówienia</h2><form method="post" action="{{url_for('material_direct_receipt')}}" class="grid3"><select name="material_id" required><option value="">— materiał —</option>{% for m in materials %}<option value="{{m.id}}">{{m.name}} ({{m.unit}})</option>{% endfor %}</select><input name="qty" type="number" min="0.0001" step="0.0001" placeholder="Ilość" required><button class="btn ok">Dodaj na stan</button></form></div>
 
       <div class="card">
         <h2>Zamówienia materiałów (max 200)</h2>
         <table>
           <thead>
-            <tr><th>Nr</th><th>Status</th><th>Notatka</th><th>Data</th><th>Akcje</th></tr>
+            <tr><th>Nr</th><th>Dostawca</th><th>Materiały</th><th>Status</th><th>Data</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for p in packs %}
               <tr>
                 <td><b>{{ p['package_no'] }}</b></td>
+                <td><b>{{p.purchase.supplier_name or '—'}}</b><br><span class="muted">{{p.purchase.supplier_nip or ''}}</span></td>
+                <td>{% for i in p.purchase['items'] %}{{i.name}}: <b>{{i.qty}} {{i.unit}}</b>{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</td>
                 <td>
                   <form method="post" action="{{ url_for('material_order_status', package_id=p['id']) }}" class="flex">
                     <select name="status" style="width:140px;">
-                      <option value="planned" {% if p['status']=='planned' %}selected{% endif %}>planned</option>
-                      <option value="ordered" {% if p['status']=='ordered' %}selected{% endif %}>ordered</option>
-                      <option value="shipped" {% if p['status']=='shipped' %}selected{% endif %}>shipped</option>
-                      <option value="arrived" {% if p['status']=='arrived' %}selected{% endif %}>arrived</option>
+                      <option value="planned" {% if p['status'] in ['draft','planned'] %}selected{% endif %}>Projekt</option><option value="ordered" {% if p['status']=='ordered' %}selected{% endif %}>Zamówione</option><option value="shipped" {% if p['status']=='shipped' %}selected{% endif %}>W drodze</option><option value="arrived" {% if p['status']=='arrived' %}selected{% endif %}>Przyjęte na magazyn</option>
                     </select>
-                    <button class="btn" type="submit">ZmieĹ„</button>
+                    <button class="btn" type="submit">Zmień</button>
                   </form>
                 </td>
-                <td>{{ p['note'] or "-" }}</td>
                 <td class="muted">{{ p['created_at'] }}</td>
                 <td class="flex">
-                  <a class="btn primary" href="{{ url_for('material_order_detail', package_id=p['id']) }}">Pozycje</a>
+                  <a class="btn primary" href="{{ url_for('material_order_detail', package_id=p['id']) }}">Otwórz</a>
                   <a class="btn" target="_blank" href="{{ url_for('material_order_print', package_id=p['id']) }}">Drukuj</a>
                   <form method="post" action="{{ url_for('material_order_delete', package_id=p['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ paczkÄ™?')">
                     <button class="btn danger" type="submit">UsuĹ„</button>
@@ -9298,31 +9323,35 @@ def material_orders():
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Zamówienia materiałów", base_url=BASE_URL, db_path=DB_PATH, packs=packs)
+    return render_template_string(tpl, title="Zamówienia materiałów", base_url=BASE_URL, db_path=DB_PATH, packs=packs,customers=customers,materials=materials)
 
 @app.post("/material-orders/create")
 def material_order_create():
-    package_no = norm(request.form.get("package_no"))
-    status = "draft"
-    note = norm(request.form.get("note"))
+    customer_id=to_int(request.form.get('customer_id'),0); material_id=to_int(request.form.get('material_id'),0); qty=to_float(request.form.get('qty'),0)
+    if not material_id or qty<=0:return 'Wybierz materiał i podaj prawidłową ilość.',400
+    c=conn(); customer=c.execute('SELECT * FROM customers WHERE id=?',(customer_id,)).fetchone() if customer_id else None
+    supplier_name=(customer['name'] if customer else norm(request.form.get('supplier_name')))
+    supplier_address=(customer['address'] if customer else norm(request.form.get('supplier_address')))
+    supplier_nip=(customer['nip'] if customer else norm(request.form.get('supplier_nip')))
+    if not supplier_name:c.close(); return 'Wybierz dostawcę albo wpisz nazwę nowej firmy.',400
+    material=c.execute('SELECT * FROM raw_materials WHERE id=?',(material_id,)).fetchone()
+    if not material:c.close(); abort(404)
+    if not customer and request.form.get('save_supplier')=='1':
+        c.execute('INSERT INTO customers(id,name,address,nip,created_at) VALUES(?,?,?,?,?)',(cloud_row_id(),supplier_name,supplier_address,supplier_nip,now_iso()))
+    data={'_type':'raw_material_purchase','supplier_name':supplier_name,'supplier_address':supplier_address or '','supplier_nip':supplier_nip or '','remarks':norm(request.form.get('remarks')),'received':False,'items':[{'material_id':material_id,'name':material['name'],'unit':material['unit'],'qty':qty}]}
+    cur=c.execute("INSERT INTO material_orders(id,package_no,status,tracking,note,created_at) VALUES(?,?,'planned','',?,?)",(cloud_row_id(),next_material_order_no(c),material_purchase_note(data),now_iso()))
+    package_id=cur.lastrowid; c.commit(); c.close()
+    return redirect(url_for('material_order_detail',package_id=package_id))
 
-    if not package_no:
-        return "Brak numeru zamówienia materiałów", 400
-
-    c = conn()
-    cur = c.cursor()
-    try:
-        cur.execute("""
-          INSERT INTO material_orders(package_no, status, tracking, note, created_at)
-          VALUES(?,?,?,?,?)
-        """, (package_no, status, "", note, now_iso()))
-        c.commit()
-    except sqlite3.IntegrityError:
-        pass
-    finally:
-        c.close()
-
-    return redirect(url_for("material_orders"))
+@app.post('/material-orders/direct-receipt')
+def material_direct_receipt():
+    material_id=to_int(request.form.get('material_id'),0); qty=to_float(request.form.get('qty'),0)
+    if not material_id or qty<=0:return 'Nieprawidłowy materiał lub ilość.',400
+    with conn() as c:
+        if not c.execute('SELECT 1 FROM raw_materials WHERE id=?',(material_id,)).fetchone():abort(404)
+        c.execute('INSERT OR IGNORE INTO raw_material_stock(material_id,qty) VALUES(?,0)',(material_id,)); c.execute('UPDATE raw_material_stock SET qty=qty+? WHERE material_id=?',(qty,material_id))
+        c.execute("INSERT INTO raw_material_movements(id,material_id,qty_delta,movement_type,note,created_by,created_at) VALUES(?,?,?,'receipt','Przyjęcie bez zamówienia',?,?)",(cloud_row_id(),material_id,qty,session.get('display_name') or session.get('username'),now_iso()))
+    return redirect(url_for('material_orders'))
 
 @app.post("/material-orders/<int:package_id>/status")
 def material_order_status(package_id):
@@ -9333,7 +9362,7 @@ def material_order_status(package_id):
     c = conn()
     cur = c.cursor()
 
-    cur.execute("SELECT status FROM material_orders WHERE id=?", (package_id,))
+    cur.execute("SELECT status,note,package_no FROM material_orders WHERE id=?", (package_id,))
     pack = cur.fetchone()
     if not pack:
         c.close()
@@ -9341,26 +9370,27 @@ def material_order_status(package_id):
 
     old_status = pack["status"]
 
-    cur.execute("SELECT product_id, qty FROM material_order_items WHERE package_id=?", (package_id,))
-    items = cur.fetchall()
+    purchase=material_purchase_data(pack['note']); items=purchase.get('items') or []
 
     # PrzejĹ›cie NA arrived: fizycznie przyjÄ™to towar -> dodaj na stan.
-    if INVENTORY_AUTOMATION_ENABLED and old_status != "arrived" and status == "arrived":
+    if old_status != "arrived" and status == "arrived" and not purchase.get('received'):
         for it in items:
-            pid = it["product_id"]
-            qty = int(it["qty"])
-            cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-            cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
+            material_id=int(it['material_id']); qty=float(it['qty'])
+            cur.execute('INSERT OR IGNORE INTO raw_material_stock(material_id,qty) VALUES(?,0)',(material_id,)); cur.execute('UPDATE raw_material_stock SET qty=qty+? WHERE material_id=?',(qty,material_id))
+            cur.execute("INSERT INTO raw_material_movements(id,material_id,qty_delta,movement_type,note,created_by,created_at) VALUES(?,?,?,'purchase_receipt',?,?,?)",(cloud_row_id(),material_id,qty,f"Przyjęcie {pack['package_no']}",session.get('display_name') or session.get('username'),now_iso()))
+        purchase['received']=True
 
     # CofniÄ™cie Z arrived na inny status: towar wraca jako "w drodze" -> odejmij ze stanu.
-    elif INVENTORY_AUTOMATION_ENABLED and old_status == "arrived" and status != "arrived":
+    elif old_status == "arrived" and status != "arrived" and purchase.get('received'):
         for it in items:
-            pid = it["product_id"]
-            qty = int(it["qty"])
-            cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-            cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
+            material_id=int(it['material_id']); qty=float(it['qty'])
+            current=cur.execute('SELECT COALESCE(qty,0) qty FROM raw_material_stock WHERE material_id=?',(material_id,)).fetchone()
+            if not current or float(current['qty'])+1e-9<qty:c.close(); return f"Nie można cofnąć przyjęcia {it['name']}: stan jest mniejszy niż cofana ilość.",409
+            cur.execute('UPDATE raw_material_stock SET qty=qty-? WHERE material_id=?',(qty,material_id))
+            cur.execute("INSERT INTO raw_material_movements(id,material_id,qty_delta,movement_type,note,created_by,created_at) VALUES(?,?,?,'purchase_reversal',?,?,?)",(cloud_row_id(),material_id,-qty,f"Cofnięcie przyjęcia {pack['package_no']}",session.get('display_name') or session.get('username'),now_iso()))
+        purchase['received']=False
 
-    cur.execute("UPDATE material_orders SET status=? WHERE id=?", (status, package_id))
+    cur.execute("UPDATE material_orders SET status=?,note=? WHERE id=?", (status,material_purchase_note(purchase), package_id))
     c.commit()
     c.close()
     return redirect(url_for("material_orders"))
@@ -9391,10 +9421,9 @@ def material_order_print(package_id):
     pack = cur.execute("SELECT * FROM material_orders WHERE id=?", (package_id,)).fetchone()
     if not pack:
         c.close(); abort(404)
-    items = cur.execute("""SELECT mi.sku,mi.qty,p.name,p.unit FROM material_order_items mi
-        LEFT JOIN products p ON p.id=mi.product_id WHERE mi.package_id=? ORDER BY mi.id""", (package_id,)).fetchall()
+    purchase=material_purchase_data(pack['note']); items=purchase.get('items') or []
     c.close()
-    return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{p.package_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}table{width:100%;border-collapse:collapse;margin-top:24px}th,td{border:1px solid #222;padding:9px;text-align:left}button{padding:8px 12px}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Zamówienie materiałów {{p.package_no}}</h1><p>Data utworzenia: {{p.created_at[:10]}}</p><p><b>Dostawca / uwagi:</b> {{p.note or '—'}}</p><table><thead><tr><th>Materiał</th><th>Jednostka</th><th>Ilość</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.name or i.sku}}</td><td>{{i.unit or 'szt.'}}</td><td>{{i.qty}}</td></tr>{% else %}<tr><td colspan="3">Brak pozycji.</td></tr>{% endfor %}</tbody></table><div style="margin-top:80px;display:flex;justify-content:space-between"><span>____________________________<br>Osoba zamawiająca</span><span>____________________________<br>Akceptacja dostawcy</span></div></html>''', p=pack, items=items)
+    return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{p.package_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}table{width:100%;border-collapse:collapse;margin-top:24px}th,td{border:1px solid #222;padding:9px;text-align:left}button{padding:8px 12px}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Zamówienie materiałów {{p.package_no}}</h1><p>Data: {{p.created_at[:10]}}</p><div style="display:grid;grid-template-columns:1fr 1fr;gap:35px"><div><b>Zamawiający</b><br>Beton Łagów</div><div><b>Dostawca</b><br>{{purchase.supplier_name}}<br>{{purchase.supplier_address}}{% if purchase.supplier_nip %}<br>NIP: {{purchase.supplier_nip}}{% endif %}</div></div><table><thead><tr><th>Lp.</th><th>Materiał</th><th>Jednostka</th><th>Ilość</th></tr></thead><tbody>{% for i in items %}<tr><td>{{loop.index}}</td><td>{{i.name}}</td><td>{{i.unit}}</td><td>{{i.qty}}</td></tr>{% else %}<tr><td colspan="4">Brak pozycji.</td></tr>{% endfor %}</tbody></table><p><b>Uwagi:</b> {{purchase.remarks or '—'}}</p><div style="margin-top:80px;display:flex;justify-content:space-between"><span>____________________________<br>Osoba zamawiająca</span><span>____________________________<br>Potwierdzenie dostawcy</span></div></html>''', p=pack,purchase=purchase,items=items)
 
 @app.get("/material-orders/<int:package_id>")
 def material_order_detail(package_id):
@@ -9407,17 +9436,8 @@ def material_order_detail(package_id):
         c.close()
         abort(404)
 
-    cur.execute("SELECT id, sku, model, name FROM products ORDER BY sku LIMIT 5000")
-    products_rows = cur.fetchall()
-
-    cur.execute("""
-      SELECT ci.*, p.model, p.name
-      FROM material_order_items ci
-      JOIN products p ON p.id=ci.product_id
-      WHERE ci.package_id=?
-      ORDER BY ci.id DESC
-    """, (package_id,))
-    items = cur.fetchall()
+    materials=cur.execute('SELECT id,name,unit FROM raw_materials ORDER BY name').fetchall()
+    purchase=material_purchase_data(pack['note']); items=purchase.get('items') or []
     c.close()
 
     tpl = r"""
@@ -9425,11 +9445,11 @@ def material_order_detail(package_id):
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">Paczka {{ pack['package_no'] }}</h1>
+          <h1 style="margin:0;">Zamówienie {{ pack['package_no'] }}</h1>
           <span class="badge">{{ pack['status'] }}</span>
-          <a class="btn right" href="{{ url_for('material_orders') }}">â† Lista paczek</a>
+          <a class="btn right" href="{{ url_for('material_orders') }}">← Lista zamówień</a><a class="btn" target="_blank" href="{{url_for('material_order_print',package_id=pack.id)}}">Drukuj dokument</a>
         </div>
-        <div class="muted">Tracking: {{ pack['tracking'] or '-' }}</div>
+        <p><b>Dostawca:</b> {{purchase.supplier_name}}{% if purchase.supplier_nip %} · NIP {{purchase.supplier_nip}}{% endif %}<br>{{purchase.supplier_address}}</p><div class="muted">Uwagi: {{purchase.remarks or '—'}}</div>
         <form method="post" action="{{ url_for('material_order_tracking', package_id=pack['id']) }}" class="flex" style="margin-top:10px;">
           <input name="tracking" value="{{ pack['tracking'] or '' }}" placeholder="nr trackingu" style="width:260px;">
           <button class="btn" type="submit">ZmieĹ„ tracking</button>
@@ -9440,15 +9460,12 @@ def material_order_detail(package_id):
       </div>
 
       <div class="card">
-        <h2>Dodaj zawartoĹ›Ä‡ paczki</h2>
-        <form method="post" action="{{ url_for('material_order_item_add', package_id=pack['id']) }}" class="items-row">
+        <h2>Dodaj kolejną pozycję</h2>
+        <form method="post" action="{{ url_for('material_purchase_item_add', package_id=pack['id']) }}" class="items-row">
           <div>
-            <label class="muted small">Produkt</label>
-            <select name="product_id" required>
+            <label class="muted small">Materiał</label><select name="material_id" required>
               <option value="">-- wybierz --</option>
-              {% for p in products %}
-                <option value="{{ p['id'] }}">{{ p['sku'] }}{% if p['model'] %} â€˘ {{ p['model'] }}{% endif %}{% if p['name'] %} â€˘ {{ p['name'] }}{% endif %}</option>
-              {% endfor %}
+              {% for m in materials %}<option value="{{m.id}}">{{m.name}} ({{m.unit}})</option>{% endfor %}
             </select>
           </div>
           <div>
@@ -9462,20 +9479,18 @@ def material_order_detail(package_id):
       </div>
 
       <div class="card">
-        <h2>ZawartoĹ›Ä‡ paczki</h2>
+        <h2>Pozycje zamówienia</h2>
         <table>
           <thead>
-            <tr><th>SKU</th><th>Model / Nazwa</th><th>IloĹ›Ä‡</th><th>Data</th><th>Akcje</th></tr>
+            <tr><th>Materiał</th><th>Jednostka</th><th>Ilość</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for it in items %}
               <tr>
-                <td><b>{{ it['sku'] }}</b></td>
-                <td>{{ it['model'] or '' }}{% if it['name'] %}<div class="muted">{{ it['name'] }}</div>{% endif %}</td>
+                <td><b>{{it.name}}</b></td><td>{{it.unit}}</td>
                 <td><span class="badge">{{ it['qty'] }}</span></td>
-                <td class="muted">{{ it['created_at'] }}</td>
                 <td>
-                  <form method="post" action="{{ url_for('material_order_item_delete', package_id=pack['id'], item_id=it['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ pozycjÄ™?')">
+                  <form method="post" action="{{ url_for('material_purchase_item_delete', package_id=pack['id'], item_index=loop.index0) }}" onsubmit="return confirm('Usunąć pozycję?')">
                     <button class="btn danger" type="submit">UsuĹ„</button>
                   </form>
                 </td>
@@ -9489,8 +9504,29 @@ def material_order_detail(package_id):
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title=f"Paczka {pack['package_no']}", base_url=BASE_URL, db_path=DB_PATH,
-                                  pack=pack, products=products_rows, items=items)
+    return render_template_string(tpl,title=f"Zamówienie {pack['package_no']}",base_url=BASE_URL,db_path=DB_PATH,pack=pack,purchase=purchase,materials=materials,items=items)
+
+@app.post('/material-orders/<int:package_id>/purchase-items/add')
+def material_purchase_item_add(package_id):
+    material_id=to_int(request.form.get('material_id'),0); qty=to_float(request.form.get('qty'),0)
+    if not material_id or qty<=0:return 'Nieprawidłowy materiał lub ilość.',400
+    with conn() as c:
+        pack=c.execute('SELECT note,status FROM material_orders WHERE id=?',(package_id,)).fetchone(); material=c.execute('SELECT * FROM raw_materials WHERE id=?',(material_id,)).fetchone()
+        if not pack or not material:abort(404)
+        if pack['status']=='arrived':return 'Nie można zmieniać przyjętego zamówienia.',409
+        data=material_purchase_data(pack['note']); data['items'].append({'material_id':material_id,'name':material['name'],'unit':material['unit'],'qty':qty}); c.execute('UPDATE material_orders SET note=? WHERE id=?',(material_purchase_note(data),package_id))
+    return redirect(url_for('material_order_detail',package_id=package_id))
+
+@app.post('/material-orders/<int:package_id>/purchase-items/<int:item_index>/delete')
+def material_purchase_item_delete(package_id,item_index):
+    with conn() as c:
+        pack=c.execute('SELECT note,status FROM material_orders WHERE id=?',(package_id,)).fetchone()
+        if not pack:abort(404)
+        if pack['status']=='arrived':return 'Nie można zmieniać przyjętego zamówienia.',409
+        data=material_purchase_data(pack['note'])
+        if item_index<0 or item_index>=len(data['items']):abort(404)
+        data['items'].pop(item_index); c.execute('UPDATE material_orders SET note=? WHERE id=?',(material_purchase_note(data),package_id))
+    return redirect(url_for('material_order_detail',package_id=package_id))
 
 
 @app.post("/material-orders/<int:package_id>/delete")
