@@ -800,8 +800,13 @@ def next_invoice_no(issue_date: str) -> str:
     yyyy = dt.strftime("%Y")
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT COUNT(*) AS n FROM invoices WHERE substr(issue_date,1,7)=?", (f"{yyyy}-{mm}",))
-    n = int(cur.fetchone()["n"] or 0) + 1
+    cur.execute('CREATE TABLE IF NOT EXISTS document_sequences(sequence_key TEXT PRIMARY KEY,value INTEGER NOT NULL)')
+    prefix=f'FVAT '
+    current=cur.execute("SELECT COALESCE(MAX(CAST(substr(invoice_no,6,instr(substr(invoice_no,6),'/')-1) AS INTEGER)),0) FROM invoices WHERE substr(issue_date,1,7)=?",(f"{yyyy}-{mm}",)).fetchone()[0]
+    key=f'invoice:{yyyy}-{mm}'
+    cur.execute('INSERT INTO document_sequences(sequence_key,value) VALUES(?,?) ON CONFLICT(sequence_key) DO NOTHING',(key,int(current or 0)))
+    n=int(cur.execute('UPDATE document_sequences SET value=value+1 WHERE sequence_key=? RETURNING value',(key,)).fetchone()[0])
+    c.commit()
     c.close()
     return f"FVAT {n}/{mm}/{yyyy}"
 
@@ -3476,6 +3481,7 @@ def home():
       LEFT JOIN order_items oi ON oi.order_id=o.id
       LEFT JOIN products p ON p.id=oi.product_id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model))=TRIM(LOWER(p.sku)))
+      WHERE o.status!='cancelled'
       GROUP BY o.id ORDER BY o.id DESC LIMIT 8
     """)
     recent_orders = [dict(r) for r in cur.fetchall()]
@@ -9486,7 +9492,12 @@ def material_purchase_note(data):
 
 def next_material_order_no(c):
     year=now_iso()[:4]
-    count=c.execute("SELECT COUNT(*) FROM material_orders WHERE package_no LIKE ?",(f'ZM/{year}/%',)).fetchone()[0]+1
+    c.execute('CREATE TABLE IF NOT EXISTS document_sequences(sequence_key TEXT PRIMARY KEY,value INTEGER NOT NULL)')
+    prefix=f'ZM/{year}/'
+    current=c.execute("SELECT COALESCE(MAX(CAST(substr(package_no,?) AS INTEGER)),0) FROM material_orders WHERE package_no LIKE ?",(len(prefix)+1,prefix+'%')).fetchone()[0]
+    key=f'material_order:{year}'
+    c.execute('INSERT INTO document_sequences(sequence_key,value) VALUES(?,?) ON CONFLICT(sequence_key) DO NOTHING',(key,int(current or 0)))
+    count=int(c.execute('UPDATE document_sequences SET value=value+1 WHERE sequence_key=? RETURNING value',(key,)).fetchone()[0])
     return f'ZM/{year}/{count:05d}'
 
 @app.get("/material-orders")

@@ -91,11 +91,15 @@ def analytics():
         # even when an invoice is issued later by the accounting department.
         sales=c.execute("""
             SELECT
-              COALESCE(SUM(COALESCE(wi.qty_issued,wi.qty_planned) * COALESCE(p.unit_net_price,0)),0) net,
-              COALESCE(SUM(COALESCE(wi.qty_issued,wi.qty_planned) * COALESCE(p.unit_gross_price,p.unit_net_price,0)),0) gross,
+              COALESCE(SUM(COALESCE(wi.qty_issued,wi.qty_planned) * COALESCE(
+                CAST(json_extract(ws.snapshot_json,'$.product.unit_net_price') AS REAL),p.unit_net_price,0)),0) net,
+              COALESCE(SUM(COALESCE(wi.qty_issued,wi.qty_planned) * COALESCE(
+                CAST(json_extract(ws.snapshot_json,'$.product.unit_gross_price') AS REAL),
+                CAST(json_extract(ws.snapshot_json,'$.product.unit_net_price') AS REAL),p.unit_gross_price,p.unit_net_price,0)),0) gross,
               (SELECT COUNT(*) FROM invoices i WHERE substr(i.issue_date,1,10) BETWEEN ? AND ?) invoices
             FROM wz_items wi
             JOIN wz_documents w ON w.id=wi.wz_id
+            LEFT JOIN wz_technology_snapshots ws ON ws.wz_item_id=wi.id
             LEFT JOIN products p ON p.id=wi.product_id
             WHERE w.deleted_at IS NULL AND w.issued_at IS NOT NULL
               AND substr(w.issued_at,1,10) BETWEEN ? AND ?
@@ -146,8 +150,10 @@ def analytics():
               WHERE deleted_at IS NULL AND entry_date BETWEEN ? AND ? GROUP BY vehicle_id
             ) f ON f.vehicle_id=v.id
             LEFT JOIN (
-              SELECT vehicle_id,SUM(gross_cost) repair_cost FROM vehicle_expenses
-              WHERE deleted_at IS NULL AND expense_date BETWEEN ? AND ? GROUP BY vehicle_id
+              SELECT ve.vehicle_id,SUM(ve.gross_cost) repair_cost FROM vehicle_expenses ve
+              JOIN expense_categories ec ON ec.id=ve.category_id
+              WHERE ve.deleted_at IS NULL AND ec.group_code IN ('repairs','parts','service','tires')
+                AND ve.expense_date BETWEEN ? AND ? GROUP BY ve.vehicle_id
             ) e ON e.vehicle_id=v.id
             WHERE v.deleted_at IS NULL
             ORDER BY repair_cost DESC,total_cost DESC,v.registration_no ASC

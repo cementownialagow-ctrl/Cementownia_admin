@@ -62,6 +62,14 @@ def test_issue_and_exact_reversal():
     assert new_snapshot['cement_type']=='CEM TEST 52,5'
     assert c.execute("SELECT qty FROM raw_material_stock WHERE material_id=3").fetchone()[0] == 700
 
+    # Snapshot roboczy musi zostać zastąpiony wersją obowiązującą przy wydaniu.
+    c.execute("INSERT INTO wz_items VALUES(3,12,1,1,NULL)")
+    fn["snapshot_wz_technology"](c,12,"tester","2026-08-12T11:00:00")
+    c.execute("UPDATE recipe_versions SET consistency='S5' WHERE id=20")
+    fn["issue_recipe_materials"](c,12,"tester","2026-08-12T12:00:00")
+    issued_snapshot=json.loads(c.execute("SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=12").fetchone()[0])
+    assert issued_snapshot['consistency']=='S5'
+
 
 if __name__ == "__main__":
     test_issue_and_exact_reversal()

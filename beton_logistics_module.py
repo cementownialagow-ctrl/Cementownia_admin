@@ -67,6 +67,8 @@ def register_beton_logistics(app,deps):
         CREATE TABLE IF NOT EXISTS audit_log(
           id INTEGER PRIMARY KEY AUTOINCREMENT,actor TEXT NOT NULL,action TEXT NOT NULL,entity_type TEXT NOT NULL,
           entity_id INTEGER,details_json TEXT,created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS document_sequences(
+          sequence_key TEXT PRIMARY KEY,value INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_transports_invoice ON transports(invoice_id);
         CREATE INDEX IF NOT EXISTS idx_wz_status ON wz_documents(status,created_at);
         CREATE INDEX IF NOT EXISTS idx_transports_driver_status ON transports(driver_id,status);
@@ -123,11 +125,16 @@ def transport_status_pl(value): return TRANSPORT_STATUS_PL.get(str(value or '').
 WZ_STATUS_PL={'created':'Roboczy','issued':'Gotowy do transportu','in_transport':'W transporcie','ready_invoice':'Dostarczony — gotowy do faktury','invoiced':'Zafakturowany','returned':'Zakończony','cancelled':'Anulowany'}
 def wz_status_pl(value): return WZ_STATUS_PL.get(str(value or '').lower(),value or '—')
 def cloud_id(): return int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
+def next_document_sequence(c,key,table,column,prefix):
+    c.execute('CREATE TABLE IF NOT EXISTS document_sequences(sequence_key TEXT PRIMARY KEY,value INTEGER NOT NULL)')
+    current=c.execute(f"SELECT COALESCE(MAX(CAST(substr({column},?) AS INTEGER)),0) FROM {table} WHERE {column} LIKE ?",(len(prefix)+1,prefix+'%')).fetchone()[0]
+    c.execute('INSERT INTO document_sequences(sequence_key,value) VALUES(?,?) ON CONFLICT(sequence_key) DO NOTHING',(key,int(current or 0)))
+    return int(c.execute('UPDATE document_sequences SET value=value+1 WHERE sequence_key=? RETURNING value',(key,)).fetchone()[0])
 def next_no(c):
-    year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM transports WHERE transport_no LIKE ?",(f'TR/{year}/%',)).fetchone()[0]+1
+    year=stamp()[:4]; n=next_document_sequence(c,f'transport:{year}','transports','transport_no',f'TR/{year}/')
     return f'TR/{year}/{n:05d}'
 def next_wz_no(c):
-    year=stamp()[:4]; n=c.execute("SELECT COUNT(*) FROM wz_documents WHERE wz_no LIKE ?",(f'WZ/{year}/%',)).fetchone()[0]+1
+    year=stamp()[:4]; n=next_document_sequence(c,f'wz:{year}','wz_documents','wz_no',f'WZ/{year}/')
     return f'WZ/{year}/{n:05d}'
 
 def snapshot_wz_technology(c, wz_id, created_by, created_at):
@@ -154,16 +161,21 @@ def snapshot_wz_technology(c, wz_id, created_by, created_at):
                 frozen.setdefault(key,material.get(key))
             frozen['qty_per_unit']=float(material['qty_per_unit']); materials.append(frozen)
         version_data=dict(version) if version else {}
-        product=c.execute('SELECT id,sku,name,model,unit FROM products WHERE id=?',(wz_item['product_id'],)).fetchone()
+        product_columns={row[1] for row in c.execute('PRAGMA table_info(products)').fetchall()}
+        product_fields=['id','sku','name','model','unit']+[name for name in ('unit_net_price','unit_gross_price') if name in product_columns]
+        product=c.execute(f"SELECT {','.join(product_fields)} FROM products WHERE id=?",(wz_item['product_id'],)).fetchone()
         cement=next((m for m in materials if (m.get('material_type') or '').lower()=='cement'),{})
         snapshot={'recipe_version_id':version_data.get('id'),'recipe_no':version_data.get('recipe_no') or '','recipe_name':version_data.get('name') or 'Receptura produktu','version_no':version_data.get('version_no') or 1,'valid_from':version_data.get('valid_from'),'concrete_class':version_data.get('concrete_class'),'consistency':version_data.get('consistency'),'water_cement_ratio':version_data.get('water_cement_ratio'),'exposure_class':version_data.get('exposure_class'),'max_aggregate_size':version_data.get('max_aggregate_size'),'chloride_class':version_data.get('chloride_class'),'characteristic_strength':version_data.get('characteristic_strength'),'reference_document':version_data.get('reference_document'),'cement_type':version_data.get('cement_type') or cement.get('technical_designation') or cement.get('cement_designation'),'admixtures':version_data.get('admixtures'),'fibres':version_data.get('fibres'),'other_additions':version_data.get('other_additions'),'technology_notes':version_data.get('technology_notes'),'product':dict(product) if product else {},'materials':materials,'qty':float(wz_item['qty_issued'] if wz_item['qty_issued'] is not None else wz_item['qty_planned'])}
         c.execute('INSERT INTO wz_technology_snapshots(id,wz_id,wz_item_id,product_id,recipe_version_id,snapshot_json,created_at) VALUES(?,?,?,?,?,?,?)',(cloud_id(),wz_id,wz_item['id'],wz_item['product_id'],version_data.get('id'),json.dumps(snapshot,ensure_ascii=False),created_at))
 
 def issue_recipe_materials(c, wz_id, issued_by, issued_at):
     """Book one idempotent raw-material issue for a WZ."""
-    snapshot_wz_technology(c,wz_id,issued_by,issued_at)
     if c.execute("SELECT 1 FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue' LIMIT 1",(wz_id,)).fetchone():
         raise ValueError('Materiały dla tego WZ zostały już rozchodowane.')
+    # Snapshot oglądany na roboczym WZ jest tylko podglądem. Wydanie zawsze
+    # zamraża recepturę ponownie, według wersji obowiązującej w tej chwili.
+    c.execute('DELETE FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,))
+    snapshot_wz_technology(c,wz_id,issued_by,issued_at)
     totals={}
     for row in c.execute('SELECT snapshot_json FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,)).fetchall():
         data=json.loads(row['snapshot_json']); product_qty=float(data.get('qty') or 0)
@@ -1070,6 +1082,9 @@ def transport_ready(transport_id):
         if not transport: abort(404)
         if transport['status'] not in ('assigned','issued'):
             return redirect(url_for('beton.transport_view',transport_id=transport_id))
+        appointment=c.execute('SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
+        if not appointment:
+            return 'Najpierw dodaj transport do awizacji. Bez awizacji nie można zezwolić kierowcy na start.',409
         wz=c.execute('SELECT id,status FROM wz_documents WHERE id=? AND deleted_at IS NULL',(transport['wz_id'],)).fetchone()
         if not wz: abort(404)
         if wz['status']=='created':
@@ -1080,11 +1095,9 @@ def transport_ready(transport_id):
             except ValueError as exc:
                 c.rollback()
                 return str(exc),409
-        appointment=c.execute('SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
-        if appointment:
-            appointment_id=int(appointment['id'])
-            c.execute("UPDATE dispatch_appointments SET status='ready_to_leave',updated_by=?,updated_at=? WHERE id=?",(actor(),now,appointment_id))
-            c.execute('INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)',(appointment_id,appointment['status'],'ready_to_leave','Transport przekazany kierowcy do rozpoczęcia',actor(),now))
+        appointment_id=int(appointment['id'])
+        c.execute("UPDATE dispatch_appointments SET status='ready_to_leave',updated_by=?,updated_at=? WHERE id=?",(actor(),now,appointment_id))
+        c.execute('INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)',(appointment_id,appointment['status'],'ready_to_leave','Transport przekazany kierowcy do rozpoczęcia',actor(),now))
         c.execute("UPDATE transports SET status='issued',issued_at=COALESCE(issued_at,?),updated_by=?,updated_at=? WHERE id=?",(now,actor(),now,transport_id))
         wz_id=int(transport['wz_id'])
         c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'ready_for_driver','transport',transport_id,'{}',now))
@@ -1167,7 +1180,7 @@ def driver_transport_status_api(transport_id):
           FROM transports t JOIN drivers d ON d.id=t.driver_id
           WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL''',(transport_id,driver_id)).fetchone()
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
-        transitions={'assigned':{'in_transit','problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','closed','problem'},'closed':{'delivered','returned','problem'},'delivered':{'returned','problem'},'problem':{'in_transit','delivered','returned'}}
+        transitions={'assigned':{'problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','closed','problem'},'closed':{'delivered','returned','problem'},'delivered':{'returned','problem'},'problem':{'in_transit','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
         # Tylko kierowca ma obowiązkową przerwę między kolejnymi etapami.
         # Pracownik, dyspozytor i administrator zmieniają etap w panelu głównym bez tej blokady.
@@ -1183,11 +1196,14 @@ def driver_transport_status_api(transport_id):
             except (TypeError, ValueError):
                 pass
         appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
-        if status in {'issued','in_transit'} and appointment and appointment['status']!='ready_to_leave':
+        if status=='in_transit' and (not appointment or appointment['status']!='ready_to_leave'):
             return jsonify(ok=False,error='Dyspozytor musi najpierw oznaczyć transport jako gotowy do wyjazdu.'),409
-        sql='UPDATE transports SET status=?,driver_notes=?,receiver_name=?,updated_by=?,updated_at=?'+(f',{field}=?' if field else '')+' WHERE id=?'; values=[status,str(data.get('notes',''))[:2000],str(data.get('receiver_name',''))[:200],email,stamp()]
+        sql='UPDATE transports SET status=?,driver_notes=?,receiver_name=?,updated_by=?,updated_at=?'+(f',{field}=?' if field else '')+' WHERE id=? AND status=?'; values=[status,str(data.get('notes',''))[:2000],str(data.get('receiver_name',''))[:200],email,stamp()]
         if field:values.append(stamp())
-        values.append(transport_id); c.execute(sql,values)
+        values.extend((transport_id,row['status']))
+        if c.execute(sql,values).rowcount != 1:
+            c.rollback()
+            return jsonify(ok=False,error='Status transportu został już zmieniony. Odśwież dane.'),409
         # Podpisane WZ zamyka część dostawczą i od razu daje księgowości
         # możliwość wystawienia faktury. Powrót auta na bazę pozostaje
         # osobnym etapem logistycznym, ale nie blokuje fakturowania.

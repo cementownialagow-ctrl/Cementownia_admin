@@ -33,9 +33,14 @@ TRANSPORT_STAGE_LABEL.update({"assigned": "Oczekuje", "issued": "Oczekuje", "in_
 def _now(): return D["now_iso"]()
 def _actor(): return session.get("display_name") or session.get("username") or "pracownik"
 def _cloud_id(): return int(time.time() * 1000) * 1000 + secrets.randbelow(1000)
+def _next_sequence(c,key,table,column,prefix):
+    c.execute('CREATE TABLE IF NOT EXISTS document_sequences(sequence_key TEXT PRIMARY KEY,value INTEGER NOT NULL)')
+    current=c.execute(f"SELECT COALESCE(MAX(CAST(substr({column},?) AS INTEGER)),0) FROM {table} WHERE {column} LIKE ?",(len(prefix)+1,prefix+'%')).fetchone()[0]
+    c.execute('INSERT INTO document_sequences(sequence_key,value) VALUES(?,?) ON CONFLICT(sequence_key) DO NOTHING',(key,int(current or 0)))
+    return int(c.execute('UPDATE document_sequences SET value=value+1 WHERE sequence_key=? RETURNING value',(key,)).fetchone()[0])
 def _number(c):
     year = _now()[:4]
-    n = c.execute("SELECT COUNT(*) FROM dispatch_appointments WHERE appointment_no LIKE ?", (f"AW/{year}/%",)).fetchone()[0] + 1
+    n = _next_sequence(c,f'appointment:{year}','dispatch_appointments','appointment_no',f'AW/{year}/')
     return f"AW/{year}/{n:05d}"
 
 def register_dispatch(app, deps):
@@ -164,7 +169,7 @@ def appointments():
                     return f'Pozostało tylko {remaining_total:g} m³ do przydzielenia.', 400
                 if remaining_total > 0:
                     year = now[:4]
-                    number = c.execute("SELECT COUNT(*) FROM transports WHERE transport_no LIKE ?", (f"TR/{year}/%",)).fetchone()[0] + 1
+                    number = _next_sequence(c,f'transport:{year}','transports','transport_no',f'TR/{year}/')
                     transport_no = f"TR/{year}/{number:05d}"
                     transport_id = _cloud_id()
                     c.execute("""INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at)
