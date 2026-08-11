@@ -241,6 +241,8 @@ def init_db():
         customer_address TEXT,
         customer_phone TEXT,
         customer_email TEXT,
+        delivery_date TEXT,
+        delivery_time TEXT,
         status TEXT NOT NULL DEFAULT 'new', -- new/packed/shipped/cancelled
         note TEXT,
         created_at TEXT NOT NULL,
@@ -449,6 +451,10 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN warehouse_issued INTEGER NOT NULL DEFAULT 0")
     if "idempotency_key" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN idempotency_key TEXT")
+    if "delivery_date" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN delivery_date TEXT")
+    if "delivery_time" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN delivery_time TEXT")
 
     product_cols = {r[1] for r in cur.execute("PRAGMA table_info(products)").fetchall()}
     for col, definition in {
@@ -1601,7 +1607,7 @@ def remote_first_create_customer(name: str, address: str, phone: str, email: str
     return customer_id
 
 
-def remote_first_create_order(customer_id, customer_name, customer_address, customer_phone, customer_email, note, items, idempotency_key=None):
+def remote_first_create_order(customer_id, customer_name, customer_address, customer_phone, customer_email, note, items, idempotency_key=None, delivery_date="", delivery_time=""):
     created_at = now_iso()
     order_id = cloud_row_id()
     order_payload = {
@@ -1612,6 +1618,8 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
         "customer_address": customer_address,
         "customer_phone": customer_phone,
         "customer_email": customer_email,
+        "delivery_date": delivery_date or None,
+        "delivery_time": delivery_time or None,
         "status": "new",
         "note": note,
         "created_at": created_at,
@@ -1629,8 +1637,8 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
     try:
         cur = c.cursor()
         cur.execute(
-            "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at, idempotency_key=excluded.idempotency_key",
-            (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, idempotency_key)
+            "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, delivery_date, delivery_time, status, note, created_at, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, delivery_date=excluded.delivery_date, delivery_time=excluded.delivery_time, status=excluded.status, note=excluded.note, created_at=excluded.created_at, idempotency_key=excluded.idempotency_key",
+            (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, delivery_date or None, delivery_time or None, "new", note, created_at, idempotency_key)
         )
 
         for pid, qty in items:
@@ -2978,7 +2986,7 @@ BASE = r"""
       <a href="{{ url_for('invoices') }}">Faktury</a>
       <a href="{{ url_for('beton.wz_list') }}">Dokumenty WZ</a>
       <a href="{{ url_for('beton.transports') }}">Transporty</a>
-      <a href="{{ url_for('dispatch.appointments') }}">Awizacje i kolejka</a>
+      <a href="{{ url_for('dispatch.appointments') }}">Wydaj transport</a>
       <a href="{{ url_for('beton.drivers') }}">Kierowcy i pojazdy</a>
       <a href="{{ url_for('ops.operations') }}">Koszty i zużycie</a>
       <a href="{{ url_for('ops.analytics') }}">Analizy i raporty</a>
@@ -5221,6 +5229,17 @@ def order_new():
             </div>
           </div>
 
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label class="muted small">Termin realizacji dostawy</label>
+              <input name="delivery_date" type="date" required>
+            </div>
+            <div>
+              <label class="muted small">Planowana godzina dostawy (opcjonalnie)</label>
+              <input name="delivery_time" type="time">
+            </div>
+          </div>
+
           <div class="line"></div>
 
           <div class="flex">
@@ -5324,6 +5343,10 @@ def order_create():
     customer_address = norm(request.form.get("customer_address"))
     customer_phone = norm(request.form.get("customer_phone"))
     customer_email = norm(request.form.get("customer_email"))
+    delivery_date = norm(request.form.get("delivery_date"))
+    delivery_time = norm(request.form.get("delivery_time"))
+    if not delivery_date:
+        return "Podaj termin realizacji dostawy", 400
     # W betoniarni adres klienta jest jednocześnie adresem dostawy.
     # Nie używamy osobnego adresu wysyłki ani etykiet kurierskich.
     note = ""
@@ -5368,7 +5391,7 @@ def order_create():
 
     if supabase_enabled():
         try:
-            oid = remote_first_create_order(customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, note, items)
+            oid = remote_first_create_order(customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, note, items, delivery_date=delivery_date, delivery_time=delivery_time)
         except Exception as exc:
             app.logger.exception("Nie udało się zapisać zamówienia w Supabase")
             return render_template_string("""
@@ -5382,9 +5405,9 @@ def order_create():
         cur = c.cursor()
         created_at = now_iso()
         cur.execute("""
-          INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at)
-          VALUES(?,?,?,?,?,?,?,?,?)
-        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at))
+          INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, delivery_date, delivery_time, status, note, created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, delivery_date, delivery_time or None, "new", note, created_at))
         oid = cur.lastrowid
 
         order_no = make_order_no(oid, created_at)
