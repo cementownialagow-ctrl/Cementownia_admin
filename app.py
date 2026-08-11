@@ -130,6 +130,23 @@ def fix_polish_mojibake(text: str) -> str:
         return text
     for bad, good in _MOJIBAKE_REPLACEMENTS.items():
         text = text.replace(bad, good)
+    # Część starszych szablonów była zapisana podwójnie w błędnym kodowaniu.
+    # Po pierwszym przejściu zostaje w nich typowy zapis UTF-8 odczytany jako
+    # Windows-1250. Naprawiamy również tę ostatnią warstwę.
+    common = {
+        "Ăł": "ó", "Ä…": "ą", "Ä‡": "ć", "Ä™": "ę",
+        "Ĺ‚": "ł", "Ĺ„": "ń", "Ĺ›": "ś", "Ĺş": "ź", "ĹĽ": "ż",
+        "Ä„": "Ą", "Ä†": "Ć", "Ä": "Ę", "Ĺ": "Ł", "Ĺ": "Ń",
+        "Ă“": "Ó", "Ĺš": "Ś", "Ĺą": "Ź", "Ĺ»": "Ż",
+        "Â·": "·", "â€”": "—", "â€“": "–", "â€ž": "„", "â€ť": "”",
+        "â€ś": "“", "â€™": "’", "â†": "←", "â†’": "→", "mÂł": "m³",
+    }
+    for _ in range(2):
+        previous = text
+        for bad, good in common.items():
+            text = text.replace(bad, good)
+        if text == previous:
+            break
     return text
 
 
@@ -4946,11 +4963,26 @@ def products():
 
 @app.route("/products/<int:product_id>/recipe", methods=["GET", "POST"])
 def product_recipe(product_id):
+    # Render moze skierowac kolejne zadanie do innej instancji procesu. Przed
+    # odczytem receptury odswiezamy dane wspoldzielone, aby produkt widoczny na
+    # liscie nie konczyl sie chwile pozniej bledem 404 na innej instancji.
+    try:
+        pull_shared_tables_from_supabase(force=request.method == "POST")
+    except Exception:
+        app.logger.exception("Nie udało się odświeżyć danych przed otwarciem receptury")
     c = conn()
     product = c.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
     if not product:
         c.close()
-        abort(404)
+        try:
+            pull_shared_tables_from_supabase(force=True)
+        except Exception:
+            app.logger.exception("Nie udało się ponownie pobrać produktu %s", product_id)
+        c = conn()
+        product = c.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+        if not product:
+            c.close()
+            abort(404)
     error = ""
     if request.method == "POST":
         if request.form.get("form_action") == "save_version":
