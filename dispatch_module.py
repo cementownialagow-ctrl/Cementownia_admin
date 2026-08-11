@@ -94,7 +94,7 @@ def appointments():
                     return 'Wybrany transport należy do innego zamówienia.',400
                 if wz_id and int(selected_transport['wz_id']) != wz_id:
                     return 'Wybrany transport należy do innego dokumentu WZ.',400
-                if c.execute("SELECT 1 FROM dispatch_appointments WHERE transport_id=? AND status NOT IN ('departed','cancelled') LIMIT 1",(transport_id,)).fetchone():
+                if c.execute("SELECT 1 FROM dispatch_appointments WHERE transport_id=? AND status<>'cancelled' LIMIT 1",(transport_id,)).fetchone():
                     return 'Ten transport jest już dodany do harmonogramu.',409
                 wz_id=int(selected_transport['wz_id'])
                 driver_id=int(selected_transport['driver_id'] or driver_id or 0)
@@ -161,8 +161,9 @@ def appointments():
         rows = [dict(x) for x in rows]
         for x in rows:
             x['display_stage'] = TRANSPORT_STAGE_LABEL.get(x.get('transport_status')) or STAGE_LABEL.get(x['status'], x['status'])
-        # W formularzu pokazujemy tylko zamówienia, które nie trafiły jeszcze
-        # do harmonogramu ani nie mają przypisanego aktywnego transportu.
+        # Zamówienie pozostaje dostępne, dopóki ma co najmniej jedno własne WZ
+        # bez przypisanego transportu. Nie ukrywamy całego zamówienia tylko
+        # dlatego, że inne jego WZ zostało już przydzielone.
         orders = c.execute("""SELECT o.id,o.order_no,o.customer_name,COALESCE(o.delivery_date,'') delivery_date,COALESCE(o.delivery_time,'') delivery_time,
             COALESCE((SELECT SUM(oi.qty) FROM order_items oi WHERE oi.order_id=o.id),0) AS total_m3,
             MAX(1, CAST((COALESCE((SELECT SUM(oi.qty) FROM order_items oi WHERE oi.order_id=o.id),0)+7.999999)/8 AS INTEGER)) AS required_trips
@@ -171,23 +172,21 @@ def appointments():
             AND EXISTS (
               SELECT 1 FROM wz_documents w WHERE w.order_id=o.id AND w.deleted_at IS NULL
                 AND w.status NOT IN ('ready_invoice','invoiced','returned','completed')
-                AND (
-                  EXISTS (SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL
-                    AND t.status NOT IN ('returned','closed')
-                    AND NOT EXISTS (SELECT 1 FROM dispatch_appointments a WHERE a.transport_id=t.id AND a.status NOT IN ('departed','cancelled')))
-                  OR COALESCE((SELECT SUM(COALESCE(wi.qty_issued,wi.qty_planned)) FROM wz_items wi WHERE wi.wz_id=w.id),0) >
-                     COALESCE((SELECT SUM(ti.qty) FROM transport_items ti JOIN transports t ON t.id=ti.transport_id
-                       WHERE t.wz_id=w.id AND t.deleted_at IS NULL),0)
-                )
+                AND NOT EXISTS (SELECT 1 FROM transports assigned_transport
+                  WHERE assigned_transport.wz_id=w.id AND assigned_transport.deleted_at IS NULL)
+                AND COALESCE((SELECT SUM(COALESCE(wi.qty_issued,wi.qty_planned))
+                  FROM wz_items wi WHERE wi.wz_id=w.id),0) > 0
             )
           ORDER BY o.id DESC LIMIT 300""").fetchall()
         wzs = c.execute("""SELECT w.id,w.wz_no,o.order_no FROM wz_documents w
           JOIN orders o ON o.id=w.order_id
           WHERE w.deleted_at IS NULL AND w.status NOT IN ('ready_invoice','invoiced','returned','completed')
+            AND NOT EXISTS (SELECT 1 FROM transports assigned_transport
+              WHERE assigned_transport.wz_id=w.id AND assigned_transport.deleted_at IS NULL)
             AND (
               EXISTS (SELECT 1 FROM transports t WHERE t.wz_id=w.id AND t.deleted_at IS NULL
                 AND t.status NOT IN ('returned','closed')
-                AND NOT EXISTS (SELECT 1 FROM dispatch_appointments a WHERE a.transport_id=t.id AND a.status NOT IN ('departed','cancelled')))
+                AND NOT EXISTS (SELECT 1 FROM dispatch_appointments a WHERE a.transport_id=t.id AND a.status<>'cancelled'))
               OR COALESCE((SELECT SUM(COALESCE(wi.qty_issued,wi.qty_planned)) FROM wz_items wi WHERE wi.wz_id=w.id),0) >
                  COALESCE((SELECT SUM(ti.qty) FROM transport_items ti JOIN transports t ON t.id=ti.transport_id
                    WHERE t.wz_id=w.id AND t.deleted_at IS NULL),0)
@@ -196,7 +195,7 @@ def appointments():
         transports = c.execute("""SELECT t.id,t.transport_no,t.wz_id,w.wz_no,o.order_no
           FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id
           WHERE t.deleted_at IS NULL AND t.status NOT IN ('returned','closed')
-            AND NOT EXISTS (SELECT 1 FROM dispatch_appointments a WHERE a.transport_id=t.id AND a.status NOT IN ('departed','cancelled'))
+            AND NOT EXISTS (SELECT 1 FROM dispatch_appointments a WHERE a.transport_id=t.id AND a.status<>'cancelled')
           ORDER BY t.id DESC LIMIT 300""").fetchall()
         drivers = c.execute("SELECT id,name FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name").fetchall()
         vehicles = c.execute("SELECT id,registration_no FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no").fetchall()
