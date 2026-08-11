@@ -372,6 +372,11 @@ def wz_print(wz_id):
         items=c.execute('''SELECT COALESCE(p.name, wi.sku) AS sku, wi.qty_planned, wi.qty_issued
             FROM wz_items wi LEFT JOIN products p ON p.id=wi.product_id
             WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()
+        courses=c.execute('''SELECT t.transport_no,t.created_at,d.name driver_name,v.registration_no,
+              COALESCE((SELECT SUM(ti.qty) FROM transport_items ti WHERE ti.transport_id=t.id),0) qty
+            FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id
+            WHERE t.wz_id=? AND t.deleted_at IS NULL ORDER BY t.id''',(wz_id,)).fetchall()
+    return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{w.wz_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}table{border-collapse:collapse;width:100%;margin:22px 0}th,td{border:1px solid #333;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.sign{border-top:1px solid #111;padding-top:7px;text-align:center;margin-top:70px;width:40%}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Wydanie zewnętrzne {{w.wz_no}}</h1><p>WZ zbiorcza — obejmuje wszystkie kursy dla tego zamówienia.</p><div class="grid"><div><b>Odbiorca</b><br>{{w.customer_name}}<br>{{w.customer_address or ''}}</div><div><b>Adres dostawy</b><br>{{w.destination or '—'}}<br><br><b>Miejsce wydania</b><br>{{w.issue_location}} → {{w.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Łączna ilość [m³]</th></tr></thead><tbody>{% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td></tr>{% endfor %}</tbody></table><h2>Kursy składające się na wydanie</h2><table><thead><tr><th>Transport / WZ kursu</th><th>Kierowca / auto</th><th>Ilość [m³]</th><th>Data utworzenia</th></tr></thead><tbody>{% for x in courses %}<tr><td>{{x.transport_no}}</td><td>{{x.driver_name}} · {{x.registration_no}}</td><td>{{x.qty}}</td><td>{{x.created_at[:16]}}</td></tr>{% else %}<tr><td colspan="4">Brak przydzielonych kursów.</td></tr>{% endfor %}</tbody></table><div class="sign">Odbiorca — podpis i pieczęć na WZ zbiorczej</div></html>''',w=w,items=items,courses=courses)
     return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>{{w.wz_no}}</title><style>body{font:14px Arial,sans-serif;max-width:900px;margin:35px auto;color:#111}h1{margin-bottom:4px}table{border-collapse:collapse;width:100%;margin:22px 0}th,td{border:1px solid #333;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.sign{display:grid;grid-template-columns:1fr 1fr;gap:70px;margin-top:70px}.line{border-top:1px solid #111;padding-top:7px;text-align:center}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>Wydanie zewnętrzne {{w.wz_no}}</h1><p>Data: {{w.created_at[:10]}} · Status: {{w.status}}</p><div class="grid"><div><b>Zamawiający / odbiorca</b><br>{{w.customer_name}}<br>{{w.customer_address or ''}}</div><div><b>Miejsce wydania</b><br>{{w.issue_location}} → {{w.warehouse_location}}<br><br><b>Adres dostawy</b><br>{{w.destination or '—'}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość [m³]</th></tr></thead><tbody>{% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td></tr>{% endfor %}</tbody></table><p>Uwagi: {{w.notes or '—'}}</p><div class="sign"><div class="line">Wydał: {{w.issued_by or ''}}</div><div class="line">Odebrał / podpis i pieczęć</div></div></html>''',w=w,items=items)
 
 @bp.post('/wz/<int:wz_id>/issue')
@@ -505,6 +510,12 @@ def transports():
           WHERE t.deleted_at IS NULL ORDER BY t.id DESC''').fetchall()
     return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Transporty</h1><a class="btn primary right" href="{{url_for('beton.wz_list')}}">Wybierz wydane WZ</a></div><div class="card"><table><thead><tr><th>Transport</th><th>WZ</th><th>Klient</th><th>Kierowca / auto</th><th>Status</th><th>Faktura</th></tr></thead><tbody>{% for x in rows %}<tr><td><a href="{{url_for('beton.transport_view',transport_id=x.id)}}"><b>{{x.transport_no}}</b></a></td><td><a href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a></td><td>{{x.customer_name}}</td><td>{{x.driver_name}}<br>{{x.registration_no}}</td><td><span class="badge">{{x.status}}</span></td><td>{{x.invoice_no or '—'}}</td></tr>{% else %}<tr><td colspan="6">Brak transportów.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',rows=rows,title='Transporty',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
+TRANSPORT_NEW_TPL = '''{% extends "base.html" %}{% block content %}
+<h1>Podziel WZ na transporty</h1>
+<div class="card"><form method="get"><label>Wydane WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>
+{% if request.args.get('created') %}<div class="notice">Kurs został utworzony. <a href="{{url_for('beton.transport_course_print',transport_id=request.args.get('created_transport'))}}" target="_blank">Drukuj WZ tego kursu</a>. Pozostałą ilość możesz przydzielić do kolejnego transportu.</div>{% endif %}
+{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div><div><label>Ilość na ten transport [m³]</label><input type="number" name="transport_qty" min="0.01" max="8" step="0.01" value="{{[remaining_total,8]|min}}" required></div></div><label>Adres dostawy</label><input name="destination" value="{{wz.destination or ''}}" required><p class="muted">Wpisz faktyczną ilość dla tej gruszki. Maksimum 8 m³; pozostała ilość zostanie na następne kursy.</p><table><thead><tr><th>Produkt</th><th>Na WZ [m³]</th><th>Przydzielono [m³]</th><th>Pozostało [m³]</th></tr></thead><tbody>{% for x in wz_items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td><td>{{x.assigned_qty}}</td><td>{{x.remaining_qty}}</td></tr>{% endfor %}</tbody></table><p><b>Pozostało łącznie: {{remaining_total}} m³.</b></p>{% if allocation_plan %}<button class="btn primary">Utwórz transport i WZ kursu</button>{% else %}<span class="badge">Cała ilość została już przydzielona.</span>{% endif %}</form>{% endif %}{% endblock %}'''
+
 @bp.route('/transports/new',methods=['GET','POST'])
 def transport_new():
     wz_id=int(request.values.get('wz_id') or 0)
@@ -536,6 +547,25 @@ def transport_new():
             if not ds or not vs:raise ValueError('Najpierw dodaj kierowcę i pojazd')
             if not allocation_plan:
                 return 'Cała ilość z WZ jest już przydzielona do transportów.',409
+            try:
+                requested_qty=float((request.form.get('transport_qty') or '').replace(',','.'))
+            except ValueError:
+                requested_qty=0
+            if requested_qty <= 0:
+                return 'Podaj ilość betonu dla tego transportu w m³.', 400
+            if requested_qty > capacity:
+                return 'Jedna gruszka może zabrać maksymalnie 8 m³.', 400
+            if requested_qty > remaining_total + 0.00001:
+                return f'Pozostało tylko {remaining_total:g} m³ do przydzielenia.', 400
+            allocation_plan=[]
+            left=requested_qty
+            for item in wz_items:
+                if left <= 0.00001:
+                    break
+                qty=min(float(item['remaining_qty']), left)
+                if qty > 0.00001:
+                    allocation_plan.append((item,qty))
+                    left-=qty
             destination=request.form.get('destination','').strip() or (wz['destination'] or '').strip() or (wz['order_delivery_address'] or '').strip() or (wz['customer_address'] or '').strip()
             s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],destination,actor(),actor(),s,s));
             for item,qty in allocation_plan:c.execute('INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)',(cloud_id(),tid,item['id'],qty,s))
@@ -544,8 +574,25 @@ def transport_new():
             D['sync_local_rows_to_supabase']('transports','id',[tid])
             transport_item_ids=[x['id'] for x in c.execute('SELECT id FROM transport_items WHERE transport_id=?',(tid,)).fetchall()]
             D['sync_local_rows_to_supabase']('transport_items','id',transport_item_ids)
-            return redirect(url_for('beton.transport_new',wz_id=wz_id,created=1))
+            return redirect(url_for('beton.transport_new',wz_id=wz_id,created=1,created_transport=tid))
+    # Nowy, prosty formularz zastępuje dawny automatyczny podział po 8 m³.
+    return render_template_string(TRANSPORT_NEW_TPL,wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,allocation_plan=allocation_plan,allocation_by_item=allocation_by_item,remaining_total=remaining_total,capacity=capacity,capacity_left=capacity_left,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
     return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Przydziel transporty z dokumentu WZ</h1><div class="card"><form method="get"><label>Wydane WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>{% if request.args.get('created') %}<div class="notice">Transport został przydzielony. Jeśli pozostała ilość, przydziel kolejny kurs.</div>{% endif %}{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div></div><label>Adres dostawy</label><input name="destination" value="{{wz.destination or ''}}" required><p class="muted">Gruszka zabiera maksymalnie 8 m³. System sam przygotuje najbliższy kurs, a następnie pokaże pozostałą ilość do przydzielenia.</p><table><thead><tr><th>Produkt</th><th>WZ [m³]</th><th>Już przydzielono [m³]</th><th>Ten transport [m³]</th></tr></thead><tbody>{% for x in wz_items %}{% set planned=x.qty_issued if x.qty_issued is not none else x.qty_planned %}<tr><td>{{x.sku}}</td><td>{{planned}}</td><td>{{x.assigned_qty}}</td><td>{{allocation_by_item.get(x.id, '—')}}</td></tr>{% endfor %}</tbody></table><p><b>Pozostało do rozdzielenia: {{remaining_total}} m³.</b> Ten kurs: <b>{{capacity - capacity_left}} m³</b>.</p>{% if allocation_plan %}<button class="btn primary">Utwórz i przypisz transport (maks. 8 m³)</button>{% else %}<span class="badge">Cała ilość została już przydzielona do transportów.</span>{% endif %}</form>{% endif %}{% endblock %}''',wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,allocation_plan=allocation_plan,allocation_by_item=allocation_by_item,remaining_total=remaining_total,capacity=capacity,capacity_left=capacity_left,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+
+@bp.get('/transports/<int:transport_id>/wz-print')
+def transport_course_print(transport_id):
+    """Druk pojedynczego kursu; końcowa WZ pozostaje dokumentem zbiorczym."""
+    with D['conn']() as c:
+        transport=c.execute('''SELECT t.transport_no,t.created_at,t.destination,w.wz_no,w.issue_location,w.warehouse_location,
+              o.customer_name,o.customer_address,d.name driver_name,v.registration_no
+            FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id
+            JOIN drivers d ON d.id=t.driver_id JOIN vehicles v ON v.id=t.vehicle_id
+            WHERE t.id=? AND t.deleted_at IS NULL''',(transport_id,)).fetchone()
+        if not transport: abort(404)
+        items=c.execute('''SELECT COALESCE(p.name,wi.sku) product,ti.qty
+            FROM transport_items ti JOIN wz_items wi ON wi.id=ti.wz_item_id
+            LEFT JOIN products p ON p.id=wi.product_id WHERE ti.transport_id=? ORDER BY ti.id''',(transport_id,)).fetchall()
+    return render_template_string('''<!doctype html><html lang="pl"><meta charset="utf-8"><title>WZ kursu {{t.transport_no}}</title><style>body{font:14px Arial;max-width:900px;margin:35px auto}table{border-collapse:collapse;width:100%;margin:22px 0}td,th{border:1px solid #222;padding:9px;text-align:left}.grid{display:grid;grid-template-columns:1fr 1fr;gap:25px}.sign{margin-top:60px;border-top:1px solid #111;padding-top:8px;width:40%;text-align:center}@media print{button{display:none}}</style><button onclick="print()">Drukuj</button><h1>WZ cząstkowa / kurs {{t.transport_no}}</h1><p>Dokument do WZ zbiorczej: <b>{{t.wz_no}}</b></p><div class="grid"><div><b>Odbiorca</b><br>{{t.customer_name}}<br>{{t.customer_address or ''}}<br><br><b>Adres dostawy</b><br>{{t.destination or '—'}}</div><div><b>Kierowca / auto</b><br>{{t.driver_name}} · {{t.registration_no}}<br><br><b>Miejsce wydania</b><br>{{t.issue_location}} → {{t.warehouse_location}}</div></div><table><thead><tr><th>Produkt</th><th>Ilość [m³]</th></tr></thead><tbody>{% for i in items %}<tr><td>{{i.product}}</td><td>{{i.qty}}</td></tr>{% endfor %}</tbody></table><div class="sign">Podpis odbiorcy dla kursu</div></html>''',t=transport,items=items)
 
 @bp.get('/transports/<int:transport_id>')
 def transport_view(transport_id):
