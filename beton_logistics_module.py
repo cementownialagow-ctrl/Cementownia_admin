@@ -600,11 +600,8 @@ def driver_transport_status_api(transport_id):
 
 @driver_api.get('/transports/<int:transport_id>/invoice')
 def driver_invoice_api(transport_id):
-    driver_id=current_driver_id()
-    if not driver_id:abort(403)
-    with D['conn']() as c: row=c.execute('SELECT w.invoice_id FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,driver_id)).fetchone()
-    if not row or not row['invoice_id']:abort(404)
-    return current_app.view_functions['invoice_download_admin'](row['invoice_id'])
+    # Faktury są dokumentami księgowymi dostępnymi wyłącznie w panelu głównym.
+    return jsonify(ok=False,error='Faktury nie są dostępne w panelu kierowcy.'),403
 
 @driver_api.post('/transports/<int:transport_id>/photos')
 def driver_delivery_photo_api(transport_id):
@@ -622,7 +619,7 @@ def driver_delivery_photo_api(transport_id):
         row=c.execute('SELECT t.id,t.status FROM transports t JOIN drivers d ON d.id=t.driver_id WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL',(transport_id,driver_id)).fetchone()
     if not row:
         return jsonify(ok=False,error='Brak dostępu do transportu.'),403
-    if row['status'] not in {'delivered','returned'}:
+    if row['status'] != 'delivered':
         return jsonify(ok=False,error='Zdjęcie podpisanego WZ można dodać po potwierdzeniu etapu „WZ podpisane”.'),409
     ext={'image/jpeg':'jpg','image/png':'png','image/webp':'webp'}[photo.mimetype]
     object_path=f"{g.client_user['id']}/{transport_id}/{int(time.time()*1000)}-{os.urandom(4).hex()}.{ext}"
