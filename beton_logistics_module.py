@@ -522,7 +522,7 @@ def transport_new():
     with D['conn']() as c:
         wz_rows=c.execute("""SELECT w.id,w.wz_no,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.status IN ('issued','in_transport') AND w.deleted_at IS NULL ORDER BY w.id DESC""").fetchall()
         ds=c.execute('SELECT * FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name').fetchall(); vs=c.execute('SELECT * FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no').fetchall()
-        wz=c.execute("SELECT w.*,o.customer_name,o.note AS order_delivery_address,o.customer_address FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status IN ('issued','in_transport')",(wz_id,)).fetchone() if wz_id else None
+        wz=c.execute("SELECT w.*,o.customer_name,o.note AS order_delivery_address,o.customer_address,o.delivery_date,o.delivery_time FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status IN ('issued','in_transport')",(wz_id,)).fetchone() if wz_id else None
         wz_items=[dict(row) for row in c.execute('''SELECT wi.*,COALESCE((SELECT SUM(ti.qty) FROM transport_items ti
               JOIN transports t ON t.id=ti.transport_id WHERE ti.wz_item_id=wi.id AND t.deleted_at IS NULL),0) AS assigned_qty
               FROM wz_items wi WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()] if wz else []
@@ -557,6 +557,12 @@ def transport_new():
                 return 'Jedna gruszka może zabrać maksymalnie 8 m³.', 400
             if requested_qty > remaining_total + 0.00001:
                 return f'Pozostało tylko {remaining_total:g} m³ do przydzielenia.', 400
+            planned_departure_time=request.form.get('planned_departure_time','').strip()
+            if not planned_departure_time:
+                return 'Podaj godzinę wyjazdu dla tego transportu.', 400
+            planned_date=(wz.get('delivery_date') or '').strip()
+            if not planned_date:
+                return 'W zamówieniu brakuje terminu realizacji. Uzupełnij go przed przydzieleniem transportu.', 400
             allocation_plan=[]
             left=requested_qty
             for item in wz_items:
@@ -569,14 +575,25 @@ def transport_new():
             destination=request.form.get('destination','').strip() or (wz['destination'] or '').strip() or (wz['order_delivery_address'] or '').strip() or (wz['customer_address'] or '').strip()
             s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],destination,actor(),actor(),s,s));
             for item,qty in allocation_plan:c.execute('INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)',(cloud_id(),tid,item['id'],qty,s))
+            appointment_id=cloud_id()
+            appointment_no=f"AW/{s[:4]}/{c.execute('SELECT COUNT(*) FROM dispatch_appointments WHERE appointment_no LIKE ?',(f'AW/{s[:4]}/%',)).fetchone()[0]+1:05d}"
+            position=c.execute('SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?',(planned_date,)).fetchone()[0]
+            c.execute('''INSERT INTO dispatch_appointments(id,appointment_no,order_id,wz_id,transport_id,driver_id,vehicle_id,planned_date,time_from,time_to,queue_position,status,notes,created_by,updated_by,created_at,updated_at)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,?,?,?)''',(appointment_id,appointment_no,wz['order_id'],wz_id,tid,request.form['driver_id'],request.form['vehicle_id'],planned_date,planned_departure_time,None,position,'',actor(),actor(),s,s))
             c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'create','transport',tid,'{}',s))
             c.commit()
             D['sync_local_rows_to_supabase']('transports','id',[tid])
             transport_item_ids=[x['id'] for x in c.execute('SELECT id FROM transport_items WHERE transport_id=?',(tid,)).fetchall()]
             D['sync_local_rows_to_supabase']('transport_items','id',transport_item_ids)
+            D['sync_local_rows_to_supabase']('dispatch_appointments','id',[appointment_id])
             return redirect(url_for('beton.transport_new',wz_id=wz_id,created=1,created_transport=tid))
     # Nowy, prosty formularz zastępuje dawny automatyczny podział po 8 m³.
-    return render_template_string(TRANSPORT_NEW_TPL,wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,allocation_plan=allocation_plan,allocation_by_item=allocation_by_item,remaining_total=remaining_total,capacity=capacity,capacity_left=capacity_left,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+    transport_tpl=TRANSPORT_NEW_TPL.replace(
+        '<label>Adres dostawy</label>',
+        '<div class="row"><div><label>Data dostawy</label><input value="{{wz.delivery_date or \'Brak terminu w zamówieniu\'}}" readonly></div><div><label>Godzina wyjazdu</label><input type="time" name="planned_departure_time" value="{{wz.delivery_time or \'\'}}" required></div></div><label>Adres dostawy</label>',
+        1,
+    )
+    return render_template_string(transport_tpl,wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,allocation_plan=allocation_plan,allocation_by_item=allocation_by_item,remaining_total=remaining_total,capacity=capacity,capacity_left=capacity_left,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
     return render_template_string('''{% extends "base.html" %}{% block content %}<h1>Przydziel transporty z dokumentu WZ</h1><div class="card"><form method="get"><label>Wydane WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>{% if request.args.get('created') %}<div class="notice">Transport został przydzielony. Jeśli pozostała ilość, przydziel kolejny kurs.</div>{% endif %}{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div></div><label>Adres dostawy</label><input name="destination" value="{{wz.destination or ''}}" required><p class="muted">Gruszka zabiera maksymalnie 8 m³. System sam przygotuje najbliższy kurs, a następnie pokaże pozostałą ilość do przydzielenia.</p><table><thead><tr><th>Produkt</th><th>WZ [m³]</th><th>Już przydzielono [m³]</th><th>Ten transport [m³]</th></tr></thead><tbody>{% for x in wz_items %}{% set planned=x.qty_issued if x.qty_issued is not none else x.qty_planned %}<tr><td>{{x.sku}}</td><td>{{planned}}</td><td>{{x.assigned_qty}}</td><td>{{allocation_by_item.get(x.id, '—')}}</td></tr>{% endfor %}</tbody></table><p><b>Pozostało do rozdzielenia: {{remaining_total}} m³.</b> Ten kurs: <b>{{capacity - capacity_left}} m³</b>.</p>{% if allocation_plan %}<button class="btn primary">Utwórz i przypisz transport (maks. 8 m³)</button>{% else %}<span class="badge">Cała ilość została już przydzielona do transportów.</span>{% endif %}</form>{% endif %}{% endblock %}''',wz_rows=wz_rows,wz_id=wz_id,wz=wz,wz_items=wz_items,allocation_plan=allocation_plan,allocation_by_item=allocation_by_item,remaining_total=remaining_total,capacity=capacity,capacity_left=capacity_left,ds=ds,vs=vs,base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
 @bp.get('/transports/<int:transport_id>/wz-print')
