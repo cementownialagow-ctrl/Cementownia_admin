@@ -955,50 +955,6 @@ def transport_new():
             planned_date=(wz.get('delivery_date') or '').strip()
             if not planned_date:
                 return 'W zamówieniu brakuje terminu realizacji. Uzupełnij go przed przydzieleniem transportu.', 400
-
-            # Ten sam kierowca ani ten sam pojazd nie mogą dostać dwóch
-            # nakładających się kursów. Stosujemy tę samą 2-godzinną regułę,
-            # która obowiązuje w module awizacji. Dotyczy to również kursów
-            # dzielących jedno WZ/zamówienie.
-            try:
-                planned_departure = datetime.fromisoformat(f"{planned_date}T{planned_departure_time}")
-            except ValueError:
-                return 'Podaj prawidłową datę i godzinę wyjazdu.', 400
-            driver_id=int(request.form.get('driver_id') or 0)
-            vehicle_id=int(request.form.get('vehicle_id') or 0)
-            if not driver_id or not vehicle_id:
-                return 'Wybierz kierowcę i pojazd.', 400
-
-            driver_conflicts=c.execute("""SELECT a.planned_date,a.time_from,a.appointment_no
-                FROM dispatch_appointments a
-                LEFT JOIN transports t ON t.id=a.transport_id
-                WHERE a.driver_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
-                  AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')""",
-                (driver_id,)).fetchall()
-            for conflict in driver_conflicts:
-                try:
-                    other_departure=datetime.fromisoformat(f"{conflict['planned_date']}T{conflict['time_from']}")
-                except (TypeError,ValueError):
-                    continue
-                if abs((planned_departure-other_departure).total_seconds()) < 2*60*60:
-                    return (f"Kierowca ma już zaplanowany kurs {conflict['appointment_no']} o {conflict['time_from']}. "
-                            "Między planowanymi wyjazdami muszą być co najmniej 2 godziny.",409)
-
-            vehicle_conflicts=c.execute("""SELECT a.planned_date,a.time_from,a.appointment_no
-                FROM dispatch_appointments a
-                LEFT JOIN transports t ON t.id=a.transport_id
-                WHERE a.vehicle_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
-                  AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')""",
-                (vehicle_id,)).fetchall()
-            for conflict in vehicle_conflicts:
-                try:
-                    other_departure=datetime.fromisoformat(f"{conflict['planned_date']}T{conflict['time_from']}")
-                except (TypeError,ValueError):
-                    continue
-                if abs((planned_departure-other_departure).total_seconds()) < 2*60*60:
-                    return (f"Pojazd ma już zaplanowany kurs {conflict['appointment_no']} o {conflict['time_from']}. "
-                            "Między planowanymi wyjazdami tego samego auta muszą być co najmniej 2 godziny.",409)
-
             allocation_plan=[]
             left=requested_qty
             for item in wz_items:
@@ -1009,13 +965,13 @@ def transport_new():
                     allocation_plan.append((item,qty))
                     left-=qty
             destination=request.form.get('destination','').strip() or (wz['destination'] or '').strip() or (wz['order_delivery_address'] or '').strip() or (wz['customer_address'] or '').strip()
-            s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,driver_id,vehicle_id,destination,actor(),actor(),s,s));
+            s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],destination,actor(),actor(),s,s));
             for item,qty in allocation_plan:c.execute('INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)',(cloud_id(),tid,item['id'],qty,s))
             appointment_id=cloud_id()
             appointment_no=f"AW/{s[:4]}/{c.execute('SELECT COUNT(*) FROM dispatch_appointments WHERE appointment_no LIKE ?',(f'AW/{s[:4]}/%',)).fetchone()[0]+1:05d}"
             position=c.execute('SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?',(planned_date,)).fetchone()[0]
             c.execute('''INSERT INTO dispatch_appointments(id,appointment_no,order_id,wz_id,transport_id,driver_id,vehicle_id,planned_date,time_from,time_to,queue_position,status,notes,created_by,updated_by,created_at,updated_at)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,?,?,?)''',(appointment_id,appointment_no,wz['order_id'],wz_id,tid,driver_id,vehicle_id,planned_date,planned_departure_time,None,position,'',actor(),actor(),s,s))
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,?,?,?)''',(appointment_id,appointment_no,wz['order_id'],wz_id,tid,request.form['driver_id'],request.form['vehicle_id'],planned_date,planned_departure_time,None,position,'',actor(),actor(),s,s))
             c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'create','transport',tid,'{}',s))
             c.commit()
             D['sync_local_rows_to_supabase']('transports','id',[tid])
