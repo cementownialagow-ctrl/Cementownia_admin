@@ -171,9 +171,7 @@ def snapshot_wz_technology(c, wz_id, created_by, created_at):
 def issue_recipe_materials(c, wz_id, issued_by, issued_at):
     """Book one idempotent raw-material issue for a WZ."""
     if c.execute("SELECT 1 FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue' LIMIT 1",(wz_id,)).fetchone():
-        # Bezpieczne ponowienie po zerwanym przekierowaniu lub synchronizacji.
-        # Stan magazynu został już pomniejszony, więc niczego nie księgujemy drugi raz.
-        return
+        raise ValueError('Materiały dla tego WZ zostały już rozchodowane.')
     # Snapshot oglądany na roboczym WZ jest tylko podglądem. Wydanie zawsze
     # zamraża recepturę ponownie, według wersji obowiązującej w tej chwili.
     c.execute('DELETE FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,))
@@ -736,12 +734,8 @@ def wz_print(wz_id):
 def wz_issue(wz_id):
     s=stamp()
     with D['conn']() as c:
-        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND deleted_at IS NULL",(wz_id,)).fetchone()
-        if not w:abort(404)
-        if w['status'] in ('issued','in_transport'):
-            return redirect(url_for('beton.transport_new',wz_id=wz_id))
-        if w['status']!='created':
-            return 'Tego dokumentu WZ nie można już przygotować do transportu.',409
+        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status='created'",(wz_id,)).fetchone()
+        if not w:abort(409)
         try:
             c.execute('UPDATE wz_items SET qty_issued=qty_planned WHERE wz_id=?',(wz_id,))
             issue_recipe_materials(c,wz_id,actor(),s)
@@ -749,19 +743,16 @@ def wz_issue(wz_id):
         except ValueError as exc:
             c.rollback()
             return str(exc),409
+    D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
     with D['conn']() as c:
         item_ids=[x['id'] for x in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
         snapshot_ids=[x['id'] for x in c.execute('SELECT id FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,)).fetchall()]
         material_ids=[x['material_id'] for x in c.execute("SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue'",(wz_id,)).fetchall()]
         movement_ids=[x['id'] for x in c.execute("SELECT id FROM raw_material_movements WHERE wz_id=?",(wz_id,)).fetchall()]
-    try:
-        D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
-        D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
-        D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
-        D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
-        D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
-    except Exception:
-        current_app.logger.exception('Nie udało się zsynchronizować wydania WZ %s; operacja lokalna została zachowana',wz_id)
+    D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
+    D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
+    D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
+    D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
     # Po zatwierdzeniu WZ od razu przechodzimy do jedynego następnego kroku:
     # wyboru kierowcy, auta i ilości kursu.
     return redirect(url_for('beton.transport_new',wz_id=wz_id))
@@ -964,6 +955,50 @@ def transport_new():
             planned_date=(wz.get('delivery_date') or '').strip()
             if not planned_date:
                 return 'W zamówieniu brakuje terminu realizacji. Uzupełnij go przed przydzieleniem transportu.', 400
+
+            # Ten sam kierowca ani ten sam pojazd nie mogą dostać dwóch
+            # nakładających się kursów. Stosujemy tę samą 2-godzinną regułę,
+            # która obowiązuje w module awizacji. Dotyczy to również kursów
+            # dzielących jedno WZ/zamówienie.
+            try:
+                planned_departure = datetime.fromisoformat(f"{planned_date}T{planned_departure_time}")
+            except ValueError:
+                return 'Podaj prawidłową datę i godzinę wyjazdu.', 400
+            driver_id=int(request.form.get('driver_id') or 0)
+            vehicle_id=int(request.form.get('vehicle_id') or 0)
+            if not driver_id or not vehicle_id:
+                return 'Wybierz kierowcę i pojazd.', 400
+
+            driver_conflicts=c.execute("""SELECT a.planned_date,a.time_from,a.appointment_no
+                FROM dispatch_appointments a
+                LEFT JOIN transports t ON t.id=a.transport_id
+                WHERE a.driver_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
+                  AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')""",
+                (driver_id,)).fetchall()
+            for conflict in driver_conflicts:
+                try:
+                    other_departure=datetime.fromisoformat(f"{conflict['planned_date']}T{conflict['time_from']}")
+                except (TypeError,ValueError):
+                    continue
+                if abs((planned_departure-other_departure).total_seconds()) < 2*60*60:
+                    return (f"Kierowca ma już zaplanowany kurs {conflict['appointment_no']} o {conflict['time_from']}. "
+                            "Między planowanymi wyjazdami muszą być co najmniej 2 godziny.",409)
+
+            vehicle_conflicts=c.execute("""SELECT a.planned_date,a.time_from,a.appointment_no
+                FROM dispatch_appointments a
+                LEFT JOIN transports t ON t.id=a.transport_id
+                WHERE a.vehicle_id=? AND a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
+                  AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')""",
+                (vehicle_id,)).fetchall()
+            for conflict in vehicle_conflicts:
+                try:
+                    other_departure=datetime.fromisoformat(f"{conflict['planned_date']}T{conflict['time_from']}")
+                except (TypeError,ValueError):
+                    continue
+                if abs((planned_departure-other_departure).total_seconds()) < 2*60*60:
+                    return (f"Pojazd ma już zaplanowany kurs {conflict['appointment_no']} o {conflict['time_from']}. "
+                            "Między planowanymi wyjazdami tego samego auta muszą być co najmniej 2 godziny.",409)
+
             allocation_plan=[]
             left=requested_qty
             for item in wz_items:
@@ -974,13 +1009,13 @@ def transport_new():
                     allocation_plan.append((item,qty))
                     left-=qty
             destination=request.form.get('destination','').strip() or (wz['destination'] or '').strip() or (wz['order_delivery_address'] or '').strip() or (wz['customer_address'] or '').strip()
-            s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,request.form['driver_id'],request.form['vehicle_id'],destination,actor(),actor(),s,s));
+            s=stamp(); tid=cloud_id(); cur=c.execute("INSERT INTO transports(id,transport_no,wz_id,driver_id,vehicle_id,destination,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'assigned',?,?,?,?)",(tid,next_no(c),wz_id,driver_id,vehicle_id,destination,actor(),actor(),s,s));
             for item,qty in allocation_plan:c.execute('INSERT INTO transport_items(id,transport_id,wz_item_id,qty,created_at) VALUES(?,?,?,?,?)',(cloud_id(),tid,item['id'],qty,s))
             appointment_id=cloud_id()
             appointment_no=f"AW/{s[:4]}/{c.execute('SELECT COUNT(*) FROM dispatch_appointments WHERE appointment_no LIKE ?',(f'AW/{s[:4]}/%',)).fetchone()[0]+1:05d}"
             position=c.execute('SELECT COALESCE(MAX(queue_position),0)+1 FROM dispatch_appointments WHERE planned_date=?',(planned_date,)).fetchone()[0]
             c.execute('''INSERT INTO dispatch_appointments(id,appointment_no,order_id,wz_id,transport_id,driver_id,vehicle_id,planned_date,time_from,time_to,queue_position,status,notes,created_by,updated_by,created_at,updated_at)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,?,?,?)''',(appointment_id,appointment_no,wz['order_id'],wz_id,tid,request.form['driver_id'],request.form['vehicle_id'],planned_date,planned_departure_time,None,position,'',actor(),actor(),s,s))
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,'waiting',?,?,?,?,?)''',(appointment_id,appointment_no,wz['order_id'],wz_id,tid,driver_id,vehicle_id,planned_date,planned_departure_time,None,position,'',actor(),actor(),s,s))
             c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'create','transport',tid,'{}',s))
             c.commit()
             D['sync_local_rows_to_supabase']('transports','id',[tid])
