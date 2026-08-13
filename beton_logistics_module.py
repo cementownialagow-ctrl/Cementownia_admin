@@ -1201,6 +1201,7 @@ def driver_transports_api():
     driver_id=current_driver_id()
     if not driver_id:
         return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
+    today=stamp()[:10]
     with D['conn']() as c:
         rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no,
           EXISTS(SELECT 1 FROM delivery_photos dp WHERE dp.transport_id=t.id AND dp.deleted_at IS NULL) AS has_signed_wz_photo,
@@ -1210,7 +1211,11 @@ def driver_transports_api():
           (SELECT a.time_from FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) planned_departure_time,
           (SELECT a.time_to FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) planned_delivery_time,
           (SELECT b.code FROM dispatch_appointments a LEFT JOIN loading_bays b ON b.id=a.loading_bay_id WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) loading_bay
-          FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id WHERE t.driver_id=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL ORDER BY t.id DESC''',(driver_id,)).fetchall()
+          FROM transports t JOIN drivers d ON d.id=t.driver_id JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id JOIN vehicles v ON v.id=t.vehicle_id
+          WHERE t.driver_id=? AND d.active=1 AND d.deleted_at IS NULL AND t.deleted_at IS NULL
+            AND t.status!='returned'
+            AND (SELECT a.planned_date FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1)=?
+          ORDER BY planned_departure_time,t.id''',(driver_id,today)).fetchall()
         result=[]
         for r in rows:
             x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['can_start']=x.get('status')=='issued' and x.get('plant_status')=='ready_to_leave'; x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
@@ -1233,9 +1238,17 @@ def driver_transport_status_api(transport_id):
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
         transitions={'assigned':{'problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','closed','problem'},'closed':{'delivered','returned','problem'},'delivered':{'returned','problem'},'problem':{'in_transit','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
-        # Etapy są dostępne natychmiast po wykonaniu poprzedniej czynności.
-        # Bezpieczeństwo zapewniają dozwolone przejścia stanu i atomowa aktualizacja,
-        # a nie sztuczny licznik czasu blokujący pracę kierowcy.
+        # Minimalny czas dotyczy wyłącznie realnego przejazdu. Podpisanie WZ
+        # po przyjeździe jest dostępne od razu.
+        wait_from = row['departed_at'] if status=='closed' else row['delivered_at'] if status=='returned' else None
+        if wait_from:
+            try:
+                elapsed=(datetime.strptime(stamp(),'%Y-%m-%d %H:%M:%S')-datetime.strptime(wait_from,'%Y-%m-%d %H:%M:%S')).total_seconds()
+                if 0 <= elapsed < 600:
+                    remaining=max(1,int((600-elapsed+59)//60))
+                    return jsonify(ok=False,error=f'Ten etap będzie dostępny za około {remaining} min.'),429
+            except (TypeError,ValueError):
+                pass
         appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
         if status=='in_transit' and (not appointment or appointment['status']!='ready_to_leave'):
             return jsonify(ok=False,error='Dyspozytor musi najpierw oznaczyć transport jako gotowy do wyjazdu.'),409
