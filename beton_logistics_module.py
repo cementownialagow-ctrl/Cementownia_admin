@@ -5,7 +5,7 @@ import json
 import secrets
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Blueprint, abort, current_app, g, jsonify, redirect, render_template_string, request, send_file, session, url_for
 from reportlab.lib.pagesizes import A4
@@ -137,6 +137,29 @@ def next_wz_no(c):
     year=stamp()[:4]; n=next_document_sequence(c,f'wz:{year}','wz_documents','wz_no',f'WZ/{year}/')
     return f'WZ/{year}/{n:05d}'
 
+def transport_resource_conflict(c, driver_id, vehicle_id, planned_date, planned_departure_time):
+    """Return a Polish conflict message when a driver or vehicle is booked within 2 hours."""
+    planned_departure=datetime.fromisoformat(f"{planned_date}T{planned_departure_time}")
+    conflicts=c.execute('''SELECT a.driver_id,a.vehicle_id,a.planned_date,a.time_from,o.order_no
+        FROM dispatch_appointments a
+        JOIN orders o ON o.id=a.order_id
+        LEFT JOIN transports t ON t.id=a.transport_id
+        WHERE a.status<>'cancelled' AND COALESCE(a.time_from,'')<>''
+          AND (a.driver_id=? OR a.vehicle_id=?)
+          AND COALESCE(t.status,'assigned') NOT IN ('returned','cancelled')''',(driver_id,vehicle_id)).fetchall()
+    for conflict in conflicts:
+        try:
+            other_departure=datetime.fromisoformat(f"{conflict['planned_date']}T{conflict['time_from']}")
+        except (TypeError,ValueError):
+            continue
+        if abs((planned_departure-other_departure).total_seconds()) >= 2*60*60:
+            continue
+        if int(conflict['driver_id'] or 0)==driver_id:
+            return f"Kierowca ma już kurs {conflict['order_no']} o {conflict['time_from']}. Wymagany odstęp to minimum 2 godziny."
+        if int(conflict['vehicle_id'] or 0)==vehicle_id:
+            return f"Auto ma już kurs {conflict['order_no']} o {conflict['time_from']}. Wymagany odstęp to minimum 2 godziny."
+    return ''
+
 def snapshot_wz_technology(c, wz_id, created_by, created_at):
     """Freeze recipe and material technology for every WZ line exactly once."""
     for wz_item in c.execute('SELECT * FROM wz_items WHERE wz_id=? ORDER BY id',(wz_id,)).fetchall():
@@ -171,7 +194,9 @@ def snapshot_wz_technology(c, wz_id, created_by, created_at):
 def issue_recipe_materials(c, wz_id, issued_by, issued_at):
     """Book one idempotent raw-material issue for a WZ."""
     if c.execute("SELECT 1 FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue' LIMIT 1",(wz_id,)).fetchone():
-        raise ValueError('Materiały dla tego WZ zostały już rozchodowane.')
+        # Bezpieczne ponowienie po zerwanym przekierowaniu lub synchronizacji.
+        # Stan magazynu został już pomniejszony, więc niczego nie księgujemy drugi raz.
+        return
     # Snapshot oglądany na roboczym WZ jest tylko podglądem. Wydanie zawsze
     # zamraża recepturę ponownie, według wersji obowiązującej w tej chwili.
     c.execute('DELETE FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,))
@@ -460,7 +485,8 @@ def wz_view(wz_id):
         <table><thead><tr><th>Produkt</th><th>Plan [m³]</th><th>Wydano [m³]</th></tr></thead><tbody>
           {% for x in items %}<tr><td>{{x.sku}}</td><td>{{x.qty_planned}}</td><td>{{x.qty_issued if x.qty_issued is not none else '—'}}</td></tr>{% endfor %}
         </tbody></table>
-        <div class="flex" style="margin-top:16px">{% if w.status=='created' %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Przygotuj transport</button></form>{% elif w.status in ['issued','in_transport'] %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Dodaj kolejny kurs</a>{% endif %}{% if w.status=='issued' and not transport %}<form method="post" action="{{url_for('beton.wz_revert',wz_id=w.id)}}" onsubmit="return confirm('Cofnąć wydanie WZ i zwrócić materiały na magazyn?')"><button class="btn danger">Cofnij WZ</button></form>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Ostatni transport {{transport.transport_no}}</a>{% endif %}</div>
+        <div class="card" style="margin-top:16px"><b>Etap realizacji</b><div class="muted" style="margin-top:8px">Zamówienie → Dostawa → Wydanie → W trasie → Odbiór → Zakończone</div></div>
+        <div class="flex" style="margin-top:16px">{% if w.status=='created' and not transport %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Zaplanuj dostawę</a>{% elif w.status=='created' and transport %}<form method="post" action="{{url_for('beton.wz_issue',wz_id=w.id)}}"><button class="btn primary">Wydaj WZ</button></form>{% elif w.status in ['issued','in_transport'] %}<a class="btn primary" href="{{url_for('beton.transport_new',wz_id=w.id)}}">Zaplanuj kolejny kurs</a>{% endif %}{% if w.status=='issued' and not transport %}<form method="post" action="{{url_for('beton.wz_revert',wz_id=w.id)}}" onsubmit="return confirm('Cofnąć wydanie WZ i zwrócić materiały na magazyn?')"><button class="btn danger">Cofnij WZ</button></form>{% endif %}{% if w.status in ['issued','in_transport','returned'] %}<form method="post" action="{{url_for('beton.wz_ready',wz_id=w.id)}}"><button class="btn primary">Podpisane WZ → wystaw fakturę VAT</button></form>{% elif w.status=='ready_invoice' %}<a class="btn primary" href="{{url_for('order_invoice',order_id=w.order_id,wz_id=w.id)}}">Wystaw fakturę VAT</a>{% elif w.status=='invoiced' %}<span class="badge">Zafakturowano: {{w.invoice_no}}</span><a class="btn" href="{{url_for('invoice_download_admin',invoice_id=w.invoice_id)}}">Pobierz fakturę</a>{% endif %}{% if transport %}<a class="btn" href="{{url_for('beton.transport_view',transport_id=transport.id)}}">Szczegóły dostawy {{transport.transport_no}}</a>{% endif %}</div>
       </div>
       <div class="card"><h2>Podpisy czynności</h2><table><tr><th>Wystawił WZ</th><td>{{w.created_by}} · {{w.created_at}}</td></tr><tr><th>Wydał towar</th><td>{{w.issued_by or '—'}} {{w.issued_at or ''}}</td></tr><tr><th>Gotowość do FV</th><td>{{w.ready_by or '—'}} {{w.ready_at or ''}}</td></tr><tr><th>Wystawił FV</th><td>{{w.invoiced_by or '—'}} {{w.invoiced_at or ''}}</td></tr></table></div>
       <div class="card"><h2>Zdjęcia podpisanego WZ</h2>{% for p in photos %}<div class="flex" style="margin:8px 0"><span>{{p.created_at}}</span><a class="btn" href="{{url_for('beton.photo_download',photo_id=p.id)}}">Pobierz zdjęcie</a></div>{% else %}<span class="muted">Brak zdjęć.</span>{% endfor %}</div>
@@ -734,8 +760,12 @@ def wz_print(wz_id):
 def wz_issue(wz_id):
     s=stamp()
     with D['conn']() as c:
-        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND status='created'",(wz_id,)).fetchone()
-        if not w:abort(409)
+        w=c.execute("SELECT * FROM wz_documents WHERE id=? AND deleted_at IS NULL",(wz_id,)).fetchone()
+        if not w:abort(404)
+        if w['status'] in ('issued','in_transport'):
+            return redirect(url_for('beton.transport_new',wz_id=wz_id))
+        if w['status']!='created':
+            return 'Tego dokumentu WZ nie można już przygotować do transportu.',409
         try:
             c.execute('UPDATE wz_items SET qty_issued=qty_planned WHERE wz_id=?',(wz_id,))
             issue_recipe_materials(c,wz_id,actor(),s)
@@ -743,16 +773,19 @@ def wz_issue(wz_id):
         except ValueError as exc:
             c.rollback()
             return str(exc),409
-    D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
     with D['conn']() as c:
         item_ids=[x['id'] for x in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
         snapshot_ids=[x['id'] for x in c.execute('SELECT id FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,)).fetchall()]
         material_ids=[x['material_id'] for x in c.execute("SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue'",(wz_id,)).fetchall()]
         movement_ids=[x['id'] for x in c.execute("SELECT id FROM raw_material_movements WHERE wz_id=?",(wz_id,)).fetchall()]
-    D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
-    D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
-    D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
-    D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
+    try:
+        D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
+        D['sync_local_rows_to_supabase']('wz_items','id',item_ids)
+        D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
+        D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
+        D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
+    except Exception:
+        current_app.logger.exception('Nie udało się zsynchronizować wydania WZ %s; operacja lokalna została zachowana',wz_id)
     # Po zatwierdzeniu WZ od razu przechodzimy do jedynego następnego kroku:
     # wyboru kierowcy, auta i ilości kursu.
     return redirect(url_for('beton.transport_new',wz_id=wz_id))
@@ -894,27 +927,36 @@ def transports():
     except Exception:
         current_app.logger.exception('Nie udało się odświeżyć listy transportów z Supabase')
     with D['conn']() as c:
-        rows=c.execute('''SELECT t.*,w.wz_no,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name
+        rows=c.execute('''SELECT t.*,w.wz_no,i.invoice_no,d.name driver_name,v.registration_no,o.customer_name,
+          a.planned_date,a.time_from,a.time_to
           FROM transports t JOIN wz_documents w ON w.id=t.wz_id JOIN orders o ON o.id=w.order_id LEFT JOIN invoices i ON i.id=w.invoice_id
           LEFT JOIN drivers d ON d.id=t.driver_id LEFT JOIN vehicles v ON v.id=t.vehicle_id
+          LEFT JOIN dispatch_appointments a ON a.id=(SELECT id FROM dispatch_appointments WHERE transport_id=t.id ORDER BY id DESC LIMIT 1)
           WHERE t.deleted_at IS NULL ORDER BY t.id DESC''').fetchall()
         rows=[dict(row) for row in rows]
-        for row in rows: row['status']=transport_status_pl(row.get('status'))
-    return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Transporty</h1><a class="btn primary right" href="{{url_for('beton.wz_list')}}">Wybierz wydane WZ</a></div><div class="card"><table><thead><tr><th>Transport</th><th>WZ</th><th>Klient</th><th>Kierowca / auto</th><th>Status</th><th>Faktura</th></tr></thead><tbody>{% for x in rows %}<tr><td><a href="{{url_for('beton.transport_view',transport_id=x.id)}}"><b>{{x.transport_no}}</b></a></td><td><a href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a></td><td>{{x.customer_name}}</td><td>{{x.driver_name}}<br>{{x.registration_no}}</td><td><span class="badge">{{x.status}}</span></td><td>{{x.invoice_no or '—'}}</td></tr>{% else %}<tr><td colspan="6">Brak transportów.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',rows=rows,title='Transporty',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
+        for row in rows:
+            row['status_code']=row.get('status')
+            row['status']=transport_status_pl(row.get('status'))
+    tab=request.args.get('tab','today'); today=datetime.now().date(); tomorrow=today+timedelta(days=1)
+    if tab=='today': rows=[x for x in rows if x.get('planned_date')==today.isoformat()]
+    elif tab=='tomorrow': rows=[x for x in rows if x.get('planned_date')==tomorrow.isoformat()]
+    elif tab=='active': rows=[x for x in rows if x.get('status_code') in ('assigned','issued','in_transit','closed')]
+    elif tab=='done': rows=[x for x in rows if x.get('status_code') in ('delivered','returned')]
+    return render_template_string('''{% extends "base.html" %}{% block content %}<div class="flex"><h1>Zaplanowane dostawy</h1><a class="btn primary right" href="{{url_for('beton.transport_new')}}">Nowa dostawa</a></div><div class="card flex"><a class="btn" href="?tab=today">Dzisiaj</a><a class="btn" href="?tab=tomorrow">Jutro</a><a class="btn" href="?tab=active">W trakcie</a><a class="btn" href="?tab=done">Zakończone</a><a class="btn" href="?tab=all">Wszystkie</a></div><div class="card"><table><thead><tr><th>Termin</th><th>Dostawa</th><th>WZ</th><th>Klient</th><th>Kierowca / auto</th><th>Status</th><th>Faktura</th></tr></thead><tbody>{% for x in rows %}<tr><td><b>{{x.planned_date or '—'}}</b><br>{{x.time_from or '—'}} – {{x.time_to or '—'}}</td><td><a href="{{url_for('beton.transport_view',transport_id=x.id)}}"><b>{{x.transport_no}}</b></a></td><td><a href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a></td><td>{{x.customer_name}}</td><td>{{x.driver_name}}<br>{{x.registration_no}}</td><td><span class="badge">{{x.status}}</span></td><td>{{x.invoice_no or '—'}}</td></tr>{% else %}<tr><td colspan="7">Brak dostaw w tym widoku.</td></tr>{% endfor %}</tbody></table></div>{% endblock %}''',rows=rows,title='Zaplanowane dostawy',base_url=D['BASE_URL'],db_path=D['DB_PATH'])
 
 TRANSPORT_NEW_TPL = '''{% extends "base.html" %}{% block content %}
-<h1>Podziel WZ na transporty</h1>
-<div class="card"><form method="get"><label>Wydane WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>
-{% if request.args.get('created') %}<div class="notice">Kurs został utworzony. <a href="{{url_for('beton.transport_course_print',transport_id=request.args.get('created_transport'))}}" target="_blank">Drukuj WZ tego kursu</a>. Pozostałą ilość możesz przydzielić do kolejnego transportu.</div>{% endif %}
-{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div><div><label>Ilość na ten transport [m³]</label><input type="number" name="transport_qty" min="0.01" max="8" step="0.01" value="{{[remaining_total,8]|min}}" required></div></div><label>Adres dostawy</label><input name="destination" value="{{wz.destination or ''}}" required><p class="muted">Wpisz faktyczną ilość dla tej gruszki. Maksimum 8 m³; pozostała ilość zostanie na następne kursy.</p><table><thead><tr><th>Produkt</th><th>Na WZ [m³]</th><th>Przydzielono [m³]</th><th>Pozostało [m³]</th></tr></thead><tbody>{% for x in wz_items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td><td>{{x.assigned_qty}}</td><td>{{x.remaining_qty}}</td></tr>{% endfor %}</tbody></table><p><b>Pozostało łącznie: {{remaining_total}} m³.</b></p>{% if allocation_plan %}<button class="btn primary">Utwórz transport i WZ kursu</button>{% else %}<span class="badge">Cała ilość została już przydzielona.</span>{% endif %}</form>{% endif %}{% endblock %}'''
+<h1>Nowa dostawa</h1>
+<div class="card"><form method="get"><label>Dokument WZ</label><select name="wz_id" onchange="this.form.submit()"><option value="">Wybierz WZ</option>{% for x in wz_rows %}<option value="{{x.id}}" {{'selected' if wz_id==x.id}}>{{x.wz_no}} · {{x.customer_name}}</option>{% endfor %}</select></form></div>
+{% if request.args.get('created') %}<div class="notice">Dostawa została zaplanowana. <a href="{{url_for('beton.transport_course_print',transport_id=request.args.get('created_transport'))}}" target="_blank">Drukuj WZ tego kursu</a>. Pozostałą ilość możesz przydzielić do kolejnej dostawy.</div>{% endif %}
+{% if wz %}<form method="post" class="card"><input type="hidden" name="wz_id" value="{{wz.id}}"><h2>{{wz.wz_no}} · {{wz.customer_name}}</h2><div class="row"><div><label>Kierowca</label><select name="driver_id" required>{% for x in ds %}<option value="{{x.id}}">{{x.name}}</option>{% endfor %}</select></div><div><label>Pojazd</label><select name="vehicle_id" required>{% for x in vs %}<option value="{{x.id}}">{{x.registration_no}}</option>{% endfor %}</select></div><div><label>Ilość na tę dostawę [m³]</label><input type="number" name="transport_qty" min="0.01" max="8" step="0.01" value="{{[remaining_total,8]|min}}" required></div></div><label>Adres dostawy</label><input name="destination" value="{{wz.destination or ''}}" required><p class="muted">Wpisz faktyczną ilość dla tej gruszki. Maksimum 8 m³; pozostała ilość zostanie na następne kursy.</p><table><thead><tr><th>Produkt</th><th>Na WZ [m³]</th><th>Przydzielono [m³]</th><th>Pozostało [m³]</th></tr></thead><tbody>{% for x in wz_items %}<tr><td>{{x.sku}}</td><td>{{x.qty_issued if x.qty_issued is not none else x.qty_planned}}</td><td>{{x.assigned_qty}}</td><td>{{x.remaining_qty}}</td></tr>{% endfor %}</tbody></table><p><b>Pozostało łącznie: {{remaining_total}} m³.</b></p>{% if allocation_plan %}<button class="btn primary">Zaplanuj dostawę</button>{% else %}<span class="badge">Cała ilość została już przydzielona.</span>{% endif %}</form>{% endif %}{% endblock %}'''
 
 @bp.route('/transports/new',methods=['GET','POST'])
 def transport_new():
     wz_id=int(request.values.get('wz_id') or 0)
     with D['conn']() as c:
-        wz_rows=c.execute("""SELECT w.id,w.wz_no,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.status IN ('issued','in_transport') AND w.deleted_at IS NULL ORDER BY w.id DESC""").fetchall()
+        wz_rows=c.execute("""SELECT w.id,w.wz_no,o.customer_name FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.status IN ('created','issued','in_transport') AND w.deleted_at IS NULL ORDER BY w.id DESC""").fetchall()
         ds=c.execute('SELECT * FROM drivers WHERE active=1 AND deleted_at IS NULL ORDER BY name').fetchall(); vs=c.execute('SELECT * FROM vehicles WHERE active=1 AND deleted_at IS NULL ORDER BY registration_no').fetchall()
-        wz=c.execute("SELECT w.*,o.customer_name,o.note AS order_delivery_address,o.customer_address,o.delivery_date,o.delivery_time FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status IN ('issued','in_transport')",(wz_id,)).fetchone() if wz_id else None
+        wz=c.execute("SELECT w.*,o.customer_name,o.note AS order_delivery_address,o.customer_address,o.delivery_date,o.delivery_time FROM wz_documents w JOIN orders o ON o.id=w.order_id WHERE w.id=? AND w.status IN ('created','issued','in_transport')",(wz_id,)).fetchone() if wz_id else None
         wz_items=[dict(row) for row in c.execute('''SELECT wi.*,COALESCE((SELECT SUM(ti.qty) FROM transport_items ti
               JOIN transports t ON t.id=ti.transport_id WHERE ti.wz_item_id=wi.id AND t.deleted_at IS NULL),0) AS assigned_qty
               FROM wz_items wi WHERE wi.wz_id=? ORDER BY wi.id''',(wz_id,)).fetchall()] if wz else []
@@ -955,6 +997,15 @@ def transport_new():
             planned_date=(wz.get('delivery_date') or '').strip()
             if not planned_date:
                 return 'W zamówieniu brakuje terminu realizacji. Uzupełnij go przed przydzieleniem transportu.', 400
+            try:
+                planned_departure=datetime.fromisoformat(f"{planned_date}T{planned_departure_time}")
+            except ValueError:
+                return 'Podaj prawidłową datę i godzinę wyjazdu.',400
+            driver_id=int(request.form.get('driver_id') or 0)
+            vehicle_id=int(request.form.get('vehicle_id') or 0)
+            conflict_message=transport_resource_conflict(c,driver_id,vehicle_id,planned_date,planned_departure_time)
+            if conflict_message:
+                return conflict_message,409
             allocation_plan=[]
             left=requested_qty
             for item in wz_items:
@@ -1182,19 +1233,9 @@ def driver_transport_status_api(transport_id):
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
         transitions={'assigned':{'problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','closed','problem'},'closed':{'delivered','returned','problem'},'delivered':{'returned','problem'},'problem':{'in_transit','delivered','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
-        # Tylko kierowca ma obowiązkową przerwę między kolejnymi etapami.
-        # Pracownik, dyspozytor i administrator zmieniają etap w panelu głównym bez tej blokady.
-        previous=[row[key] for key in ('issued_at','departed_at','delivered_at','returned_at') if row[key]]
-        if row['status']=='closed' and row['updated_at']:
-            previous.append(row['updated_at'])
-        if previous and status != 'problem':
-            try:
-                last_action=max(previous)
-                elapsed=(datetime.strptime(stamp(), '%Y-%m-%d %H:%M:%S')-datetime.strptime(last_action, '%Y-%m-%d %H:%M:%S')).total_seconds()
-                if 0 <= elapsed < 300:
-                    return jsonify(ok=False,error='Zbyt szybko kliknięto kolejny etap. Potwierdzenie nie jest teraz możliwe.'),429
-            except (TypeError, ValueError):
-                pass
+        # Etapy są dostępne natychmiast po wykonaniu poprzedniej czynności.
+        # Bezpieczeństwo zapewniają dozwolone przejścia stanu i atomowa aktualizacja,
+        # a nie sztuczny licznik czasu blokujący pracę kierowcy.
         appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
         if status=='in_transit' and (not appointment or appointment['status']!='ready_to_leave'):
             return jsonify(ok=False,error='Dyspozytor musi najpierw oznaczyć transport jako gotowy do wyjazdu.'),409
