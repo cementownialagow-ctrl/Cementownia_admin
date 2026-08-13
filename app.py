@@ -454,7 +454,7 @@ def init_db():
         order_item_id INTEGER NOT NULL,
         product_id INTEGER,
         sku TEXT,
-        qty INTEGER NOT NULL,
+        qty REAL NOT NULL,
         created_at TEXT NOT NULL,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id),
         FOREIGN KEY(order_id) REFERENCES orders(id),
@@ -800,13 +800,10 @@ def next_invoice_no(issue_date: str) -> str:
     yyyy = dt.strftime("%Y")
     c = conn()
     cur = c.cursor()
-    cur.execute('CREATE TABLE IF NOT EXISTS document_sequences(sequence_key TEXT PRIMARY KEY,value INTEGER NOT NULL)')
-    prefix=f'FVAT '
+    # To jest wyłącznie podgląd następnego numeru. Samo otwarcie formularza
+    # nie może rezerwować ani zużywać numeru faktury.
     current=cur.execute("SELECT COALESCE(MAX(CAST(substr(invoice_no,6,instr(substr(invoice_no,6),'/')-1) AS INTEGER)),0) FROM invoices WHERE substr(issue_date,1,7)=?",(f"{yyyy}-{mm}",)).fetchone()[0]
-    key=f'invoice:{yyyy}-{mm}'
-    cur.execute('INSERT INTO document_sequences(sequence_key,value) VALUES(?,?) ON CONFLICT(sequence_key) DO NOTHING',(key,int(current or 0)))
-    n=int(cur.execute('UPDATE document_sequences SET value=value+1 WHERE sequence_key=? RETURNING value',(key,)).fetchone()[0])
-    c.commit()
+    n=int(current or 0)+1
     c.close()
     return f"FVAT {n}/{mm}/{yyyy}"
 
@@ -2432,7 +2429,7 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     cpdf.setFont(pdf_font, 9)
     total_qty = 0
     for lp, it in enumerate(items, 1):
-        qty = int(it.get("qty") or 0)
+        qty = to_float(it.get("qty"), 0.0)
         if qty <= 0:
             continue
         total_qty += qty
@@ -2628,7 +2625,7 @@ def invoiced_qty_by_order_item_ids(order_item_ids: list[int]):
       GROUP BY order_item_id
     """, tuple(ids))
     for r in cur.fetchall():
-        out[int(r["order_item_id"])] = int(r["qty"] or 0)
+        out[int(r["order_item_id"])] = float(r["qty"] or 0)
     c.close()
     return out
 
@@ -2641,7 +2638,7 @@ def replace_invoice_allocations(invoice_id: int, invoice_items: list[dict]):
     for it in invoice_items:
         order_item_id = int(it.get("order_item_id") or it.get("id") or 0)
         order_id = int(it.get("source_order_id") or it.get("order_id") or 0)
-        qty = int(it.get("qty") or 0)
+        qty = to_float(it.get("qty"), 0.0)
         if order_item_id <= 0 or order_id <= 0 or qty <= 0:
             continue
         cur.execute("""
@@ -2675,8 +2672,8 @@ def order_fully_invoiced(cur, order_id: int) -> bool:
       WHERE order_item_id IN ({ph})
       GROUP BY order_item_id
     """, tuple(item_ids))
-    done = {int(r["order_item_id"]): int(r["qty"] or 0) for r in cur.fetchall()}
-    return all(int(row["qty"] or 0) > 0 and int(done.get(int(row["id"]), 0)) >= int(row["qty"] or 0) for row in rows)
+    done = {int(r["order_item_id"]): float(r["qty"] or 0) for r in cur.fetchall()}
+    return all(float(row["qty"] or 0) > 0 and float(done.get(int(row["id"]), 0)) + 1e-9 >= float(row["qty"] or 0) for row in rows)
 
 
 def finalize_fully_invoiced_orders(order_ids: list[int]):
@@ -2702,7 +2699,7 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
             cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
             for it in cur.fetchall():
                 pid = int(it["product_id"])
-                qty = int(it["qty"] or 0)
+                qty = to_float(it["qty"], 0.0)
                 cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
                 cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
                 changed_product_ids.append(pid)
@@ -2783,7 +2780,7 @@ def invoice_edit_items(invoice_id: int, invoice_row: dict):
     cur = c.cursor()
     cur.execute("SELECT order_id, order_item_id, qty FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
     current_alloc_rows = [dict(r) for r in cur.fetchall()]
-    current_qty_by_item = {int(r["order_item_id"]): int(r["qty"] or 0) for r in current_alloc_rows}
+    current_qty_by_item = {int(r["order_item_id"]): float(r["qty"] or 0) for r in current_alloc_rows}
     allocated_order_ids = {int(r["order_id"]) for r in current_alloc_rows if int(r.get("order_id") or 0)}
 
     email = _email_key(invoice_row.get("buyer_email"))
@@ -2836,9 +2833,9 @@ def invoice_edit_items(invoice_id: int, invoice_row: dict):
     out = []
     for it in items:
         item_id = int(it["id"])
-        current_qty = int(current_qty_by_item.get(item_id, 0))
-        ordered_qty = int(it.get("qty") or 0)
-        invoiced_total = int(invoiced_by_item.get(item_id, 0))
+        current_qty = float(current_qty_by_item.get(item_id, 0))
+        ordered_qty = float(it.get("qty") or 0)
+        invoiced_total = float(invoiced_by_item.get(item_id, 0))
         invoiced_other = max(0, invoiced_total - current_qty)
         max_qty = max(0, ordered_qty - invoiced_other)
         row = dict(it)
@@ -2967,14 +2964,6 @@ def role_may_read(role: str, path: str) -> bool:
         return (path.startswith("/orders") or path.startswith("/customers")
                 or path.startswith("/products") or path.startswith("/document-search"))
     return False
-
-
-def current_user_may_read(path: str) -> bool:
-    """Jinja helper: render only UI elements the signed-in role may actually open."""
-    return role_may_read(session.get("role"), path)
-
-
-app.jinja_env.globals["may_read"] = current_user_may_read
 
 
 @app.before_request
@@ -3140,30 +3129,30 @@ BASE = r"""
     <div class="brand"><img src="{{ url_for('brand_logo') }}" alt="Beton Łagów"></div>
     <div class="nav flex">
       <a class="{% if request.endpoint == 'home' %}active{% endif %}" href="{{ url_for('home') }}">Pulpit</a>
-      {% if may_read('/orders') %}<a class="{% if request.endpoint in ['orders','order_view'] %}active{% endif %}" href="{{ url_for('orders') }}">Zamówienia</a>{% endif %}
-      {% if may_read('/orders/new') %}<a class="{% if request.endpoint == 'order_new' %}active{% endif %}" href="{{ url_for('order_new') }}">Nowe zamówienie</a>{% endif %}
-      {% if may_read('/invoices') %}<a class="nav-invoices" href="{{ url_for('invoices') }}">Faktury</a>{% endif %}
-      {% if may_read('/beton/wz') %}<a class="nav-wz" href="{{ url_for('beton.wz_list') }}">Dokumenty WZ</a>{% endif %}
-      {% if may_read('/warehouse') %}<a class="{% if request.endpoint == 'raw_material_warehouse' %}active{% endif %}" href="{{ url_for('raw_material_warehouse') }}">Magazyn</a>{% endif %}
-      {% if may_read('/beton/transports') %}<a class="nav-transports" href="{{ url_for('beton.transports') }}">Transporty</a>{% endif %}
-      {% if may_read('/dispatch') %}<a href="{{ url_for('dispatch.appointments') }}">Wydaj transport</a>{% endif %}
-      {% if may_read('/beton/drivers') %}<a href="{{ url_for('beton.drivers') }}">Kierowcy i pojazdy</a>{% endif %}
-      {% if may_read('/operations') %}<a href="{{ url_for('ops.operations') }}">Koszty i zużycie</a>{% endif %}
-      {% if may_read('/analytics') %}<a href="{{ url_for('ops.analytics') }}">Analizy i raporty</a>{% endif %}
-      {% if may_read('/ksef') %}<a href="{{ url_for('ksef_dashboard') }}">KSeF</a>{% endif %}
-      {% if may_read('/material-orders') %}<a href="{{ url_for('material_orders') }}">Zamówienia materiałów</a>{% endif %}
-      {% if may_read('/products') or may_read('/customers') or may_read('/pricing') or may_read('/company') or session.get('role') == 'admin' %}
+      <a class="{% if request.endpoint in ['orders','order_view'] %}active{% endif %}" href="{{ url_for('orders') }}">Zamówienia</a>
+      <a class="{% if request.endpoint == 'order_new' %}active{% endif %}" href="{{ url_for('order_new') }}">Nowe zamówienie</a>
+      <a class="nav-invoices" href="{{ url_for('invoices') }}">Faktury</a>
+      <a class="nav-wz" href="{{ url_for('beton.wz_list') }}">Dokumenty WZ</a>
+      <a class="{% if request.endpoint == 'raw_material_warehouse' %}active{% endif %}" href="{{ url_for('raw_material_warehouse') }}">Magazyn</a>
+      <a class="nav-transports" href="{{ url_for('beton.transports') }}">Zaplanowane dostawy</a>
+      <a href="{{ url_for('dispatch.appointments') }}">Zaplanuj dostawę</a>
+      <a href="{{ url_for('beton.drivers') }}">Kierowcy i pojazdy</a>
+      <a href="{{ url_for('ops.operations') }}">Koszty i zużycie</a>
+      <a href="{{ url_for('ops.analytics') }}">Analizy i raporty</a>
+      <a href="{{ url_for('ksef_dashboard') }}">KSeF</a>
+      <a href="{{ url_for('material_orders') }}">Zamówienia materiałów</a>
       <div class="nav-dropdown">
         <button class="nav-drop-btn" type="button">Ustawienia ▾</button>
         <div class="nav-dropdown-menu">
-          {% if may_read('/products') %}<a href="{{ url_for('products') }}">Produkty</a>{% endif %}
-          {% if may_read('/customers') %}<a href="{{ url_for('customers') }}">Klienci</a>{% endif %}
-          {% if may_read('/pricing') %}<a href="{{ url_for('pricing') }}">Cennik</a>{% endif %}
-          {% if may_read('/company') %}<a href="{{ url_for('company') }}">Dane mojej firmy</a>{% endif %}
-          {% if session.get('role') == 'admin' %}<a href="{{ url_for('admin_users') }}">Użytkownicy</a><a href="{{ url_for('admin_audit') }}">Dziennik zmian</a><a href="{{ url_for('admin_test_data') }}">Dane testowe</a>{% endif %}
+          <a href="{{ url_for('products') }}">Produkty</a>
+          <a href="{{ url_for('customers') }}">Klienci</a>
+          <a href="{{ url_for('pricing') }}">Cennik</a>
+          <a href="{{ url_for('company') }}">Dane mojej firmy</a>
+          {% if session.get('role') == 'admin' %}<a href="{{ url_for('admin_users') }}">Użytkownicy</a>{% endif %}
+          <a href="{{ url_for('admin_audit') }}">Dziennik zmian</a>
+          {% if session.get('role') == 'admin' %}<a href="{{ url_for('admin_test_data') }}">Dane testowe</a>{% endif %}
         </div>
       </div>
-      {% endif %}
       <a href="{{ url_for('logout') }}">Wyloguj</a>
     </div>
     <div class="right muted">Magazyn główny<br>{{ base_url }}</div>
@@ -3475,159 +3464,154 @@ def admin_test_data():
 @app.get("/")
 def home():
     maybe_pull_shared_from_supabase()
-    role = norm(session.get("role")).lower()
-
-    can_orders = role_may_read(role, "/orders")
-    can_financial = role_may_read(role, "/invoices")
-    can_inventory = role_may_read(role, "/warehouse")
-    can_transport = role_may_read(role, "/beton/transports")
-    can_wz = role_may_read(role, "/beton/wz")
-    can_dispatch = role_may_read(role, "/dispatch")
-    can_products = role_may_read(role, "/products")
-    can_material_orders = role_may_read(role, "/material-orders")
-    can_order_values = can_financial or role in {"admin", "manager"}
-
     c = conn()
     cur = c.cursor()
+    cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','confirmed','in_delivery')")
+    n_orders_current = cur.fetchone()["n"]
     today_iso = app_now().date().isoformat()
+    cur.execute("SELECT COUNT(*) AS n FROM orders WHERE substr(created_at,1,10)=?", (today_iso,))
+    n_orders_today = int(cur.fetchone()["n"] or 0)
+    cur.execute("""
+      SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,
+             COALESCE(SUM(oi.qty * COALESCE(pr.net_price,0)),0) AS total_net
+      FROM orders o
+      LEFT JOIN order_items oi ON oi.order_id=o.id
+      LEFT JOIN products p ON p.id=oi.product_id
+      LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model))=TRIM(LOWER(p.sku)))
+      WHERE o.status!='cancelled'
+      GROUP BY o.id ORDER BY o.id DESC LIMIT 8
+    """)
+    recent_orders = [dict(r) for r in cur.fetchall()]
 
-    n_orders_current = 0
-    n_orders_today = 0
-    today_remaining = 0
-    recent_orders = []
-    low_raw_materials = []
-    overdue_invoice_count = 0
-    overdue_invoice_total = 0.0
-    active_transport_count = 0
-    pending_wz_count = 0
-    loading_queue_count = 0
+    # Pulpit nie opiera się na dawnym ręcznym statusie zamówienia. Etap jest
+    # wyliczany z faktycznie utworzonego transportu, podpisanego WZ i faktury.
+    def dashboard_delivery_status(order_id):
+        if cur.execute("SELECT 1 FROM invoices WHERE order_id=? LIMIT 1", (order_id,)).fetchone():
+            return "FV wystawiona"
+        rows = cur.execute("""SELECT t.status FROM transports t
+            JOIN wz_documents w ON w.id=t.wz_id
+            WHERE w.order_id=? AND w.deleted_at IS NULL AND t.deleted_at IS NULL""", (order_id,)).fetchall()
+        transport_statuses = {norm(row["status"]).lower() for row in rows}
+        if "in_transit" in transport_statuses:
+            return "W dostawie"
+        if "issued" in transport_statuses:
+            return "Wydane"
+        if "assigned" in transport_statuses:
+            return "Przydzielone"
+        if "delivered" in transport_statuses:
+            return "WZ podpisane"
+        if "closed" in transport_statuses:
+            return "Na miejscu"
+        if "returned" in transport_statuses:
+            return "Zakończone"
+        wz = cur.execute("""SELECT status FROM wz_documents
+            WHERE order_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1""", (order_id,)).fetchone()
+        wz_status = norm(wz["status"]).lower() if wz else ""
+        if wz_status == "ready_invoice":
+            return "WZ podpisane"
+        if wz_status in ("issued", "in_transport"):
+            return "Wydane"
+        return "Nieprzydzielone"
 
-    if can_orders:
-        cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','confirmed','in_delivery')")
-        n_orders_current = int(cur.fetchone()["n"] or 0)
-        cur.execute("SELECT COUNT(*) AS n FROM orders WHERE substr(created_at,1,10)=? AND lower(COALESCE(status,'')) <> 'cancelled'", (today_iso,))
-        n_orders_today = int(cur.fetchone()["n"] or 0)
-
-        if can_order_values:
-            cur.execute("""
-              SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,
-                     COALESCE(SUM(oi.qty * COALESCE(pr.net_price,p.unit_net_price,0)),0) AS total_net
-              FROM orders o
-              LEFT JOIN order_items oi ON oi.order_id=o.id
-              LEFT JOIN products p ON p.id=oi.product_id
-              LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model))=TRIM(LOWER(p.sku)))
-              WHERE lower(COALESCE(o.status,'')) <> 'cancelled'
-              GROUP BY o.id ORDER BY o.id DESC LIMIT 8
-            """)
-        else:
-            cur.execute("""
-              SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,NULL AS total_net
-              FROM orders o
-              WHERE lower(COALESCE(o.status,'')) <> 'cancelled'
-              ORDER BY o.id DESC LIMIT 8
-            """)
-        recent_orders = [dict(r) for r in cur.fetchall()]
-        for order in recent_orders:
-            order["delivery_status"] = norm(order.get("status")) or "-"
-        cur.execute("""SELECT COUNT(*) AS n FROM orders
-                       WHERE delivery_date=? AND lower(COALESCE(status,'')) NOT IN ('cancelled','issued')""", (today_iso,))
-        today_remaining = int(cur.fetchone()["n"] or 0)
-
-    if can_inventory:
-        low_raw_materials = [dict(row) for row in cur.execute("""SELECT rm.id,rm.name,rm.unit,COALESCE(s.qty,0) qty,
-          MAX(pr.qty_per_unit) max_usage,
-          CASE WHEN MAX(pr.qty_per_unit)>0 THEN COALESCE(s.qty,0)/MAX(pr.qty_per_unit) ELSE 0 END coverage
-          FROM raw_materials rm JOIN product_recipes pr ON pr.material_id=rm.id
-          LEFT JOIN raw_material_stock s ON s.material_id=rm.id
-          GROUP BY rm.id,rm.name,rm.unit,s.qty
-          HAVING COALESCE(s.qty,0)<=MAX(pr.qty_per_unit)*5
-          ORDER BY coverage ASC,rm.name LIMIT 8""").fetchall()]
-
-    if can_financial:
-        overdue_row = cur.execute("""SELECT COUNT(*) AS invoice_count,
-            COALESCE(SUM(COALESCE(i.total_gross,0)),0) AS total_gross
-          FROM invoices i
-          LEFT JOIN invoice_meta m ON m.invoice_id=i.id
-          WHERE COALESCE(m.paid,0)=0
-            AND date(COALESCE(NULLIF(i.payment_to,''),i.issue_date)) < date(?)""", (today_iso,)).fetchone()
-        overdue_invoice_count = int(overdue_row["invoice_count"] or 0)
-        overdue_invoice_total = float(overdue_row["total_gross"] or 0)
-
-    if can_transport:
-        active_transport_count = int(cur.execute("""SELECT COUNT(*) n FROM transports
-            WHERE deleted_at IS NULL AND lower(COALESCE(status,'')) NOT IN ('returned','closed','cancelled')""").fetchone()["n"] or 0)
-    if can_wz:
-        pending_wz_count = int(cur.execute("""SELECT COUNT(*) n FROM wz_documents
-            WHERE deleted_at IS NULL AND lower(COALESCE(status,'')) IN ('created','issued','in_transport')""").fetchone()["n"] or 0)
-    if can_dispatch:
-        try:
-            loading_queue_count = int(cur.execute("""SELECT COUNT(*) n FROM dispatch_appointments
-                WHERE lower(COALESCE(status,'')) IN ('waiting','gate_entered','first_weighing','waiting_for_loading','loading','second_weighing','ready_to_leave')""").fetchone()["n"] or 0)
-        except sqlite3.OperationalError:
-            loading_queue_count = 0
+    all_orders = [dict(row) for row in cur.execute("SELECT id,delivery_date FROM orders WHERE lower(COALESCE(status,'')) <> 'cancelled'").fetchall()]
+    for order in recent_orders:
+        order["delivery_status"] = dashboard_delivery_status(order["id"])
+    dashboard_counts = {}
+    for order in all_orders:
+        label = dashboard_delivery_status(order["id"])
+        dashboard_counts[label] = dashboard_counts.get(label, 0) + 1
+    status_new = dashboard_counts.get("Nieprzydzielone", 0)
+    status_assigned = dashboard_counts.get("Przydzielone", 0) + dashboard_counts.get("Wydane", 0)
+    status_delivery = dashboard_counts.get("W dostawie", 0) + dashboard_counts.get("Na miejscu", 0)
+    status_signed = dashboard_counts.get("WZ podpisane", 0)
+    status_done = dashboard_counts.get("Zakończone", 0)
+    status_invoice = dashboard_counts.get("FV wystawiona", 0)
+    today_remaining = sum(
+        1 for order in all_orders
+        if norm(order.get("delivery_date")) == today_iso
+        and dashboard_delivery_status(order["id"]) not in {"Zakończone", "FV wystawiona"}
+    )
+    status_total = sum(dashboard_counts.values())
+    status_divisor = max(1, status_total)
+    # Niski stan = zapas na najwyżej 5 jednostek produktu według najbardziej
+    # materiałochłonnej receptury wykorzystującej dany surowiec.
+    low_raw_materials=[dict(row) for row in cur.execute('''SELECT rm.id,rm.name,rm.unit,COALESCE(s.qty,0) qty,
+      MAX(pr.qty_per_unit) max_usage,
+      CASE WHEN MAX(pr.qty_per_unit)>0 THEN COALESCE(s.qty,0)/MAX(pr.qty_per_unit) ELSE 0 END coverage
+      FROM raw_materials rm JOIN product_recipes pr ON pr.material_id=rm.id
+      LEFT JOIN raw_material_stock s ON s.material_id=rm.id
+      GROUP BY rm.id,rm.name,rm.unit,s.qty
+      HAVING COALESCE(s.qty,0)<=MAX(pr.qty_per_unit)*5
+      ORDER BY coverage ASC,rm.name LIMIT 8''').fetchall()]
+    overdue_row = cur.execute("""SELECT COUNT(*) AS invoice_count,
+        COALESCE(SUM(COALESCE(i.total_gross,0)),0) AS total_gross
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+      WHERE COALESCE(m.paid,0)=0
+        AND date(COALESCE(NULLIF(i.payment_to,''),i.issue_date)) < date(?)""", (today_iso,)).fetchone()
+    overdue_invoice_count = int(overdue_row["invoice_count"] or 0)
+    overdue_invoice_total = float(overdue_row["total_gross"] or 0)
+    warehouse_role = session.get("role") == "warehouse"
+    due_to_issue_today = int(cur.execute("""SELECT COUNT(*) AS n
+      FROM dispatch_appointments a JOIN transports t ON t.id=a.transport_id
+      WHERE a.planned_date=? AND a.status NOT IN ('cancelled','returned')
+        AND t.status IN ('assigned','issued') AND t.deleted_at IS NULL""", (today_iso,)).fetchone()["n"] or 0)
     c.close()
 
     tpl = r"""
     {% extends "base.html" %}
     {% block content %}
       <style>
-        .dashboard-head{display:flex;align-items:center;gap:14px;margin-bottom:18px}.dashboard-head h1{margin:0}.search-shell{margin-left:28px;flex:1;max-width:580px;position:relative}.search-shell input{padding-left:42px;background:#fff}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:16px}.metric{display:grid;grid-template-columns:55px 1fr;gap:14px;align-items:center;background:#fff;border:1px solid #e7eaf2;border-radius:22px;padding:18px;box-shadow:var(--shadow)}.metric .icon{display:grid;place-items:center;width:55px;height:55px;border-radius:17px;background:var(--soft,#edf3ff);color:var(--tone,#5577ee);font-size:23px}.metric span{color:#718096;font-size:12px;font-weight:650}.metric b{display:block;margin-top:2px;font-size:25px}.metric small{display:block;margin-top:4px;color:#2da176;font-size:10px}.dash-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:16px;align-items:start}.panel-title{display:flex;align-items:center;gap:9px;margin-bottom:13px}.panel-title h2{margin:0}.panel-title .btn{margin-left:auto}.orders-card table{min-width:700px}.stock-list{display:grid;gap:2px}.stock-item{display:grid;grid-template-columns:42px 1fr auto;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #edf0f5}.stock-icon{display:grid;place-items:center;width:39px;height:39px;border-radius:12px;background:#f1f4f9}.stock-name{font-size:12px;font-weight:700}.stock-sku{font-size:9px;color:#8b96a9}.stock-qty{font-size:12px;font-weight:800}.quick-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.quick-grid .btn{min-height:72px;flex-direction:column;background:#f8faff}@media(max-width:900px){.dash-grid{grid-template-columns:1fr}.dashboard-head{flex-wrap:wrap}.search-shell{order:3;margin-left:0;flex-basis:100%}}
+        .dashboard-head{display:flex;align-items:center;gap:14px;margin-bottom:18px}.dashboard-head h1{margin:0}.search-shell{margin-left:28px;flex:1;max-width:580px;position:relative}.search-shell input{padding-left:42px;background:#fff}.search-shell:before{content:"⌕";position:absolute;left:15px;top:9px;color:#8793aa;font-size:19px;z-index:2}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:16px}.metric{display:grid;grid-template-columns:55px 1fr;gap:14px;align-items:center;background:#fff;border:1px solid #e7eaf2;border-radius:22px;padding:18px;box-shadow:var(--shadow)}.metric .icon{display:grid;place-items:center;width:55px;height:55px;border-radius:17px;background:var(--soft,#edf3ff);color:var(--tone,#5577ee);font-size:23px}.metric span{color:#718096;font-size:12px;font-weight:650}.metric b{display:block;margin-top:2px;font-size:25px;letter-spacing:-.6px}.metric small{display:block;margin-top:4px;color:#2da176;font-size:10px}.dash-grid{display:grid;grid-template-columns:minmax(0,2.15fr) minmax(300px,.9fr);gap:16px;align-items:start}.panel-title{display:flex;align-items:center;gap:9px;margin-bottom:13px}.panel-title h2{margin:0}.panel-title .btn{margin-left:auto;padding:7px 11px;font-size:11px}.orders-card{padding-bottom:8px}.orders-card table{min-width:780px}.orders-card td{font-size:12px}.customer-name{font-weight:700}.order-no{color:#4166d3;font-weight:750;text-decoration:none}.side-stack{display:grid;gap:16px}.stock-list{display:grid;gap:2px}.stock-item{display:grid;grid-template-columns:42px 1fr auto;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #edf0f5}.stock-icon{display:grid;place-items:center;width:39px;height:39px;border-radius:12px;background:#f1f4f9;color:#68758d}.stock-name{font-size:12px;font-weight:700}.stock-sku{font-size:9px;color:#8b96a9}.stock-qty{font-size:12px;font-weight:800}.stock-qty:after{content:"";display:inline-block;width:7px;height:7px;margin-left:8px;border-radius:50%;background:#ee5262}.donut-wrap{display:grid;grid-template-columns:145px 1fr;align-items:center;gap:14px}.donut{width:140px;height:140px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#5577ee 0 calc(var(--p1)*1%),#65a7ec calc(var(--p1)*1%) calc((var(--p1) + var(--p2))*1%),#31b98b calc((var(--p1) + var(--p2))*1%) calc((var(--p1) + var(--p2) + var(--p3))*1%),#e05263 calc((var(--p1) + var(--p2) + var(--p3))*1%) 100%)}.donut:before{content:"";width:86px;height:86px;background:#fff;border-radius:50%;position:absolute}.donut-label{position:relative;text-align:center;font-size:11px;color:#77849b}.donut-label b{display:block;color:#17233c;font-size:25px}.legend{display:grid;gap:9px}.legend-row{display:grid;grid-template-columns:9px 1fr auto;gap:7px;align-items:center;font-size:10px}.legend-dot{width:8px;height:8px;border-radius:50%}.quick-card{grid-column:1}.quick-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}.quick-grid .btn{min-height:80px;flex-direction:column;background:#f8faff;border-color:#e8ecf6;font-size:11px}.quick-grid .btn b{font-size:20px}.quick-grid .btn:nth-child(1){background:#edf3ff;color:#4166d3}.quick-grid .btn:nth-child(2){background:#eaf9f4;color:#16835f}.quick-grid .btn:nth-child(3){background:#eef3ff;color:#4b6bd3}.quick-grid .btn:nth-child(4){background:#fff5e5;color:#c57a10}.quick-grid .btn:nth-child(5){background:#f3edff;color:#7650ce}@media(max-width:1200px){.metrics{grid-template-columns:1fr 1fr}.dash-grid{grid-template-columns:1fr}.quick-card{grid-column:auto}}@media(max-width:760px){.dashboard-head{flex-wrap:wrap}.search-shell{order:3;margin-left:0;flex-basis:100%}.metrics{grid-template-columns:1fr}.quick-grid{grid-template-columns:1fr 1fr}.donut-wrap{grid-template-columns:1fr}.donut{margin:auto}}
       </style>
+
       <div class="dashboard-head">
-        <div><h1>Pulpit</h1><div class="muted">Widok dopasowany do uprawnień: {{ role_label }}.</div></div>
-        {% if may_read('/document-search') %}<form class="search-shell" action="{{ url_for('document_search') }}"><input name="q" placeholder="Szukaj dokumentów..."></form>{% endif %}
-        {% if may_read('/orders/new') %}<a class="btn primary" href="{{ url_for('order_new') }}">＋ Nowe zamówienie</a>{% endif %}
+        <div><h1>Pulpit</h1><div class="muted">Dzisiejszy obraz realizacji zamówień i dostaw.</div></div>
+        <form class="search-shell" action="{{ url_for('document_search') }}"><input name="q" placeholder="Szukaj: klient, WZ, transport, faktura..."></form>
+        <a class="btn primary" href="{{ url_for('order_new') }}">＋ Nowe zamówienie</a>
       </div>
 
       <div class="metrics">
-        {% if can_orders %}
-          <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
-          <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>W realizacji</span><b>{{ n_orders_current }}</b></div></div>
-          <a class="metric" style="--soft:#fff5e5;--tone:#c57a10;text-decoration:none;color:inherit" href="{{ url_for('orders', tab='today') }}"><div class="icon">▦</div><div><span>Pozostało do realizacji dzisiaj</span><b>{{ today_remaining }}</b></div></a>
-        {% endif %}
-        {% if can_transport %}<a class="metric" style="text-decoration:none;color:inherit" href="{{ url_for('beton.transports') }}"><div class="icon">🚚</div><div><span>Aktywne transporty</span><b>{{ active_transport_count }}</b></div></a>{% endif %}
-        {% if can_wz %}<a class="metric" style="text-decoration:none;color:inherit" href="{{ url_for('beton.wz_list') }}"><div class="icon">📋</div><div><span>WZ w toku</span><b>{{ pending_wz_count }}</b></div></a>{% endif %}
-        {% if can_dispatch %}<a class="metric" style="text-decoration:none;color:inherit" href="{{ url_for('dispatch.appointments') }}"><div class="icon">⇢</div><div><span>Kolejka / wydanie</span><b>{{ loading_queue_count }}</b></div></a>{% endif %}
-        {% if can_financial %}<a class="metric" style="--soft:#fff0f2;--tone:#c7354c;text-decoration:none;color:inherit" href="{{ url_for('invoices', filter='overdue') }}"><div class="icon">!</div><div><span>Zaległe płatności</span><b>{{ overdue_invoice_count }}</b><small>{{ "%.2f"|format(overdue_invoice_total) }} PLN po terminie</small></div></a>{% endif %}
+        {% if warehouse_role %}<a class="metric" style="--soft:#fff5e5;--tone:#c57a10;text-decoration:none;color:inherit" href="{{ url_for('dispatch.appointments', day=today_iso) }}"><div class="icon">!</div><div><span>DO WYDANIA DZISIAJ</span><b>{{ due_to_issue_today }}</b><small>Przejdź do planu wydań</small></div></a>{% endif %}
+        <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
+        <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>W realizacji</span><b>{{ n_orders_current }}</b></div></div>
+        <a class="metric" style="--soft:#fff5e5;--tone:#c57a10;text-decoration:none;color:inherit" href="{{ url_for('orders', tab='today') }}"><div class="icon">▦</div><div><span>Pozostało do realizacji dzisiaj</span><b>{{ today_remaining }}</b><small>Zobacz dzisiejsze wydania</small></div></a>
       </div>
+
+      {% if not warehouse_role %}<div class="metrics" style="grid-template-columns:minmax(260px,1fr);max-width:360px">
+        <a class="metric" style="--soft:#fff0f2;--tone:#c7354c;text-decoration:none;color:inherit" href="{{ url_for('invoices', filter='overdue') }}"><div class="icon">!</div><div><span>Zaległe płatności</span><b>{{ overdue_invoice_count }}</b><small>{{ "%.2f"|format(overdue_invoice_total) }} PLN po terminie</small></div></a>
+      </div>{% endif %}
 
       <div class="dash-grid">
-        {% if can_orders %}<div class="card orders-card">
-          <div class="panel-title"><h2>Ostatnie zamówienia</h2><a class="btn" href="{{ url_for('orders') }}">Zobacz wszystkie</a></div>
-          <table><thead><tr><th>Nr zamówienia</th><th>Klient</th><th>Data</th>{% if can_order_values %}<th>Wartość</th>{% endif %}<th>Status</th></tr></thead><tbody>
-          {% for o in recent_orders %}<tr><td><a href="{{ url_for('order_view',order_id=o.id) }}">{{ canonical_order_no(o.id,o.created_at,o.order_no) }}</a></td><td>{{ o.customer_name or '-' }}</td><td>{{ o.created_at[:16] }}</td>{% if can_order_values %}<td>{{ "%.2f"|format(o.total_net or 0) }} zł</td>{% endif %}<td><span class="badge">{{ o.delivery_status }}</span></td></tr>{% endfor %}
-          {% if not recent_orders %}<tr><td colspan="6" class="muted">Brak zamówień.</td></tr>{% endif %}
+        <div class="card orders-card">
+          <div class="panel-title"><span>▣</span><h2>Ostatnie zamówienia</h2><a class="btn" href="{{ url_for('orders') }}">Zobacz wszystkie</a></div>
+          <table><thead><tr><th>Nr zamówienia</th><th>Klient</th><th>Data</th><th>Wartość</th><th>Status</th><th></th></tr></thead><tbody>
+          {% for o in recent_orders %}<tr><td><a class="order-no" href="{{ url_for('order_view',order_id=o.id) }}">{{ canonical_order_no(o.id,o.created_at,o.order_no) }}</a></td><td class="customer-name">{{ o.customer_name or '-' }}</td><td>{{ o.created_at[:16] }}</td><td>{{ "%.2f"|format(o.total_net) }} zł</td><td><span class="badge">{{ o.delivery_status }}</span></td><td><a class="btn" href="{{ url_for('order_view',order_id=o.id) }}">•••</a></td></tr>{% endfor %}
+          {% if not recent_orders %}<tr><td colspan="6" class="muted">Brak zamówień do wyświetlenia.</td></tr>{% endif %}
           </tbody></table>
-        </div>{% endif %}
-        <div>
-          {% if can_inventory %}<div class="card"><div class="panel-title"><h2>Niskie stany surowców</h2><a class="btn" href="{{url_for('raw_material_warehouse')}}">Magazyn</a></div><div class="stock-list">{% for m in low_raw_materials %}<div class="stock-item"><div class="stock-icon">{% if m.qty<=0 %}!{% else %}▥{% endif %}</div><div><div class="stock-name">{{m.name}}</div><div class="stock-sku">Zapas na ok. {{'%.1f'|format(m.coverage)}} jedn. produktu</div></div><div class="stock-qty">{{'%.4f'|format(m.qty)|float}} {{m.unit}}</div></div>{% else %}<div class="muted">Brak niskich stanów.</div>{% endfor %}</div></div>{% endif %}
+        </div>
+        <div class="side-stack">
+          <div class="card"><div class="panel-title"><h2>Status realizacji</h2></div><div class="donut-wrap"><div class="donut" style="--p1:{{ status_new*100/status_divisor }};--p2:{{ status_assigned*100/status_divisor }};--p3:{{ (status_delivery + status_signed)*100/status_divisor }}"><div class="donut-label"><b>{{ status_total }}</b>łącznie</div></div><div class="legend">
+            <div class="legend-row"><i class="legend-dot" style="background:#5577ee"></i><span>Nieprzydzielone</span><b>{{ status_new }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#65a7ec"></i><span>Wydane / przydzielone</span><b>{{ status_assigned }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#31b98b"></i><span>W dostawie / na miejscu</span><b>{{ status_delivery }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#c784de"></i><span>WZ podpisane</span><b>{{ status_signed }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#45a879"></i><span>Zakończone</span><b>{{ status_done }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#e05263"></i><span>FV wystawiona</span><b>{{ status_invoice }}</b></div>
+          </div></div></div>
+          <div class="card"><div class="panel-title"><span>⚠</span><h2>Niskie stany surowców</h2><a class="btn" href="{{url_for('raw_material_warehouse')}}">Magazyn</a></div><div class="stock-list">{% for m in low_raw_materials %}<div class="stock-item"><div class="stock-icon">{% if m.qty<=0 %}!{% else %}▥{% endif %}</div><div><div class="stock-name">{{m.name}}</div><div class="stock-sku">Zapas na ok. {{'%.1f'|format(m.coverage)}} jedn. produktu</div></div><div class="stock-qty" style="color:{{'#c7354c' if m.qty<=0 else '#c57a10'}}">{{'%.4f'|format(m.qty)|float}} {{m.unit}}</div></div>{% else %}<div class="muted">Brak niskich stanów. Zapasy surowców są wystarczające.</div>{% endfor %}</div></div>
+        </div>
+        <div class="card quick-card"><div class="panel-title"><span>ϟ</span><h2>Szybkie akcje</h2></div><div class="quick-grid">
+          <a class="btn" href="{{ url_for('order_new') }}"><b>＋</b><span>Nowe zamówienie</span></a><a class="btn" href="{{ url_for('products') }}"><b>◇</b><span>Dodaj produkt</span></a><a class="btn" href="{{ url_for('material_orders') }}"><b>⇢</b><span>Zamów materiały</span></a><a class="btn" href="{{ url_for('invoices') }}"><b>▤</b><span>Faktury</span></a>
         </div>
       </div>
-
-      <div class="card"><div class="panel-title"><h2>Szybkie akcje</h2></div><div class="quick-grid">
-        {% if can_orders %}<a class="btn" href="{{ url_for('order_new') }}">Nowe zamówienie</a>{% endif %}
-        {% if can_products %}<a class="btn" href="{{ url_for('products') }}">Produkty</a>{% endif %}
-        {% if can_material_orders %}<a class="btn" href="{{ url_for('material_orders') }}">Zamów materiały</a>{% endif %}
-        {% if can_inventory %}<a class="btn" href="{{ url_for('raw_material_warehouse') }}">Magazyn</a>{% endif %}
-        {% if can_wz %}<a class="btn" href="{{ url_for('beton.wz_list') }}">Dokumenty WZ</a>{% endif %}
-        {% if can_transport %}<a class="btn" href="{{ url_for('beton.transports') }}">Transporty</a>{% endif %}
-        {% if can_dispatch %}<a class="btn" href="{{ url_for('dispatch.appointments') }}">Wydaj transport</a>{% endif %}
-        {% if can_financial %}<a class="btn" href="{{ url_for('invoices') }}">Faktury</a>{% endif %}
-      </div></div>
+      </div>
     {% endblock %}
     """
-    role_labels = {"admin":"Administrator","manager":"Kierownik","accounting":"Księgowość","office":"Biuro","warehouse":"Magazyn"}
-    return render_template_string(
-        tpl, title="Start", base_url=BASE_URL, db_path=DB_PATH, role_label=role_labels.get(role, role or "Użytkownik"),
-        can_orders=can_orders, can_financial=can_financial, can_inventory=can_inventory,
-        can_transport=can_transport, can_wz=can_wz, can_dispatch=can_dispatch,
-        can_products=can_products, can_material_orders=can_material_orders, can_order_values=can_order_values,
-        n_orders_current=n_orders_current, n_orders_today=n_orders_today, today_remaining=today_remaining,
-        recent_orders=recent_orders, low_raw_materials=low_raw_materials,
-        overdue_invoice_count=overdue_invoice_count, overdue_invoice_total=overdue_invoice_total,
-        active_transport_count=active_transport_count, pending_wz_count=pending_wz_count,
-        loading_queue_count=loading_queue_count
-    )
+    return render_template_string(tpl, title="Start", base_url=BASE_URL, db_path=DB_PATH,
+                                  n_orders_current=n_orders_current, n_orders_today=n_orders_today, today_remaining=today_remaining,
+                                  recent_orders=recent_orders, status_new=status_new, status_assigned=status_assigned,
+                                  status_delivery=status_delivery, status_signed=status_signed, status_done=status_done,
+                                  status_invoice=status_invoice, status_total=status_total,
+                                  status_divisor=status_divisor,low_raw_materials=low_raw_materials,
+                                  overdue_invoice_count=overdue_invoice_count,overdue_invoice_total=overdue_invoice_total,
+                                  warehouse_role=warehouse_role,due_to_issue_today=due_to_issue_today,today_iso=today_iso)
+
 
 @app.get("/documents/search")
 def document_search():
@@ -6621,7 +6605,7 @@ def order_item_update(order_id, item_id):
     if INVENTORY_AUTOMATION_ENABLED and int(o["warehouse_issued"] or 0) == 1:
         c.close()
         return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
-    invoiced_qty = int(invoiced_qty_by_order_item_ids([item_id]).get(int(item_id)) or 0)
+    invoiced_qty = float(invoiced_qty_by_order_item_ids([item_id]).get(int(item_id)) or 0)
     if qty < invoiced_qty:
         c.close()
         return f"Nie moĹĽesz ustawiÄ‡ iloĹ›ci poniĹĽej juĹĽ zafakturowanej ({invoiced_qty} szt.)", 400
@@ -6647,7 +6631,7 @@ def order_item_delete(order_id, item_id):
     if int(o["warehouse_issued"] or 0) == 1:
         c.close()
         return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
-    invoiced_qty = int(invoiced_qty_by_order_item_ids([item_id]).get(int(item_id)) or 0)
+    invoiced_qty = float(invoiced_qty_by_order_item_ids([item_id]).get(int(item_id)) or 0)
     if invoiced_qty > 0:
         c.close()
         return f"Nie moĹĽesz usunÄ…Ä‡ pozycji, bo jest juĹĽ zafakturowana ({invoiced_qty} szt.)", 400
@@ -6680,7 +6664,7 @@ def order_delete(order_id):
     if INVENTORY_AUTOMATION_ENABLED and int(o["warehouse_issued"] or 0) == 1:
         for it in items:
             pid = int(it["product_id"])
-            qty = int(it["qty"])
+            qty = to_float(it["qty"], 0.0)
             cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
             cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
             changed_product_ids.append(pid)
@@ -6743,7 +6727,7 @@ def order_status_update(order_id):
 
         for it in items:
             pid = int(it["product_id"])
-            qty = int(it["qty"])
+            qty = to_float(it["qty"], 0.0)
             cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
             cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
             changed_product_ids.append(pid)
@@ -6861,8 +6845,8 @@ def order_invoice(order_id):
     invoiced_by_item = invoiced_qty_by_order_item_ids([int(it["id"]) for it in items])
     for it in items:
         source_order = related_order_by_id.get(int(it.get("order_id") or 0), {})
-        ordered_qty = int(it.get("qty") or 0)
-        done_qty = int(invoiced_by_item.get(int(it["id"])) or 0)
+        ordered_qty = float(it.get("qty") or 0)
+        done_qty = float(invoiced_by_item.get(int(it["id"])) or 0)
         it["source_order_no"] = order_display_no(
             source_order.get("id") or it.get("order_id"),
             source_order.get("created_at") or it.get("source_order_created_at"),
@@ -6874,7 +6858,7 @@ def order_invoice(order_id):
         it["invoiced_qty"] = done_qty
         it["remaining_qty"] = max(0, ordered_qty - done_qty)
         if wz_id:
-            it["remaining_qty"] = min(it["remaining_qty"], int(wz_qty.get(int(it["id"]), 0)))
+            it["remaining_qty"] = min(it["remaining_qty"], float(wz_qty.get(int(it["id"]), 0)))
 
     cur.execute("SELECT * FROM company_profile WHERE id=1")
     company = cur.fetchone()
@@ -7082,7 +7066,7 @@ def order_invoice(order_id):
                   <td>{{ it['invoiced_qty'] }}</td>
                   <td><b>{{ it['remaining_qty'] }}</b></td>
                   <td>
-                    <input type="number" min="0" name="invoice_qty_{{ it['id'] }}" value="0" max="{{ it['remaining_qty'] }}" style="width:110px;" {% if it['remaining_qty'] <= 0 %}disabled{% endif %}>
+                    <input type="number" min="0" step="0.01" name="invoice_qty_{{ it['id'] }}" value="{{ it['remaining_qty'] if wz_id else 0 }}" max="{{ it['remaining_qty'] }}" style="width:110px;" {% if it['remaining_qty'] <= 0 %}disabled{% endif %}>
                   </td>
                   <td>{{ "%.2f"|format(it['net_price']) }}</td>
                   <td>{{ "%.2f"|format(it['gross_price']) }}</td>
@@ -7150,7 +7134,7 @@ def order_invoice(order_id):
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no)
+    return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, wz_id=wz_id)
 
 
 @app.get("/orders/<int:order_id>/print")
@@ -8003,8 +7987,8 @@ def api_order_lookup():
 
     invoiced_by_item = invoiced_qty_by_order_item_ids([int(it["id"]) for it in items])
     for it in items:
-        ordered_qty = int(it.get("qty") or 0)
-        invoiced_qty = int(invoiced_by_item.get(int(it["id"])) or 0)
+        ordered_qty = float(it.get("qty") or 0)
+        invoiced_qty = float(invoiced_by_item.get(int(it["id"])) or 0)
         it["ordered_qty"] = ordered_qty
         it["invoiced_qty"] = invoiced_qty
         it["remaining_qty"] = max(0, ordered_qty - invoiced_qty)
@@ -9347,7 +9331,7 @@ def invoice_edit_admin(invoice_id):
         elif not invoice_items:
             msg = "Faktura musi zawierać co najmniej jedną pozycję."
         else:
-            old_order_ids = sorted({int(x.get("source_order_id") or x.get("order_id") or 0) for x in edit_items if int(x.get("current_invoice_qty") or 0) > 0})
+            old_order_ids = sorted({int(x.get("source_order_id") or x.get("order_id") or 0) for x in edit_items if float(x.get("current_invoice_qty") or 0) > 0})
             st, pc, city = split_address(data.get("buyer_address", ""))
             c = conn()
             cur = c.cursor()
