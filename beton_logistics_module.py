@@ -120,7 +120,7 @@ def register_beton_logistics(app,deps):
 
 def stamp(): return D['now_iso']()
 def actor(): return session.get('display_name') or session.get('username') or 'kierowca'
-TRANSPORT_STATUS_PL={'assigned':'Oczekuje na zgodę administratora','issued':'Zezwolono na start','departed':'Wyjechał','in_transit':'W drodze','on_site':'Na miejscu','delivered':'Dostarczony','returned':'Powrót do bazy','closed':'Zakończony','cancelled':'Anulowany'}
+TRANSPORT_STATUS_PL={'assigned':'Oczekuje na zgodę administratora','issued':'Zezwolono na start','departed':'Wyjechał','in_transit':'W drodze','on_site':'Na miejscu','delivered':'WZ podpisane','returning':'Wraca do bazy','returned':'Powrót potwierdzony','closed':'Zakończony','cancelled':'Anulowany'}
 def transport_status_pl(value): return TRANSPORT_STATUS_PL.get(str(value or '').lower(),value or '—')
 WZ_STATUS_PL={'created':'Roboczy','issued':'Gotowy do transportu','in_transport':'W transporcie','ready_invoice':'Dostarczony — gotowy do faktury','invoiced':'Zafakturowany','returned':'Zakończony','cancelled':'Anulowany'}
 def wz_status_pl(value): return WZ_STATUS_PL.get(str(value or '').lower(),value or '—')
@@ -1226,7 +1226,7 @@ def driver_transports_api():
         return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
     today=stamp()[:10]
     with D['conn']() as c:
-        rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no,
+        rows=c.execute('''SELECT t.id,t.transport_no,t.wz_id,w.wz_no,w.invoice_id,t.destination,t.status,t.issued_at,t.departed_at,t.delivered_at,t.returned_at,t.updated_at,t.receiver_name,t.driver_notes,i.invoice_no,o.customer_name,v.registration_no,
           EXISTS(SELECT 1 FROM delivery_photos dp WHERE dp.transport_id=t.id AND dp.deleted_at IS NULL) AS has_signed_wz_photo,
           COALESCE(NULLIF(t.destination,''),NULLIF(w.destination,''),NULLIF(o.note,''),o.customer_address) AS delivery_address,
           (SELECT a.status FROM dispatch_appointments a WHERE a.transport_id=t.id ORDER BY a.id DESC LIMIT 1) plant_status,
@@ -1241,7 +1241,15 @@ def driver_transports_api():
           ORDER BY planned_departure_time,t.id''',(driver_id,today)).fetchall()
         result=[]
         for r in rows:
-            x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['can_start']=x.get('status')=='issued'; x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
+            x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['can_start']=x.get('status')=='issued'; x['wait_seconds']=0
+            wait_started=x.get('departed_at') if x.get('status')=='in_transit' else x.get('updated_at') if x.get('status')=='returning' else None
+            if wait_started:
+                try:
+                    elapsed=(datetime.strptime(stamp(),'%Y-%m-%d %H:%M:%S')-datetime.strptime(wait_started,'%Y-%m-%d %H:%M:%S')).total_seconds()
+                    x['wait_seconds']=max(0,int(600-elapsed))
+                except (TypeError,ValueError):
+                    pass
+            x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
                 FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
                 LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(r['id'],))]; result.append(x)
     return jsonify(ok=True,transports=result)
@@ -1251,7 +1259,7 @@ def driver_transport_status_api(transport_id):
     driver_id=current_driver_id(); email=(g.client_user.get('email') or '').strip().lower(); data=request.get_json(silent=True) or {}; status=str(data.get('status',''))
     appointment_id_to_sync=None
     if not driver_id:return jsonify(ok=False,error='Konto kierowcy nie jest powiązane z kierowcą w panelu głównym.'),403
-    allowed={'in_transit','closed','delivered','returned','problem'}
+    allowed={'in_transit','closed','delivered','returning','returned','problem'}
     if status not in allowed:return jsonify(ok=False,error='Niedozwolony status'),400
     field={'issued':'issued_at','in_transit':'departed_at','delivered':'delivered_at','returned':'returned_at'}.get(status)
     with D['conn']() as c:
@@ -1259,11 +1267,11 @@ def driver_transport_status_api(transport_id):
           FROM transports t JOIN drivers d ON d.id=t.driver_id
           WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL''',(transport_id,driver_id)).fetchone()
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
-        transitions={'assigned':{'problem'},'issued':{'in_transit','problem'},'in_transit':{'delivered','closed','problem'},'closed':{'delivered','returned','problem'},'delivered':{'returned','problem'},'problem':{'in_transit','delivered','returned'}}
+        transitions={'assigned':{'problem'},'issued':{'in_transit','problem'},'in_transit':{'closed','problem'},'closed':{'delivered','problem'},'delivered':{'returning','problem'},'returning':{'returned','problem'},'problem':{'in_transit','delivered','returning','returned'}}
         if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
         # Minimalny czas dotyczy wyłącznie realnego przejazdu. Podpisanie WZ
         # po przyjeździe jest dostępne od razu.
-        wait_from = row['departed_at'] if status=='closed' else row['delivered_at'] if status=='returned' else None
+        wait_from = row['departed_at'] if status=='closed' else row['updated_at'] if row['status']=='returning' and status=='returned' else None
         if wait_from:
             try:
                 elapsed=(datetime.strptime(stamp(),'%Y-%m-%d %H:%M:%S')-datetime.strptime(wait_from,'%Y-%m-%d %H:%M:%S')).total_seconds()
