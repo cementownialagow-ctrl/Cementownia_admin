@@ -1242,7 +1242,12 @@ def driver_transports_api():
         result=[]
         for r in rows:
             x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['can_start']=x.get('status')=='issued'; x['wait_seconds']=0
-            wait_started=x.get('departed_at') if x.get('status')=='in_transit' else x.get('updated_at') if x.get('status')=='returning' else None
+            # „Wracam do bazy” jest stanem widoku opartym na istniejącym
+            # returned_at. Nie zapisujemy nieobsługiwanego statusu `returning`
+            # do starszej bazy ani Supabase.
+            if x.get('status')=='delivered' and x.get('returned_at'):
+                x['status']='returning'
+            wait_started=x.get('departed_at') if x.get('status')=='in_transit' else x.get('returned_at') if x.get('status')=='returning' else None
             if wait_started:
                 try:
                     elapsed=(datetime.strptime(stamp(),'%Y-%m-%d %H:%M:%S')-datetime.strptime(wait_started,'%Y-%m-%d %H:%M:%S')).total_seconds()
@@ -1267,11 +1272,12 @@ def driver_transport_status_api(transport_id):
           FROM transports t JOIN drivers d ON d.id=t.driver_id
           WHERE t.id=? AND t.driver_id=? AND d.active=1 AND t.deleted_at IS NULL''',(transport_id,driver_id)).fetchone()
         if not row:return jsonify(ok=False,error='Brak dostępu'),403
+        effective_status='returning' if row['status']=='delivered' and row['returned_at'] else row['status']
         transitions={'assigned':{'problem'},'issued':{'in_transit','problem'},'in_transit':{'closed','problem'},'closed':{'delivered','problem'},'delivered':{'returning','problem'},'returning':{'returned','problem'},'problem':{'in_transit','delivered','returning','returned'}}
-        if status not in transitions.get(row['status'],set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
+        if status not in transitions.get(effective_status,set()):return jsonify(ok=False,error='Nieprawidłowa kolejność statusów'),409
         # Minimalny czas dotyczy wyłącznie realnego przejazdu. Podpisanie WZ
         # po przyjeździe jest dostępne od razu.
-        wait_from = row['departed_at'] if status=='closed' else row['updated_at'] if row['status']=='returning' and status=='returned' else None
+        wait_from = row['departed_at'] if status=='closed' else row['returned_at'] if effective_status=='returning' and status=='returned' else None
         if wait_from:
             try:
                 elapsed=(datetime.strptime(stamp(),'%Y-%m-%d %H:%M:%S')-datetime.strptime(wait_from,'%Y-%m-%d %H:%M:%S')).total_seconds()
@@ -1283,12 +1289,22 @@ def driver_transport_status_api(transport_id):
         appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
         if status=='in_transit' and row['status']!='issued':
             return jsonify(ok=False,error='Administrator musi najpierw zezwolić na rozpoczęcie dostawy.'),409
-        sql='UPDATE transports SET status=?,driver_notes=?,receiver_name=?,updated_by=?,updated_at=?'+(f',{field}=?' if field else '')+' WHERE id=? AND status=?'; values=[status,str(data.get('notes',''))[:2000],str(data.get('receiver_name',''))[:200],email,stamp()]
-        if field:values.append(stamp())
-        values.extend((transport_id,row['status']))
-        if c.execute(sql,values).rowcount != 1:
-            c.rollback()
-            return jsonify(ok=False,error='Status transportu został już zmieniony. Odśwież dane.'),409
+        if status=='returning':
+            now=stamp()
+            if c.execute("""UPDATE transports SET returned_at=?,updated_by=?,updated_at=?
+                    WHERE id=? AND status='delivered' AND returned_at IS NULL""",
+                    (now,email,now,transport_id)).rowcount != 1:
+                c.rollback()
+                return jsonify(ok=False,error='Rozpoczęcie powrotu zostało już zapisane. Odśwież dane.'),409
+            # Po wyjściu z bloku `with` zapis zostanie zatwierdzony, a poniższa
+            # synchronizacja wyśle wyłącznie obsługiwany status `delivered`.
+        else:
+            sql='UPDATE transports SET status=?,driver_notes=?,receiver_name=?,updated_by=?,updated_at=?'+(f',{field}=?' if field else '')+' WHERE id=? AND status=?'; values=[status,str(data.get('notes',''))[:2000],str(data.get('receiver_name',''))[:200],email,stamp()]
+            if field:values.append(stamp())
+            values.extend((transport_id,row['status']))
+            if c.execute(sql,values).rowcount != 1:
+                c.rollback()
+                return jsonify(ok=False,error='Status transportu został już zmieniony. Odśwież dane.'),409
         # Podpisane WZ zamyka część dostawczą i od razu daje księgowości
         # możliwość wystawienia faktury. Powrót auta na bazę pozostaje
         # osobnym etapem logistycznym, ale nie blokuje fakturowania.
