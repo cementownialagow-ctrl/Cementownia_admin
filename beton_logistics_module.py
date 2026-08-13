@@ -1117,7 +1117,7 @@ def transport_view(transport_id):
         adjustment=c.execute('SELECT * FROM transport_delivery_adjustments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
     detail_tpl='''{% extends "base.html" %}{% block content %}<div class="flex"><h1>{{x.transport_no}}</h1><span class="badge">{{x.status}}</span><a class="btn right" href="{{url_for('beton.wz_view',wz_id=x.wz_id)}}">{{x.wz_no}}</a><a class="btn" target="_blank" href="{{url_for('beton.transport_course_print',transport_id=x.id)}}">Drukuj WZ kursu</a></div><div class="card"><div class="grid3"><div><span class="muted">Klient</span><br><b>{{x.customer_name}}</b></div><div><span class="muted">Kierowca</span><br><b>{{x.driver_name}}</b></div><div><span class="muted">Pojazd</span><br><b>{{x.registration_no}}</b></div></div><table><tbody>{% for i in items %}<tr><td>{{i.sku}}</td><td><b>{{i.qty}} mÂł</b></td></tr>{% endfor %}</tbody></table></div><form method="post" action="{{url_for('beton.transport_adjustment_save',transport_id=x.id)}}" class="card"><h2>Dane konkretnej dostawy</h2><div class="grid3"><div><label><input type="checkbox" name="water_added" value="1" {{'checked' if adjustment and adjustment.water_added}}> Dodano wodÄ™ na ĹĽÄ…danie odbiorcy</label></div><div><label>IloĹ›Ä‡ wody</label><input type="number" step="0.01" name="water_qty" value="{{adjustment.water_qty if adjustment else ''}}"></div><div><label>Jednostka</label><select name="water_unit"><option>l</option><option>kg</option></select></div><div><label>Data i godzina</label><input type="datetime-local" name="event_at" value="{{(adjustment.event_at or '')[:16] if adjustment else ''}}"></div><div><label>Osoba odpowiedzialna</label><input name="responsible_person" value="{{adjustment.responsible_person or '' if adjustment else ''}}"></div><div><label>Dodano wĹ‚Ăłkna</label><input name="added_fibres" value="{{adjustment.added_fibres or '' if adjustment else ''}}"></div><div><label>Dodano chemiÄ™</label><input name="added_chemicals" value="{{adjustment.added_chemicals or '' if adjustment else ''}}"></div><div><label>Inne dodatki</label><input name="other_additions" value="{{adjustment.other_additions or '' if adjustment else ''}}"></div></div><label>Uwagi</label><textarea name="notes">{{adjustment.notes or '' if adjustment else ''}}</textarea><button class="btn primary">Zapisz dane dostawy</button></form>{% endblock %}'''
     detail_tpl=detail_tpl.replace('mÂł','m³')
-    if x.get('status_code') in ('assigned','issued'):
+    if x.get('status_code') == 'assigned':
         ready_url=url_for('beton.transport_ready',transport_id=x['id'])
         ready_button=f'''<form method="post" action="{ready_url}" style="display:inline"><button class="btn primary" type="submit">Zezwól kierowcy na rozpoczęcie</button></form>'''
         detail_tpl=detail_tpl.replace('Drukuj WZ kursu</a>','Drukuj WZ kursu</a>'+ready_button,1)
@@ -1131,7 +1131,10 @@ def transport_ready(transport_id):
     with D['conn']() as c:
         transport=c.execute('SELECT id,wz_id,status FROM transports WHERE id=? AND deleted_at IS NULL',(transport_id,)).fetchone()
         if not transport: abort(404)
-        if transport['status'] not in ('assigned','issued'):
+        # Ponowne wysłanie formularza po udanej operacji jest idempotentne.
+        if transport['status']=='issued':
+            return redirect(url_for('beton.transport_view',transport_id=transport_id))
+        if transport['status']!='assigned':
             return redirect(url_for('beton.transport_view',transport_id=transport_id))
         appointment=c.execute('SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1',(transport_id,)).fetchone()
         if not appointment:
@@ -1152,18 +1155,25 @@ def transport_ready(transport_id):
         c.execute("UPDATE transports SET status='issued',issued_at=COALESCE(issued_at,?),updated_by=?,updated_at=? WHERE id=?",(now,actor(),now,transport_id))
         wz_id=int(transport['wz_id'])
         c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(actor(),'ready_for_driver','transport',transport_id,'{}',now))
-    D['sync_local_rows_to_supabase']('transports','id',[transport_id])
-    if appointment_id: D['sync_local_rows_to_supabase']('dispatch_appointments','id',[appointment_id])
-    D['sync_local_rows_to_supabase']('wz_documents','id',[wz_id])
+    # Zapis lokalny jest już zatwierdzony. Błąd pojedynczej tabeli w chmurze
+    # nie może zmieniać poprawnej operacji użytkownika w stronę HTTP 500.
+    sync_jobs=[('transports','id',[transport_id]),('wz_documents','id',[wz_id])]
     with D['conn']() as c:
         wz_item_ids=[row['id'] for row in c.execute('SELECT id FROM wz_items WHERE wz_id=?',(wz_id,)).fetchall()]
         snapshot_ids=[row['id'] for row in c.execute('SELECT id FROM wz_technology_snapshots WHERE wz_id=?',(wz_id,)).fetchall()]
         material_ids=[row['material_id'] for row in c.execute("SELECT DISTINCT material_id FROM raw_material_movements WHERE wz_id=? AND movement_type='wz_issue'",(wz_id,)).fetchall()]
         movement_ids=[row['id'] for row in c.execute('SELECT id FROM raw_material_movements WHERE wz_id=?',(wz_id,)).fetchall()]
-    D['sync_local_rows_to_supabase']('wz_items','id',wz_item_ids)
-    D['sync_local_rows_to_supabase']('wz_technology_snapshots','id',snapshot_ids)
-    D['sync_local_rows_to_supabase']('raw_material_stock','material_id',material_ids)
-    D['sync_local_rows_to_supabase']('raw_material_movements','id',movement_ids)
+    sync_jobs.extend([
+        ('wz_items','id',wz_item_ids),
+        ('wz_technology_snapshots','id',snapshot_ids),
+        ('raw_material_stock','material_id',material_ids),
+        ('raw_material_movements','id',movement_ids),
+    ])
+    for table,key,ids in sync_jobs:
+        try:
+            D['sync_local_rows_to_supabase'](table,key,ids)
+        except Exception:
+            current_app.logger.exception('Synchronizacja %s po zezwoleniu na start nie powiodła się',table)
     return redirect(url_for('beton.transport_view',transport_id=transport_id))
 
 @bp.post('/transports/<int:transport_id>/delivery-data')
@@ -1218,7 +1228,7 @@ def driver_transports_api():
           ORDER BY planned_departure_time,t.id''',(driver_id,today)).fetchall()
         result=[]
         for r in rows:
-            x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['can_start']=x.get('status')=='issued' and x.get('plant_status')=='ready_to_leave'; x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
+            x=dict(r); x['destination']=(x.get('destination') or x.get('delivery_address') or '').strip(); x['can_start']=x.get('status')=='issued'; x['items']=[dict(z) for z in c.execute('''SELECT COALESCE(p.name, w.sku) AS sku, ti.qty
                 FROM transport_items ti JOIN wz_items w ON w.id=ti.wz_item_id
                 LEFT JOIN products p ON p.id=w.product_id WHERE ti.transport_id=?''',(r['id'],))]; result.append(x)
     return jsonify(ok=True,transports=result)
@@ -1250,8 +1260,8 @@ def driver_transport_status_api(transport_id):
             except (TypeError,ValueError):
                 pass
         appointment=c.execute("SELECT id,status FROM dispatch_appointments WHERE transport_id=? ORDER BY id DESC LIMIT 1",(transport_id,)).fetchone()
-        if status=='in_transit' and (not appointment or appointment['status']!='ready_to_leave'):
-            return jsonify(ok=False,error='Dyspozytor musi najpierw oznaczyć transport jako gotowy do wyjazdu.'),409
+        if status=='in_transit' and row['status']!='issued':
+            return jsonify(ok=False,error='Administrator musi najpierw zezwolić na rozpoczęcie dostawy.'),409
         sql='UPDATE transports SET status=?,driver_notes=?,receiver_name=?,updated_by=?,updated_at=?'+(f',{field}=?' if field else '')+' WHERE id=? AND status=?'; values=[status,str(data.get('notes',''))[:2000],str(data.get('receiver_name',''))[:200],email,stamp()]
         if field:values.append(stamp())
         values.extend((transport_id,row['status']))
@@ -1269,13 +1279,14 @@ def driver_transport_status_api(transport_id):
             c.execute("UPDATE wz_documents SET status='in_transport' WHERE id=? AND status='issued'",(row['wz_id'],))
         if status=='in_transit' and appointment:
             c.execute("UPDATE dispatch_appointments SET status='departed',updated_by=?,updated_at=? WHERE id=?",(email,stamp(),appointment['id']))
-            c.execute("INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)",(appointment['id'],'ready_to_leave','departed','Potwierdzenie wyjazdu przez kierowcę',email,stamp()))
+            c.execute("INSERT INTO appointment_status_history(appointment_id,old_status,new_status,reason,actor,created_at) VALUES(?,?,?,?,?,?)",(appointment['id'],appointment['status'],'departed','Potwierdzenie wyjazdu przez kierowcę',email,stamp()))
             appointment_id_to_sync=appointment['id']
         c.execute('INSERT INTO audit_log(actor,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?)',(email,'status:'+status,'transport',transport_id,'{}',stamp()))
-    D['sync_local_rows_to_supabase']('transports','id',[transport_id])
-    D['sync_local_rows_to_supabase']('wz_documents','id',[row['wz_id']])
-    if appointment_id_to_sync:
-        D['sync_local_rows_to_supabase']('dispatch_appointments','id',[appointment_id_to_sync])
+    for table,key,ids in [('transports','id',[transport_id]),('wz_documents','id',[row['wz_id']])]:
+        try:
+            D['sync_local_rows_to_supabase'](table,key,ids)
+        except Exception:
+            current_app.logger.exception('Synchronizacja %s po zmianie etapu kierowcy nie powiodła się',table)
     return jsonify(ok=True,status=status)
 
 @driver_api.get('/transports/<int:transport_id>/invoice')
